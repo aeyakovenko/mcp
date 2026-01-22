@@ -14,8 +14,8 @@ use {
             },
             CodingShredHeader, DataShredHeader, Error, ProcessShredsStats, ShredCommonHeader,
             ShredFlags, ShredVariant, CODING_SHREDS_PER_FEC_BLOCK, DATA_SHREDS_PER_FEC_BLOCK,
-            SHREDS_PER_FEC_BLOCK, SIZE_OF_CODING_SHRED_HEADERS, SIZE_OF_DATA_SHRED_HEADERS,
-            SIZE_OF_SIGNATURE,
+            DEFAULT_PROPOSER_ID, SHREDS_PER_FEC_BLOCK, SIZE_OF_CODING_SHRED_HEADERS,
+            SIZE_OF_DATA_SHRED_HEADERS, SIZE_OF_SIGNATURE,
         },
         shredder::ReedSolomonCache,
     },
@@ -40,7 +40,8 @@ use {
     },
 };
 
-const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1203);
+// MCP-05: SIZE_OF_PAYLOAD reduced by 1 due to proposer_id field in common header
+const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1202);
 
 // Layout: {common, data} headers | data buffer
 //     | [Merkle root of the previous erasure batch if chained]
@@ -725,6 +726,7 @@ pub(super) fn recover(
             slot,
             index: _,
             version,
+            proposer_id: _,
             fec_set_index,
         } = shred.common_header();
         slot == &common_header.slot
@@ -1055,6 +1057,7 @@ pub(crate) fn make_shreds_from_data(
         slot,
         index: next_shred_index,
         version: shred_version,
+        proposer_id: DEFAULT_PROPOSER_ID, // MCP-05: default for non-MCP shreds
         fec_set_index: next_shred_index,
     };
 
