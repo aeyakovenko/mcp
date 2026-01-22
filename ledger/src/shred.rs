@@ -124,6 +124,13 @@ pub const DATA_SHREDS_PER_FEC_BLOCK: usize = 32;
 pub const CODING_SHREDS_PER_FEC_BLOCK: usize = 32;
 pub const SHREDS_PER_FEC_BLOCK: usize = DATA_SHREDS_PER_FEC_BLOCK + CODING_SHREDS_PER_FEC_BLOCK;
 
+// MCP-06: FEC parameters for MCP proposer shreds.
+// 40 data + 160 coding provides 4:1 redundancy, allowing recovery
+// with only 20% of total shreds (matching RECONSTRUCTION_THRESHOLD).
+pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = 40;
+pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = 160;
+pub const MCP_SHREDS_PER_FEC_BLOCK: usize = MCP_DATA_SHREDS_PER_FEC_BLOCK + MCP_CODING_SHREDS_PER_FEC_BLOCK;
+
 /// An upper bound on maximum number of data shreds we can handle in a slot
 /// 32K shreds would allow ~320K peak TPS
 /// (32K shreds per slot * 4 TX per shred * 2.5 slots per sec)
