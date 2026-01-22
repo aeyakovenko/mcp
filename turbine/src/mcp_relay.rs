@@ -21,11 +21,8 @@ use {
     std::collections::HashMap,
 };
 
-/// Number of proposers in MCP.
-pub const NUM_PROPOSERS: u8 = 16;
-
-/// Number of relays in MCP.
-pub const NUM_RELAYS: u16 = 200;
+// Re-export MCP constants from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
 /// Result of validating a proposer shred.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,20 +43,22 @@ pub enum ShredValidationResult {
 
 /// A proposer shred message received by a relay.
 ///
-/// Wire format: (slot, proposer_id, commitment, shred, witness, proposer_sig)
+/// Wire format: (slot, proposer_id, shred_index, commitment, shred, witness, proposer_sig)
 #[derive(Debug, Clone)]
 pub struct ProposerShredMessage {
     /// The slot this shred belongs to.
     pub slot: u64,
     /// The proposer ID (0-15).
     pub proposer_id: u8,
+    /// The shred index within the FEC block.
+    pub shred_index: u32,
     /// The commitment (merkle root) of the shred batch.
     pub commitment: Hash,
     /// The raw shred data.
     pub shred_data: Vec<u8>,
     /// The merkle witness (proof) for this relay's index.
     pub witness: Vec<u8>,
-    /// The proposer's signature over (slot, proposer_id, commitment).
+    /// The proposer's signature over (slot, proposer_id, shred_index, commitment).
     pub proposer_signature: Signature,
 }
 
@@ -68,6 +67,7 @@ impl ProposerShredMessage {
     pub fn new(
         slot: u64,
         proposer_id: u8,
+        shred_index: u32,
         commitment: Hash,
         shred_data: Vec<u8>,
         witness: Vec<u8>,
@@ -76,6 +76,7 @@ impl ProposerShredMessage {
         Self {
             slot,
             proposer_id,
+            shred_index,
             commitment,
             shred_data,
             witness,
@@ -84,10 +85,14 @@ impl ProposerShredMessage {
     }
 
     /// Get the data to be signed by the proposer.
+    ///
+    /// The signature binds to (slot, proposer_id, shred_index, commitment) to prevent
+    /// replay of signatures across different shreds.
     pub fn get_signing_data(&self) -> Vec<u8> {
-        let mut data = Vec::with_capacity(8 + 1 + 32);
+        let mut data = Vec::with_capacity(8 + 1 + 4 + 32);
         data.extend_from_slice(&self.slot.to_le_bytes());
         data.push(self.proposer_id);
+        data.extend_from_slice(&self.shred_index.to_le_bytes());
         data.extend_from_slice(self.commitment.as_ref());
         data
     }
@@ -219,24 +224,37 @@ impl RelayShredProcessor {
     ///
     /// Validates the shred and returns the result along with the validated
     /// shred if successful.
+    ///
+    /// The shred_index is taken from the message itself. The relay verifies
+    /// that this shred is meant for them by checking
+    /// `message.shred_index % NUM_RELAYS == relay_id`.
     pub fn process_shred(
         &mut self,
         message: &ProposerShredMessage,
         proposer_pubkey: &Pubkey,
-        shred_index: u32,
     ) -> (ShredValidationResult, Option<ValidatedShred>) {
+        let shred_index = message.shred_index;
+
         // Validate proposer ID
         if message.proposer_id >= NUM_PROPOSERS {
             return (ShredValidationResult::InvalidProposerId, None);
         }
 
+        // Verify this shred is meant for this relay
+        // In MCP, relay_id = shred_index % NUM_RELAYS
+        let expected_relay = (shred_index as u16) % NUM_RELAYS;
+        if expected_relay != self.relay_id {
+            return (ShredValidationResult::WrongRelayIndex, None);
+        }
+
         // Verify proposer signature
+        // Note: signature binds (slot, proposer_id, shred_index, commitment)
         if !message.verify_proposer_signature(proposer_pubkey) {
             return (ShredValidationResult::InvalidSignature, None);
         }
 
         // Verify merkle proof
-        // The witness should prove that the shred is at the relay's index
+        // The witness should prove that the shred is at shred_index
         // in the merkle tree committed to by the proposer
         if !self.verify_merkle_witness(message, shred_index) {
             return (ShredValidationResult::InvalidMerkleProof, None);
@@ -341,6 +359,7 @@ mod tests {
         let msg = ProposerShredMessage::new(
             100,
             5,
+            42, // shred_index
             make_test_hash(1),
             vec![1, 2, 3, 4],
             vec![5, 6, 7, 8],
@@ -349,9 +368,11 @@ mod tests {
 
         assert_eq!(msg.slot, 100);
         assert_eq!(msg.proposer_id, 5);
+        assert_eq!(msg.shred_index, 42);
 
         let signing_data = msg.get_signing_data();
-        assert_eq!(signing_data.len(), 8 + 1 + 32);
+        // 8 (slot) + 1 (proposer_id) + 4 (shred_index) + 32 (commitment) = 45
+        assert_eq!(signing_data.len(), 8 + 1 + 4 + 32);
     }
 
     #[test]
@@ -392,13 +413,14 @@ mod tests {
         let msg = ProposerShredMessage::new(
             100,
             20, // Invalid: >= NUM_PROPOSERS
+            0,  // shred_index
             make_test_hash(1),
             vec![1, 2, 3],
             vec![],
             Signature::default(),
         );
 
-        let (result, _) = processor.process_shred(&msg, &Pubkey::new_unique(), 0);
+        let (result, _) = processor.process_shred(&msg, &Pubkey::new_unique());
         assert_eq!(result, ShredValidationResult::InvalidProposerId);
     }
 

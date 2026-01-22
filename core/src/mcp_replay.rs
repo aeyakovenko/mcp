@@ -20,13 +20,11 @@ use {
     std::collections::HashMap,
 };
 
-/// Number of proposers in MCP.
-pub const NUM_PROPOSERS: u8 = 16;
-
-/// Number of relays in MCP.
-pub const NUM_RELAYS: u16 = 200;
+// Re-export MCP constants from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
 /// Reconstruction threshold (20% of relays needed to reconstruct).
+/// Note: This matches RECONSTRUCTION_THRESHOLD in ledger/src/mcp.rs
 pub const RECONSTRUCTION_THRESHOLD_PERCENT: u8 = 20;
 
 // ============================================================================

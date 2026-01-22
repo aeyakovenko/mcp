@@ -26,11 +26,8 @@ use {
     std::net::SocketAddr,
 };
 
-/// Number of proposers in MCP.
-pub const NUM_PROPOSERS: u8 = 16;
-
-/// Number of relays in MCP.
-pub const NUM_RELAYS: u16 = 200;
+// Re-export MCP constants from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
 /// A shred ready for distribution to relays.
 #[derive(Debug, Clone)]
@@ -76,22 +73,28 @@ pub struct RelayShredMessage {
     pub slot: u64,
     /// The proposer's ID.
     pub proposer_id: u8,
+    /// The shred index within the FEC block.
+    pub shred_index: u32,
     /// The merkle root commitment.
     pub commitment: Hash,
     /// The raw shred data.
     pub shred_data: Vec<u8>,
     /// The merkle witness for this shred.
     pub witness: Vec<u8>,
-    /// The proposer's signature over (slot, proposer_id, commitment).
+    /// The proposer's signature over (slot, proposer_id, shred_index, commitment).
     pub proposer_signature: Signature,
 }
 
 impl RelayShredMessage {
     /// Get the data that was signed by the proposer.
-    pub fn get_signing_data(slot: u64, proposer_id: u8, commitment: &Hash) -> Vec<u8> {
-        let mut data = Vec::with_capacity(8 + 1 + 32);
+    ///
+    /// The signature binds to (slot, proposer_id, shred_index, commitment) to prevent
+    /// replay of signatures across different shreds.
+    pub fn get_signing_data(slot: u64, proposer_id: u8, shred_index: u32, commitment: &Hash) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + 1 + 4 + 32);
         data.extend_from_slice(&slot.to_le_bytes());
         data.push(proposer_id);
+        data.extend_from_slice(&shred_index.to_le_bytes());
         data.extend_from_slice(commitment.as_ref());
         data
     }
@@ -105,6 +108,9 @@ impl RelayShredMessage {
 
         // proposer_id (1 byte)
         buffer.push(self.proposer_id);
+
+        // shred_index (4 bytes) - NEW
+        buffer.extend_from_slice(&self.shred_index.to_le_bytes());
 
         // commitment (32 bytes)
         buffer.extend_from_slice(self.commitment.as_ref());
@@ -125,7 +131,8 @@ impl RelayShredMessage {
 
     /// Deserialize a message from bytes.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 8 + 1 + 32 + 4 + 2 + 64 {
+        // Minimum size: slot(8) + proposer_id(1) + shred_index(4) + commitment(32) + shred_data_len(4) + witness_len(2) + sig(64)
+        if data.len() < 8 + 1 + 4 + 32 + 4 + 2 + 64 {
             return None;
         }
 
@@ -138,6 +145,10 @@ impl RelayShredMessage {
         // proposer_id
         let proposer_id = data[offset];
         offset += 1;
+
+        // shred_index - NEW
+        let shred_index = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+        offset += 4;
 
         // commitment
         let commitment = Hash::from(<[u8; 32]>::try_from(&data[offset..offset + 32]).ok()?);
@@ -174,11 +185,23 @@ impl RelayShredMessage {
         Some(Self {
             slot,
             proposer_id,
+            shred_index,
             commitment,
             shred_data,
             witness,
             proposer_signature,
         })
+    }
+
+    /// Verify the proposer's signature.
+    pub fn verify_signature(&self, proposer_pubkey: &Pubkey) -> bool {
+        let signing_data = Self::get_signing_data(
+            self.slot,
+            self.proposer_id,
+            self.shred_index,
+            &self.commitment,
+        );
+        self.proposer_signature.verify(proposer_pubkey.as_ref(), &signing_data)
     }
 }
 
@@ -218,21 +241,28 @@ impl ProposerDistributor {
         &self,
         batch: &ProposerShredBatch,
     ) -> Vec<(u16, RelayShredMessage)> {
-        // Sign the commitment once
-        let signing_data =
-            RelayShredMessage::get_signing_data(batch.slot, batch.proposer_id, &batch.commitment);
-        let signature = self.keypair.sign_message(&signing_data);
-
-        // Create a message for each shred
+        // Create a message for each shred, with per-shred signature binding
         batch
             .shreds
             .iter()
             .enumerate()
-            .map(|(idx, shred)| {
-                let relay_index = idx as u16 % NUM_RELAYS;
+            .map(|(_idx, shred)| {
+                let shred_index = shred.index;
+                let relay_index = (shred_index as u16) % NUM_RELAYS;
+
+                // Sign each shred individually to bind the signature to this specific shred
+                let signing_data = RelayShredMessage::get_signing_data(
+                    batch.slot,
+                    batch.proposer_id,
+                    shred_index,
+                    &batch.commitment,
+                );
+                let signature = self.keypair.sign_message(&signing_data);
+
                 let message = RelayShredMessage {
                     slot: batch.slot,
                     proposer_id: batch.proposer_id,
+                    shred_index,
                     commitment: batch.commitment,
                     shred_data: shred.data.clone(),
                     witness: shred.witness.clone(),
@@ -247,17 +277,19 @@ impl ProposerDistributor {
     pub fn create_message(
         &self,
         slot: u64,
+        shred_index: u32,
         commitment: Hash,
         shred_data: Vec<u8>,
         witness: Vec<u8>,
     ) -> RelayShredMessage {
         let signing_data =
-            RelayShredMessage::get_signing_data(slot, self.proposer_id, &commitment);
+            RelayShredMessage::get_signing_data(slot, self.proposer_id, shred_index, &commitment);
         let signature = self.keypair.sign_message(&signing_data);
 
         RelayShredMessage {
             slot,
             proposer_id: self.proposer_id,
+            shred_index,
             commitment,
             shred_data,
             witness,
@@ -327,6 +359,7 @@ mod tests {
         let msg = RelayShredMessage {
             slot: 12345,
             proposer_id: 5,
+            shred_index: 42,
             commitment: make_test_hash(42),
             shred_data: vec![1, 2, 3, 4, 5],
             witness: vec![10, 20, 30],
@@ -338,6 +371,7 @@ mod tests {
 
         assert_eq!(msg.slot, deserialized.slot);
         assert_eq!(msg.proposer_id, deserialized.proposer_id);
+        assert_eq!(msg.shred_index, deserialized.shred_index);
         assert_eq!(msg.commitment, deserialized.commitment);
         assert_eq!(msg.shred_data, deserialized.shred_data);
         assert_eq!(msg.witness, deserialized.witness);
@@ -353,6 +387,7 @@ mod tests {
 
         let message = distributor.create_message(
             100,
+            7, // shred_index
             make_test_hash(1),
             vec![1, 2, 3],
             vec![4, 5, 6],
@@ -360,6 +395,7 @@ mod tests {
 
         assert_eq!(message.slot, 100);
         assert_eq!(message.proposer_id, 3);
+        assert_eq!(message.shred_index, 7);
         assert_eq!(message.shred_data, vec![1, 2, 3]);
         assert_eq!(message.witness, vec![4, 5, 6]);
     }
@@ -378,6 +414,7 @@ mod tests {
         let msg = RelayShredMessage {
             slot: 100,
             proposer_id: 1,
+            shred_index: 0,
             commitment: make_test_hash(1),
             shred_data: vec![1],
             witness: vec![2],
@@ -393,12 +430,13 @@ mod tests {
     fn test_signing_data() {
         let slot = 12345u64;
         let proposer_id = 5u8;
+        let shred_index = 99u32;
         let commitment = make_test_hash(42);
 
-        let data = RelayShredMessage::get_signing_data(slot, proposer_id, &commitment);
+        let data = RelayShredMessage::get_signing_data(slot, proposer_id, shred_index, &commitment);
 
-        // Should be 8 + 1 + 32 = 41 bytes
-        assert_eq!(data.len(), 41);
+        // Should be 8 + 1 + 4 + 32 = 45 bytes
+        assert_eq!(data.len(), 45);
 
         // Verify slot bytes
         assert_eq!(&data[0..8], &slot.to_le_bytes());
@@ -406,7 +444,10 @@ mod tests {
         // Verify proposer_id
         assert_eq!(data[8], proposer_id);
 
+        // Verify shred_index
+        assert_eq!(&data[9..13], &shred_index.to_le_bytes());
+
         // Verify commitment
-        assert_eq!(&data[9..41], commitment.as_ref());
+        assert_eq!(&data[13..45], commitment.as_ref());
     }
 }

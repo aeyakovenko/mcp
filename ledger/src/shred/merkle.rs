@@ -1481,6 +1481,7 @@ mod test {
             slot: 145_865_705,
             index: 1835,
             version: rng.gen(),
+            proposer_id: 0, // MCP-05: proposer_id
             fec_set_index: 1835,
         };
         let data_header = {
@@ -1742,6 +1743,7 @@ mod test {
                 slot,
                 index,
                 version,
+                proposer_id: _,
                 fec_set_index: _,
             } = *shred.common_header();
             let shred_type = ShredType::from(shred_variant);

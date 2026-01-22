@@ -110,9 +110,24 @@ impl BanklessBatch {
         data
     }
 
-    /// Deserialize a batch.
+    /// Maximum number of transactions allowed in a batch (safety limit).
+    const MAX_TRANSACTIONS_PER_BATCH: usize = 10_000;
+
+    /// Maximum size of a single transaction in bytes (safety limit).
+    const MAX_TRANSACTION_SIZE: usize = 1_232; // MTU-based limit
+
+    /// Maximum total batch size in bytes (safety limit).
+    const MAX_BATCH_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
+    /// Deserialize a batch with bounds checking to prevent memory DoS.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
+        // Check minimum header size
         if data.len() < 8 + 1 + 4 {
+            return None;
+        }
+
+        // Reject obviously oversized input
+        if data.len() > Self::MAX_BATCH_SIZE {
             return None;
         }
 
@@ -127,7 +142,16 @@ impl BanklessBatch {
         let tx_count = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
         offset += 4;
 
+        // Bounds check: reject unreasonable transaction counts
+        if tx_count > Self::MAX_TRANSACTIONS_PER_BATCH {
+            return None;
+        }
+
         let mut batch = Self::new(slot, proposer_id);
+
+        // Pre-allocate with bounded capacity
+        batch.transactions.reserve(tx_count.min(1000));
+        batch.transaction_hashes.reserve(tx_count.min(1000));
 
         for _ in 0..tx_count {
             if data.len() < offset + 4 {
@@ -136,6 +160,11 @@ impl BanklessBatch {
 
             let tx_len = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
             offset += 4;
+
+            // Bounds check: reject unreasonable transaction sizes
+            if tx_len > Self::MAX_TRANSACTION_SIZE {
+                return None;
+            }
 
             if data.len() < offset + tx_len {
                 return None;

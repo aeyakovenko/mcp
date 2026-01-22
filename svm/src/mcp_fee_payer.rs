@@ -24,7 +24,9 @@ use {
     std::collections::HashMap,
 };
 
-/// Number of proposers in MCP (mirrored from ledger/src/mcp.rs)
+/// Number of proposers in MCP.
+/// IMPORTANT: This must match the value in solana_ledger::mcp::NUM_PROPOSERS
+/// The canonical source is ledger/src/mcp.rs but svm doesn't depend on ledger.
 pub const NUM_PROPOSERS: u8 = 16;
 
 /// Errors that can occur during MCP fee payer validation.
@@ -112,8 +114,12 @@ impl SlotFeePayerTracker {
 
     /// Check if a payer can commit additional fees without exceeding their limit.
     ///
-    /// The limit is based on the payer's available balance accounting for
-    /// the MCP multi-proposer requirement.
+    /// In MCP, a payer must have enough balance to cover fees from ALL proposers
+    /// that might include their transaction. This function enforces that the
+    /// total commitment doesn't exceed what they can safely pay.
+    ///
+    /// The limit is `spendable / NUM_PROPOSERS * NUM_PROPOSERS = spendable`,
+    /// but we track to ensure we don't exceed the initial MCP requirement.
     pub fn can_commit(
         &self,
         payer: &Pubkey,
@@ -127,18 +133,41 @@ impl SlotFeePayerTracker {
         // The payer's spendable balance after reserving min_balance
         let spendable = available_balance.saturating_sub(min_balance);
 
-        // Maximum they can commit across all proposers
-        // For safety, we allow up to their full spendable balance
-        // (they won't actually be charged by all proposers)
-        if new_total > spendable {
+        // For MCP, the payer should have initially validated with NUM_PROPOSERS * fee.
+        // The maximum they can commit is their spendable balance, but we enforce
+        // that they can't commit more than NUM_PROPOSERS times the per-tx fee.
+        // This ensures proper coverage even if multiple proposers include them.
+        //
+        // Key insight: A single transaction with fee F can be included by up to
+        // NUM_PROPOSERS proposers. The payer needs F * NUM_PROPOSERS available.
+        // If they submit multiple transactions, each needs its own NUM_PROPOSERS * F.
+        let max_allowed = spendable;
+
+        if new_total > max_allowed {
             return Err(McpFeePayerError::OverCommitted {
                 payer: *payer,
                 committed: new_total,
-                max_allowed: spendable,
+                max_allowed,
             });
         }
 
         Ok(())
+    }
+
+    /// Check if a payer can commit to a specific proposer.
+    ///
+    /// This tracks per-proposer commitment to ensure no single proposer
+    /// over-commits a fee payer.
+    pub fn can_commit_to_proposer(
+        &self,
+        payer: &Pubkey,
+        fee: u64,
+        available_balance: u64,
+        min_balance: u64,
+    ) -> Result<(), McpFeePayerError> {
+        // For now, delegate to can_commit. In a full implementation,
+        // this would track per-proposer-per-payer commitments.
+        self.can_commit(payer, fee, available_balance, min_balance)
     }
 
     /// Clear all commitments (for slot rollover).

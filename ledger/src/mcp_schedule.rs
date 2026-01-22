@@ -17,7 +17,6 @@
 
 use {
     crate::mcp::{NUM_PROPOSERS, NUM_RELAYS},
-    rand::distributions::{Distribution, WeightedIndex},
     rand_chacha::{rand_core::SeedableRng, ChaChaRng},
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
@@ -57,11 +56,13 @@ impl ProposerSchedule {
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
+        // Build pool as a single weighted shuffle (no duplicates).
+        // Use modular indexing for slot extraction to avoid boundary issues.
         let proposer_pool = stake_weighted_selection(
             keyed_stakes,
             epoch,
-            // Need pool size = num_slots + NUM_PROPOSERS - 1 for rotation
-            num_slots + (NUM_PROPOSERS as u64) - 1,
+            // Pool size is one complete shuffle of validators
+            0, // 0 means "use validators.len()"
             0x50524F50, // "PROP" magic for proposer RNG differentiation
         );
 
@@ -77,9 +78,16 @@ impl ProposerSchedule {
     /// Get the set of proposers active at the given slot index.
     ///
     /// Returns NUM_PROPOSERS pubkeys representing the active proposers.
+    /// Uses modular indexing to ensure uniqueness even when slot_index
+    /// is larger than the pool size.
     pub fn get_proposers_at_slot_index(&self, slot_index: u64) -> Vec<Pubkey> {
-        let start = slot_index as usize;
-        self.proposer_pool[start..start + NUM_PROPOSERS as usize].to_vec()
+        let pool_len = self.proposer_pool.len();
+        let start = (slot_index as usize) % pool_len;
+
+        // Extract NUM_PROPOSERS elements using modular indexing
+        (0..NUM_PROPOSERS as usize)
+            .map(|i| self.proposer_pool[(start + i) % pool_len])
+            .collect()
     }
 
     /// Get the proposer ID for a given pubkey at a given slot index.
@@ -87,11 +95,11 @@ impl ProposerSchedule {
     /// Returns Some(proposer_id) if the pubkey is an active proposer at this slot,
     /// None otherwise.
     pub fn get_proposer_id(&self, slot_index: u64, pubkey: &Pubkey) -> Option<ProposerId> {
-        let start = slot_index as usize;
-        let end = start + NUM_PROPOSERS as usize;
+        let pool_len = self.proposer_pool.len();
+        let start = (slot_index as usize) % pool_len;
 
-        for (i, pk) in self.proposer_pool[start..end].iter().enumerate() {
-            if pk == pubkey {
+        for i in 0..NUM_PROPOSERS as usize {
+            if self.proposer_pool[(start + i) % pool_len] == *pubkey {
                 return Some(i as ProposerId);
             }
         }
@@ -105,26 +113,28 @@ impl ProposerSchedule {
 
     /// Get all slot indices where the given pubkey is an active proposer.
     pub fn get_proposer_slots(&self, pubkey: &Pubkey) -> Vec<u64> {
+        // With modular indexing, a pubkey at position P in the pool is active
+        // for any slot S where (S % pool_len) + i == P (mod pool_len) for some i < NUM_PROPOSERS.
+        // This means: S where P - NUM_PROPOSERS < S % pool_len <= P (mod pool_len)
+
         let positions = match self.pubkey_to_positions.get(pubkey) {
             Some(p) => p,
             None => return vec![],
         };
 
+        let pool_len = self.proposer_pool.len();
         let mut slots = Vec::new();
-        for &pos in positions {
-            // A proposer at position `pos` is active for slots:
-            // [max(0, pos - NUM_PROPOSERS + 1), min(pos, num_slots - 1)]
-            let first_slot = pos.saturating_sub(NUM_PROPOSERS as usize - 1);
-            let last_slot = pos.min(self.num_slots as usize - 1);
 
-            for slot in first_slot..=last_slot {
-                if !slots.contains(&(slot as u64)) {
-                    slots.push(slot as u64);
+        for slot in 0..self.num_slots {
+            let start = (slot as usize) % pool_len;
+            for i in 0..NUM_PROPOSERS as usize {
+                let pos = (start + i) % pool_len;
+                if positions.contains(&pos) {
+                    slots.push(slot);
+                    break;
                 }
             }
         }
-        slots.sort();
-        slots.dedup();
         slots
     }
 
@@ -161,11 +171,13 @@ impl RelaySchedule {
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
+        // Build pool as a single weighted shuffle (no duplicates).
+        // Use modular indexing for slot extraction to avoid boundary issues.
         let relay_pool = stake_weighted_selection(
             keyed_stakes,
             epoch,
-            // Need pool size = num_slots + NUM_RELAYS - 1 for rotation
-            num_slots + (NUM_RELAYS as u64) - 1,
+            // Pool size is one complete shuffle of validators
+            0, // 0 means "use validators.len()"
             0x52454C59, // "RELY" magic for relay RNG differentiation
         );
 
@@ -181,9 +193,16 @@ impl RelaySchedule {
     /// Get the set of relays active at the given slot index.
     ///
     /// Returns NUM_RELAYS pubkeys representing the active relays.
+    /// Uses modular indexing to ensure uniqueness even when slot_index
+    /// is larger than the pool size.
     pub fn get_relays_at_slot_index(&self, slot_index: u64) -> Vec<Pubkey> {
-        let start = slot_index as usize;
-        self.relay_pool[start..start + NUM_RELAYS as usize].to_vec()
+        let pool_len = self.relay_pool.len();
+        let start = (slot_index as usize) % pool_len;
+
+        // Extract NUM_RELAYS elements using modular indexing
+        (0..NUM_RELAYS as usize)
+            .map(|i| self.relay_pool[(start + i) % pool_len])
+            .collect()
     }
 
     /// Get the relay ID for a given pubkey at a given slot index.
@@ -191,11 +210,11 @@ impl RelaySchedule {
     /// Returns Some(relay_id) if the pubkey is an active relay at this slot,
     /// None otherwise.
     pub fn get_relay_id(&self, slot_index: u64, pubkey: &Pubkey) -> Option<RelayId> {
-        let start = slot_index as usize;
-        let end = start + NUM_RELAYS as usize;
+        let pool_len = self.relay_pool.len();
+        let start = (slot_index as usize) % pool_len;
 
-        for (i, pk) in self.relay_pool[start..end].iter().enumerate() {
-            if pk == pubkey {
+        for i in 0..NUM_RELAYS as usize {
+            if self.relay_pool[(start + i) % pool_len] == *pubkey {
                 return Some(i as RelayId);
             }
         }
@@ -290,10 +309,14 @@ impl McpSchedule {
     }
 }
 
-/// Generate stake-weighted selection for a pool of validators.
+/// Generate stake-weighted selection for a pool of validators WITHOUT REPLACEMENT.
 ///
 /// Uses ChaCha RNG seeded by epoch and magic number to ensure determinism
 /// while differentiating between proposer and relay schedules.
+///
+/// The algorithm performs weighted sampling without replacement. When pool_size
+/// is 0, returns a single complete shuffle of all validators (for use with
+/// modular indexing that guarantees uniqueness for any window extraction).
 fn stake_weighted_selection<'a>(
     keyed_stakes: impl Iterator<Item = (&'a Pubkey, u64)>,
     epoch: Epoch,
@@ -309,8 +332,7 @@ fn stake_weighted_selection<'a>(
     // Sort for determinism
     sort_stakes(&mut stakes);
 
-    let (keys, stake_values): (Vec<_>, Vec<_>) = stakes.into_iter().unzip();
-    let weighted_index = WeightedIndex::new(stake_values).unwrap();
+    let validators: Vec<_> = stakes.into_iter().collect();
 
     // Seed with epoch and magic to differentiate proposer vs relay schedules
     let mut seed = [0u8; 32];
@@ -319,9 +341,89 @@ fn stake_weighted_selection<'a>(
 
     let rng = &mut ChaChaRng::from_seed(seed);
 
-    (0..pool_size)
-        .map(|_| keys[weighted_index.sample(rng)])
-        .collect()
+    // If pool_size is 0, return a single complete shuffle.
+    // This is used with modular indexing to guarantee uniqueness.
+    let actual_pool_size = if pool_size == 0 {
+        validators.len()
+    } else {
+        pool_size as usize
+    };
+
+    let mut pool = Vec::with_capacity(actual_pool_size);
+
+    while pool.len() < actual_pool_size {
+        // Perform a weighted shuffle of all validators
+        let shuffled = weighted_shuffle_without_replacement(&validators, rng);
+
+        // Add shuffled validators to pool
+        for pubkey in shuffled {
+            if pool.len() >= actual_pool_size {
+                break;
+            }
+            pool.push(pubkey);
+        }
+    }
+
+    pool
+}
+
+/// Perform weighted shuffle without replacement using the Fisher-Yates variant.
+///
+/// Each item is selected with probability proportional to its stake,
+/// then removed from consideration for subsequent selections.
+fn weighted_shuffle_without_replacement(
+    validators: &[(&Pubkey, u64)],
+    rng: &mut ChaChaRng,
+) -> Vec<Pubkey> {
+    use rand::Rng;
+
+    let mut remaining: Vec<_> = validators.iter().map(|(pk, stake)| (*pk, *stake)).collect();
+    let mut result = Vec::with_capacity(remaining.len());
+
+    while !remaining.is_empty() {
+        let total_stake: u64 = remaining.iter().map(|(_, s)| s).sum();
+        if total_stake == 0 {
+            // All remaining have zero stake, just append them in order
+            result.extend(remaining.iter().map(|(pk, _)| **pk));
+            break;
+        }
+
+        // Select random point in [0, total_stake)
+        let target = rng.gen_range(0..total_stake);
+
+        // Find the validator at this cumulative stake point
+        let mut cumulative = 0u64;
+        let mut selected_idx = 0;
+        for (i, (_, stake)) in remaining.iter().enumerate() {
+            cumulative += stake;
+            if cumulative > target {
+                selected_idx = i;
+                break;
+            }
+        }
+
+        // Move selected validator to result
+        let (pubkey, _) = remaining.remove(selected_idx);
+        result.push(*pubkey);
+    }
+
+    result
+}
+
+/// Verify that no window of the given size contains duplicate pubkeys.
+/// (Currently unused but kept for debugging/testing)
+#[allow(dead_code)]
+fn verify_no_window_duplicates(pool: &[Pubkey], window_size: usize) -> bool {
+    use std::collections::HashSet;
+
+    for start in 0..pool.len().saturating_sub(window_size - 1) {
+        let window = &pool[start..std::cmp::min(start + window_size, pool.len())];
+        let unique: HashSet<_> = window.iter().collect();
+        if unique.len() != window.len() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sort stakes by stake descending, then by pubkey for determinism.
@@ -483,5 +585,52 @@ mod tests {
             overlap.len() >= (NUM_PROPOSERS as usize - 2),
             "Consecutive slots should share most proposers due to rotation"
         );
+    }
+
+    #[test]
+    fn test_no_duplicate_proposers_per_slot() {
+        use std::collections::HashSet;
+
+        let stakes = create_test_stakes();
+        let keyed_stakes: Vec<_> = stakes.iter().map(|(pk, s)| (pk, *s)).collect();
+
+        let schedule = ProposerSchedule::new(keyed_stakes.into_iter(), 0, 100);
+
+        // Verify each slot has unique proposers
+        for slot in 0..100 {
+            let proposers = schedule.get_proposers_at_slot_index(slot);
+            let unique: HashSet<_> = proposers.iter().collect();
+            assert_eq!(
+                unique.len(),
+                proposers.len(),
+                "Slot {} has duplicate proposers",
+                slot
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_duplicate_relays_per_slot() {
+        use std::collections::HashSet;
+
+        // Need more validators for relay test (200 relays)
+        let stakes: Vec<_> = (0..250)
+            .map(|i| (Pubkey::new_unique(), (i + 1) as u64 * 1000))
+            .collect();
+        let keyed_stakes: Vec<_> = stakes.iter().map(|(pk, s)| (pk, *s)).collect();
+
+        let schedule = RelaySchedule::new(keyed_stakes.into_iter(), 0, 50);
+
+        // Verify each slot has unique relays
+        for slot in 0..50 {
+            let relays = schedule.get_relays_at_slot_index(slot);
+            let unique: HashSet<_> = relays.iter().collect();
+            assert_eq!(
+                unique.len(),
+                relays.len(),
+                "Slot {} has duplicate relays",
+                slot
+            );
+        }
     }
 }

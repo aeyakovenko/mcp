@@ -83,6 +83,17 @@ The FEC rate (40:160) provides 4:1 redundancy, allowing reconstruction from any 
 | `SIZE_OF_MERKLE_PROOF_ENTRY` | 20 bytes | Truncated hash for proofs |
 | `PROOF_ENTRIES_FOR_MCP_BATCH` | 8 | ceil(log2(200)) |
 
+### 2.4 Batch Size Limits
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_TRANSACTIONS_PER_BATCH` | 65,536 | Maximum transactions per proposer batch |
+| `MAX_BATCH_BYTES` | 10 MB | Maximum serialized batch size |
+| `MAX_SHRED_DATA_SIZE` | 1,228 bytes | Maximum data payload per shred |
+| `MAX_WITNESS_ENTRIES` | 8 | Maximum merkle proof entries |
+
+**Enforcement:** Batches exceeding these limits MUST be rejected. Validators MUST NOT process oversized batches during replay.
+
 ---
 
 ## 3. Roles and Schedules
@@ -102,14 +113,24 @@ Schedules are deterministically generated per epoch using stake-weighted selecti
 ```
 seed = hash(epoch_number || role_magic)
 rng = ChaCha20Rng::from_seed(seed)
-schedule = stake_weighted_sample_without_replacement(validators, stakes, rng, pool_size)
+pool = stake_weighted_sample_without_replacement(validators, stakes, rng, pool_size)
 ```
 
-**Proposer Schedule:** 16 unique validators selected stake-weighted, rotating one position per slot.
+**Pool Generation:** A single shuffled pool of unique validators is generated for the epoch. The pool size equals the role count (16 for proposers, 200 for relays).
 
-**Relay Schedule:** 200 unique validators selected stake-weighted, rotating one position per slot.
+**Slot Assignment via Modular Indexing:** For slot `s` within the epoch:
+```
+for i in 0..role_count:
+    role_validators[i] = pool[(slot_index + i) % pool_size]
+```
 
-**Note:** The selection algorithm MUST ensure no duplicate validators within a single slot's proposer or relay set.
+Where `slot_index` is the slot's position within the epoch. This rotates the pool by one position per slot while guaranteeing uniqueness within each slot.
+
+**Proposer Schedule:** Pool of 16 unique validators, modular indexing assigns proposer_ids [0, 15].
+
+**Relay Schedule:** Pool of 200 unique validators, modular indexing assigns relay_ids [0, 199].
+
+**Uniqueness Guarantee:** The modular indexing approach mathematically guarantees no duplicate validators within a single slot's proposer or relay set, since consecutive indices in a circular pool are always distinct.
 
 **Leader Schedule:** Unchanged from standard Solana; uses `NUM_CONSECUTIVE_LEADER_SLOTS` repetition.
 
@@ -286,7 +307,9 @@ Proposers create transaction batches without executing:
 
 1. Receive transactions from mempool
 2. Validate signatures (no state execution)
-3. Order by ordering_fee descending, then by transaction hash (for determinism)
+3. Order by ordering_fee descending, then by SHA256(serialized_transaction) ascending (for determinism)
+   - The hash is computed over the full serialized transaction bytes
+   - Ties in ordering_fee are broken deterministically by transaction hash
 4. Serialize batch:
    ```
    | slot (8) | proposer_id (1) | tx_count (4) | [tx_len (4) | tx_data]... |
@@ -297,7 +320,9 @@ Proposers create transaction batches without executing:
 1. Serialize batch to bytes
 2. Apply Reed-Solomon encoding (40 data + 160 coding)
 3. Build Merkle tree over all 200 shreds
-4. Sign commitment: `sign(slot || proposer_id || merkle_root)`
+4. For each shred, sign: `sign(slot || proposer_id || shred_index || merkle_root)`
+   - `shred_index` is 4 bytes little-endian (range [0, 199])
+   - Binding shred_index prevents cross-shred signature replay attacks
 
 ### 7.3 Distribution to Relays
 
@@ -309,6 +334,8 @@ relay_id = shred_index % NUM_RELAYS
 
 Where `shred_index` is in range [0, 199] for MCP FEC blocks.
 
+**Stake-Weighted Relay Positions:** The `relay_id` maps to a stake-weighted position in the relay schedule, NOT directly to a validator. The schedule generation (Section 3.2) assigns validators to positions [0, 199] based on stake weight. Higher-stake validators are more likely to be assigned positions, but the `shred_index % NUM_RELAYS` formula distributes shreds uniformly across all scheduled relay positions for that slot.
+
 **Message Format:** Send to each relay via unicast:
 
 ```
@@ -317,6 +344,7 @@ Where `shred_index` is in range [0, 199] for MCP FEC blocks.
 ├──────────────────┬───────────────────────────────────────────────┤
 │ slot             │ 8 bytes, little-endian                        │
 │ proposer_id      │ 1 byte                                        │
+│ shred_index      │ 4 bytes, little-endian (range [0, 199])       │
 │ commitment       │ 32 bytes (merkle root)                        │
 │ shred_data_len   │ 4 bytes, little-endian                        │
 │ shred_data       │ Variable                                      │
@@ -325,6 +353,9 @@ Where `shred_index` is in range [0, 199] for MCP FEC blocks.
 │ proposer_sig     │ 64 bytes                                      │
 └──────────────────┴───────────────────────────────────────────────┘
 ```
+
+**Witness Size Enforcement:** If `witness_len > 8`, the message MUST be rejected as malformed.
+Relays MUST NOT process messages with invalid witness lengths.
 
 ---
 
@@ -335,10 +366,21 @@ Where `shred_index` is in range [0, 199] for MCP FEC blocks.
 For each received shred message:
 
 1. Validate `proposer_id` in range [0, 15]
-2. Verify proposer signature: `verify(proposer_pubkey, slot || proposer_id || commitment, sig)`
-3. Compute leaf hash: `SHA256(MERKLE_HASH_PREFIX_LEAF || shred_data)`
-4. Verify merkle proof against commitment
-5. Check for duplicates
+2. Validate `shred_index` in range [0, 199]
+3. Validate `witness_len <= 8` (reject if exceeded)
+4. Verify proposer signature: `verify(proposer_pubkey, slot || proposer_id || shred_index || commitment, sig)`
+   - Signature data is 45 bytes: slot (8) + proposer_id (1) + shred_index (4) + commitment (32)
+5. Compute leaf hash: `SHA256(MERKLE_HASH_PREFIX_LEAF || shred_data)`
+6. Verify merkle proof against commitment
+7. Check for duplicates (same slot, proposer_id, shred_index)
+
+**Verification Failure Handling:**
+- Invalid proposer_id: silently drop message
+- Invalid shred_index: silently drop message
+- Invalid witness_len: silently drop message
+- Signature verification failed: silently drop message
+- Merkle proof failed: silently drop message
+- Duplicate shred: silently drop message (keep first received)
 
 ### 8.2 Shred Storage
 
@@ -661,3 +703,4 @@ The following MUST produce identical results across all implementations:
 |---------|------|---------|
 | 1.0-draft | 2026-01-22 | Initial specification (draft) |
 | 1.0-draft | 2026-01-22 | Corrected fee charging, block_id serialization, relay distribution |
+| 1.0-draft | 2026-01-22 | Added shred_index to signature binding, batch limits, verification failure handling, clarified schedule generation |

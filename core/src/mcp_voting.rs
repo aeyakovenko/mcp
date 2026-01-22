@@ -22,16 +22,14 @@ use {
     std::collections::HashMap,
 };
 
-/// Number of proposers in MCP.
-pub const NUM_PROPOSERS: u8 = 16;
-
-/// Number of relays in MCP.
-pub const NUM_RELAYS: u16 = 200;
+// Re-export MCP constants from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
 /// Reconstruction threshold (20% of relays).
+/// Note: This matches RECONSTRUCTION_THRESHOLD in ledger/src/mcp.rs
 pub const RECONSTRUCTION_THRESHOLD_PERCENT: u8 = 20;
 
-/// Minimum shreds needed for valid block.
+/// Minimum shreds needed for valid block (20% of 200 = 40).
 pub const MIN_SHREDS_FOR_VALIDITY: usize =
     (NUM_RELAYS as usize * RECONSTRUCTION_THRESHOLD_PERCENT as usize) / 100;
 
@@ -167,6 +165,11 @@ impl BlockValidator {
         }
     }
 
+    /// Get the slot being validated.
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
     /// Set the required proposers based on attestation aggregate.
     pub fn set_required_proposers(&mut self, proposers: Vec<u8>) {
         self.required_proposers = proposers;
@@ -188,11 +191,16 @@ impl BlockValidator {
     /// 1. Leader signature (caller should verify before calling this)
     /// 2. Delayed bankhash matches
     /// 3. All required proposers have enough shreds
+    ///
+    /// The `payload_block_id` is the block_id computed by the ConsensusPayload.
+    /// This validator does NOT recompute it - it trusts the payload's computation
+    /// after verifying the leader signature.
     pub fn validate(
         &self,
         payload_leader: &Pubkey,
         payload_bankhash: &Hash,
         payload_proposers: &[(u8, Hash)],
+        payload_block_id: Hash,
     ) -> BlockValidationResult {
         // Check leader
         if *payload_leader != self.expected_leader {
@@ -237,23 +245,9 @@ impl BlockValidator {
             }
         }
 
-        // All checks passed - compute block_id
-        // In practice, block_id comes from the consensus payload
-        // Here we simulate it for testing
-        let block_id = self.compute_block_id(payload_proposers);
-
-        BlockValidationResult::Valid { block_id }
-    }
-
-    /// Compute block ID from proposer commitments.
-    fn compute_block_id(&self, proposers: &[(u8, Hash)]) -> Hash {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.slot.to_le_bytes());
-        for (pid, root) in proposers {
-            data.push(*pid);
-            data.extend_from_slice(root.as_ref());
-        }
-        solana_sha256_hasher::hash(&data)
+        // All checks passed - return the block_id from the payload
+        // The block_id is trusted because we verified the leader's signature
+        BlockValidationResult::Valid { block_id: payload_block_id }
     }
 }
 
@@ -307,6 +301,7 @@ impl BlockVote {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use solana_signer::Signer;
 
     fn make_test_hash(seed: u8) -> Hash {
         Hash::from([seed; 32])
@@ -344,9 +339,13 @@ mod tests {
             (1u8, make_test_hash(1)),
             (2u8, make_test_hash(2)),
         ];
+        let block_id = make_test_hash(42);
 
-        let result = validator.validate(&leader, &bankhash, &proposers);
+        let result = validator.validate(&leader, &bankhash, &proposers, block_id);
         assert!(matches!(result, BlockValidationResult::Valid { .. }));
+        if let BlockValidationResult::Valid { block_id: returned_id } = result {
+            assert_eq!(returned_id, block_id);
+        }
     }
 
     #[test]
@@ -356,7 +355,7 @@ mod tests {
         let bankhash = make_test_hash(99);
         let validator = BlockValidator::new(100, expected_leader, bankhash);
 
-        let result = validator.validate(&wrong_leader, &bankhash, &[]);
+        let result = validator.validate(&wrong_leader, &bankhash, &[], make_test_hash(1));
         assert!(matches!(result, BlockValidationResult::Invalid {
             reason: ValidationFailure::WrongLeader { .. }
         }));
@@ -369,7 +368,7 @@ mod tests {
         let wrong_bankhash = make_test_hash(100);
         let validator = BlockValidator::new(100, leader, expected_bankhash);
 
-        let result = validator.validate(&leader, &wrong_bankhash, &[]);
+        let result = validator.validate(&leader, &wrong_bankhash, &[], make_test_hash(1));
         assert!(matches!(result, BlockValidationResult::Invalid {
             reason: ValidationFailure::BankhashMismatch { .. }
         }));
@@ -390,7 +389,7 @@ mod tests {
             (2u8, make_test_hash(2)),
         ];
 
-        let result = validator.validate(&leader, &bankhash, &proposers);
+        let result = validator.validate(&leader, &bankhash, &proposers, make_test_hash(1));
         assert!(matches!(result, BlockValidationResult::Pending { .. }));
         if let BlockValidationResult::Pending { pending_proposers } = result {
             assert_eq!(pending_proposers, vec![2]);

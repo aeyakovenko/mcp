@@ -12,6 +12,7 @@ pub(crate) const PROOF_ENTRIES_FOR_32_32_BATCH: u8 = 6;
 
 // MCP-06: Number of proof entries for MCP 200 shred batch (40 data + 160 coding).
 // ceil(log2(200)) = 8
+#[allow(dead_code)] // Reserved for MCP batch creation
 pub(crate) const PROOF_ENTRIES_FOR_MCP_BATCH: u8 = 8;
 
 // Defense against second preimage attack:

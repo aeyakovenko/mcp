@@ -147,6 +147,11 @@ impl SlotFeeTracker {
         }
     }
 
+    /// Get the slot being tracked.
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
     /// Record a fee payment.
     pub fn record_fee_payment(
         &mut self,

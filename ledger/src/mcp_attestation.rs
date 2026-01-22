@@ -392,7 +392,7 @@ impl RelayAttestationBuilder {
     }
 
     /// Add an attestation entry for a proposer.
-    pub fn add_entry(&mut self, proposer_id: u8, merkle_root: Hash) -> &mut Self {
+    pub fn add_entry(mut self, proposer_id: u8, merkle_root: Hash) -> Self {
         self.entries
             .push(AttestationEntry::new(proposer_id, merkle_root));
         self

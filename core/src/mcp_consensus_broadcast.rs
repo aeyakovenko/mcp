@@ -26,8 +26,8 @@ use {
     solana_signer::Signer,
 };
 
-/// Proposer ID used for consensus payload shreds.
-pub const CONSENSUS_PAYLOAD_PROPOSER_ID: u8 = 0xFF;
+// Re-export MCP constant from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::CONSENSUS_PAYLOAD_PROPOSER_ID;
 
 /// Current version of the consensus payload format.
 pub const CONSENSUS_PAYLOAD_VERSION: u8 = 1;

@@ -107,12 +107,15 @@ pub const SIZE_OF_NONCE: usize = std::mem::size_of::<Nonce>();
 /// `test_shred_constants` ensures that the values are correct.
 ///
 /// MCP-05: Added proposer_id (1 byte) after version field.
-/// Legacy shreds (without proposer_id) use SIZE_OF_COMMON_SHRED_HEADER_LEGACY.
+/// Legacy shreds (without proposer_id) use SIZE_OF_*_LEGACY constants.
 const SIZE_OF_COMMON_SHRED_HEADER: usize = 84; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
 const SIZE_OF_COMMON_SHRED_HEADER_LEGACY: usize = 83;
 pub const SIZE_OF_DATA_SHRED_HEADERS: usize = 89; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
 const SIZE_OF_DATA_SHRED_HEADERS_LEGACY: usize = 88;
 const SIZE_OF_CODING_SHRED_HEADERS: usize = 90; // MCP: +1 for proposer_id
+#[allow(dead_code)] // Reserved for legacy shred compatibility
 const SIZE_OF_CODING_SHRED_HEADERS_LEGACY: usize = 89;
 const SIZE_OF_SIGNATURE: usize = SIGNATURE_BYTES;
 
@@ -259,10 +262,8 @@ enum ShredVariant {
     }, // 0b10??_????
 }
 
-/// Reserved proposer ID for consensus payload shreds (MCP-05).
-/// Shreds with this proposer_id contain consensus-level data (certificates, votes)
-/// rather than proposer transaction batches.
-pub const CONSENSUS_PAYLOAD_PROPOSER_ID: u8 = 0xFF;
+// Re-export consensus payload proposer ID from canonical source (mcp.rs)
+pub use crate::mcp::CONSENSUS_PAYLOAD_PROPOSER_ID;
 
 /// Default proposer ID for legacy/non-MCP shreds.
 pub const DEFAULT_PROPOSER_ID: u8 = 0;
@@ -979,6 +980,7 @@ mod tests {
             slot: Slot::MAX,
             index: u32::MAX,
             version: u16::MAX,
+            proposer_id: u8::MAX, // MCP-05: proposer_id field
             fec_set_index: u32::MAX,
         };
         let data_shred_header = DataShredHeader {

@@ -22,13 +22,11 @@ use {
     std::collections::{HashMap, HashSet},
 };
 
-/// Number of proposers in MCP.
-pub const NUM_PROPOSERS: u8 = 16;
-
-/// Number of relays in MCP.
-pub const NUM_RELAYS: u16 = 200;
+// Re-export MCP constants from canonical source (ledger/src/mcp.rs)
+pub use solana_ledger::mcp::{NUM_PROPOSERS, NUM_RELAYS};
 
 /// Attestation threshold as percentage (60%).
+/// Note: This matches ATTESTATION_THRESHOLD in ledger/src/mcp.rs
 pub const ATTESTATION_THRESHOLD_PERCENT: u8 = 60;
 
 // ============================================================================
