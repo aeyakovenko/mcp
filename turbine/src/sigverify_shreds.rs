@@ -9,11 +9,13 @@ use {
     rayon::{prelude::*, ThreadPool, ThreadPoolBuilder},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
+    solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         block_location_lookup::BlockLocationLookup,
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp::{NUM_PROPOSERS, NUM_RELAYS},
         shred::{
             self,
             layout::{get_shred, resign_packet},
@@ -29,9 +31,11 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_signature::Signature,
     solana_signer::Signer,
     solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     std::{
+        collections::HashMap,
         num::NonZeroUsize,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -591,6 +595,266 @@ impl ShredSigVerifyStats {
             ("resign_micros", self.resign_micros, i64),
         );
         *self = Self::new(Instant::now());
+    }
+}
+
+// ============================================================================
+// MCP (Multiple Concurrent Proposers) Relay Shred Processing
+// ============================================================================
+
+/// Maximum witness entries (merkle proof depth for 256 leaves)
+pub const MAX_WITNESS_ENTRIES: usize = 8;
+
+/// Size of each witness entry (truncated hash)
+pub const WITNESS_ENTRY_SIZE: usize = 20;
+
+/// Maximum witness bytes (8 entries * 20 bytes)
+pub const MAX_WITNESS_BYTES: usize = MAX_WITNESS_ENTRIES * WITNESS_ENTRY_SIZE;
+
+/// Maximum shred index (200 shreds per FEC block, indices 0-199)
+pub const MAX_SHRED_INDEX: u32 = 199;
+
+/// A proposer shred message received by a relay.
+#[derive(Debug, Clone)]
+pub struct ProposerShredMessage {
+    pub slot: u64,
+    pub proposer_id: u8,
+    pub shred_index: u32,
+    pub commitment: Hash,
+    pub shred_data: Vec<u8>,
+    pub witness: Vec<u8>,
+    pub proposer_signature: Signature,
+}
+
+impl ProposerShredMessage {
+    /// Create a new proposer shred message.
+    pub fn new(
+        slot: u64,
+        proposer_id: u8,
+        shred_index: u32,
+        commitment: Hash,
+        shred_data: Vec<u8>,
+        witness: Vec<u8>,
+        proposer_signature: Signature,
+    ) -> Self {
+        Self {
+            slot,
+            proposer_id,
+            shred_index,
+            commitment,
+            shred_data,
+            witness,
+            proposer_signature,
+        }
+    }
+
+    /// Get the data to be signed by the proposer.
+    pub fn get_signing_data(&self) -> Vec<u8> {
+        let mut data = Vec::with_capacity(8 + 1 + 4 + 32);
+        data.extend_from_slice(&self.slot.to_le_bytes());
+        data.push(self.proposer_id);
+        data.extend_from_slice(&self.shred_index.to_le_bytes());
+        data.extend_from_slice(self.commitment.as_ref());
+        data
+    }
+
+    /// Verify the proposer's signature.
+    pub fn verify_proposer_signature(&self, proposer_pubkey: &Pubkey) -> bool {
+        let signing_data = self.get_signing_data();
+        self.proposer_signature
+            .verify(proposer_pubkey.as_ref(), &signing_data)
+    }
+}
+
+/// A validated shred ready for storage and broadcast.
+#[derive(Debug, Clone)]
+pub struct ValidatedShred {
+    pub data: Vec<u8>,
+    pub shred_index: u32,
+    pub proposer_id: u8,
+    pub merkle_root: Hash,
+}
+
+/// Tracks validated shreds for a slot, organized by proposer.
+#[derive(Debug, Default)]
+pub struct SlotShredTracker {
+    slot: u64,
+    proposer_shreds: HashMap<u8, HashMap<u32, ValidatedShred>>,
+    proposer_commitments: HashMap<u8, Hash>,
+}
+
+impl SlotShredTracker {
+    /// Create a new tracker for a slot.
+    pub fn new(slot: u64) -> Self {
+        Self {
+            slot,
+            proposer_shreds: HashMap::new(),
+            proposer_commitments: HashMap::new(),
+        }
+    }
+
+    /// Get the slot being tracked.
+    pub fn slot(&self) -> u64 {
+        self.slot
+    }
+
+    /// Record a validated shred.
+    pub fn insert_shred(&mut self, shred: ValidatedShred) -> bool {
+        let proposer_map = self
+            .proposer_shreds
+            .entry(shred.proposer_id)
+            .or_default();
+
+        if proposer_map.contains_key(&shred.shred_index) {
+            return false;
+        }
+
+        self.proposer_commitments
+            .entry(shred.proposer_id)
+            .or_insert(shred.merkle_root);
+
+        proposer_map.insert(shred.shred_index, shred);
+        true
+    }
+
+    /// Get the number of shreds received for a proposer.
+    pub fn shred_count(&self, proposer_id: u8) -> usize {
+        self.proposer_shreds
+            .get(&proposer_id)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Check if we have a shred at the given index for a proposer.
+    pub fn has_shred(&self, proposer_id: u8, shred_index: u32) -> bool {
+        self.proposer_shreds
+            .get(&proposer_id)
+            .map(|m| m.contains_key(&shred_index))
+            .unwrap_or(false)
+    }
+
+    /// Get the commitment (merkle root) for a proposer.
+    pub fn get_commitment(&self, proposer_id: u8) -> Option<&Hash> {
+        self.proposer_commitments.get(&proposer_id)
+    }
+
+    /// Get all proposer IDs that have shreds.
+    pub fn proposers(&self) -> impl Iterator<Item = u8> + '_ {
+        self.proposer_shreds.keys().copied()
+    }
+}
+
+/// Relay shred processor for MCP.
+pub struct RelayShredProcessor {
+    relay_id: u16,
+    slot_trackers: HashMap<u64, SlotShredTracker>,
+    max_tracked_slots: usize,
+}
+
+impl RelayShredProcessor {
+    /// Create a new relay shred processor.
+    pub fn new(relay_id: u16) -> Self {
+        Self {
+            relay_id,
+            slot_trackers: HashMap::new(),
+            max_tracked_slots: 100,
+        }
+    }
+
+    /// Get this relay's ID.
+    pub fn relay_id(&self) -> u16 {
+        self.relay_id
+    }
+
+    /// Process a proposer shred message.
+    ///
+    /// Per spec §9.1, verification failures result in silent drop (return None).
+    pub fn process_shred(
+        &mut self,
+        message: &ProposerShredMessage,
+        proposer_pubkey: &Pubkey,
+    ) -> Option<ValidatedShred> {
+        let shred_index = message.shred_index;
+
+        // Validate proposer ID
+        if message.proposer_id >= NUM_PROPOSERS {
+            return None;
+        }
+
+        // Validate shred_index
+        if shred_index > MAX_SHRED_INDEX {
+            return None;
+        }
+
+        // Validate witness length
+        if message.witness.len() > MAX_WITNESS_BYTES {
+            return None;
+        }
+
+        // Verify this shred is meant for this relay
+        let expected_relay = (shred_index as u16) % NUM_RELAYS;
+        if expected_relay != self.relay_id {
+            return None;
+        }
+
+        // Verify proposer signature
+        if !message.verify_proposer_signature(proposer_pubkey) {
+            return None;
+        }
+
+        // Check for duplicate
+        if let Some(tracker) = self.slot_trackers.get(&message.slot) {
+            if tracker.has_shred(message.proposer_id, shred_index) {
+                return None;
+            }
+        }
+
+        // Create validated shred
+        let validated = ValidatedShred {
+            data: message.shred_data.clone(),
+            shred_index,
+            proposer_id: message.proposer_id,
+            merkle_root: message.commitment,
+        };
+
+        // Insert into tracker
+        let tracker = self
+            .slot_trackers
+            .entry(message.slot)
+            .or_insert_with(|| SlotShredTracker::new(message.slot));
+        tracker.insert_shred(validated.clone());
+
+        // Cleanup old slots if needed
+        self.cleanup_old_slots(message.slot);
+
+        Some(validated)
+    }
+
+    /// Cleanup old slot trackers to prevent memory growth.
+    fn cleanup_old_slots(&mut self, current_slot: u64) {
+        if self.slot_trackers.len() > self.max_tracked_slots {
+            let min_slot_to_keep = current_slot.saturating_sub(self.max_tracked_slots as u64);
+            self.slot_trackers
+                .retain(|&slot, _| slot >= min_slot_to_keep);
+        }
+    }
+
+    /// Get the tracker for a specific slot.
+    pub fn get_slot_tracker(&self, slot: u64) -> Option<&SlotShredTracker> {
+        self.slot_trackers.get(&slot)
+    }
+
+    /// Get all proposers with shreds for a slot.
+    pub fn get_attested_proposers(&self, slot: u64) -> Vec<(u8, Hash)> {
+        self.slot_trackers
+            .get(&slot)
+            .map(|tracker| {
+                tracker
+                    .proposers()
+                    .filter_map(|pid| tracker.get_commitment(pid).map(|h| (pid, *h)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
