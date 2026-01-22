@@ -262,8 +262,10 @@ enum ShredVariant {
     }, // 0b10??_????
 }
 
-// Re-export consensus payload proposer ID from canonical source (mcp.rs)
-pub use crate::mcp::CONSENSUS_PAYLOAD_PROPOSER_ID;
+/// Reserved proposer ID for consensus payload shreds.
+/// Shreds with this proposer_id contain consensus-level data (e.g., certificates,
+/// votes) rather than proposer transaction batches.
+pub const CONSENSUS_PAYLOAD_PROPOSER_ID: u8 = 0xFF;
 
 /// Default proposer ID for legacy/non-MCP shreds.
 pub const DEFAULT_PROPOSER_ID: u8 = 0;
