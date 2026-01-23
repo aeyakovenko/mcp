@@ -35,17 +35,17 @@
 ## Issue-by-Issue Missing Work (latest snapshot)
 - #21 PR Spec: spec is present but code does not implement the defined wire formats or pipeline behavior (`mcp_spec.md:361-618`).
 - #19 MCP-04 Transaction format: no SDK/runtime parsing or fee integration; mismatched config layout and `target_proposer` type (`ledger/src/mcp.rs:216-262`, `mcp_spec.md:500-511`).
-- #18 MCP-16 Replay reconstruct: no RS decoding or reconstruction pipeline; MCP shreds only stored (`core/src/window_service.rs:214-253`, `ledger/src/blockstore.rs:3164-3278`).
+- #18 MCP-16 Replay reconstruct: PARTIALLY FIXED - `reconstruct_slot()` and RS decoding wired in replay_stage; remaining: full integration with bank execution.
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
 - #16 MCP-14 Voting: MCP block validation/vote logic exists but is unused; implied block computation skips proposer signature checks (`core/src/mcp_consensus_block.rs:333-368`).
-- #15 MCP-13 Consensus broadcast: no turbine path broadcasts MCP blocks; only relay-shred distribution exists (`turbine/src/broadcast_stage/standard_broadcast_run.rs:631-700`).
-- #14 MCP-12 Aggregate attestations: no aggregation pipeline; attestation formats conflict (`ledger/src/mcp_attestation.rs:48-55`, `ledger/src/shred/mcp_shred.rs:423-456`).
-- #13 MCP-11 Relay submit attestations: no relay emission path; attestation formats inconsistent with spec.
+- #15 MCP-13 Consensus broadcast: PARTIALLY FIXED - `mcp_block_sender` wired in replay_stage for consensus broadcast; remaining: wire receiver in retransmit stage.
+- #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; remaining: attestation format consistency across modules.
+- #13 MCP-11 Relay submit attestations: PARTIALLY FIXED - `RelayAttestationService` wired in window_service; remaining: wire keypair and UDP send to leader.
 - #12 MCP-09 Relay verify shreds: Merkle verification uses truncated root and relay witness_len is not enforced to spec root semantics (`ledger/src/mcp_merkle.rs:97-120`, `turbine/src/sigverify_shreds.rs:929-957`).
 - #11 MCP-07 Proposer distribute shreds: broadcaster repackages legacy shreds and does not RS-encode payload (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`).
 - #10 MCP-19 Bankless proposer/leader: no bankless integration in banking/replay.
 - #9 MCP-10 Record attestation: MCP attestation CFs exist but no writes/reads from pipeline.
-- #8 MCP-17 Fee-only replay: helper types exist but replay does not use them.
+- #8 MCP-17 Fee-only replay: PARTIALLY FIXED - `TwoPhaseProcessor` initialized in replay_stage with ordered transactions; remaining: integrate with blockstore_processor execution.
 - #7 MCP-05 Proposer ID in shreds: legacy shred header modified, but MCP shreds are separate; no unified path.
 - #6 MCP-08 Fee payer check: MCP fee validation is enforced in transaction processor but relies on a config not parsed from transactions (`svm/src/transaction_processor.rs:633-652`, `ledger/src/mcp.rs:216-262`).
 - #5 MCP-02 Schedule: algorithm differs from spec’s seed derivation (spec uses `SHA256("mcp:committee:"||role||epoch)`, code uses `epoch||magic`) (`mcp_spec.md:155-206`, `ledger/src/leader_schedule.rs:275-314`).
