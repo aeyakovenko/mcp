@@ -38,9 +38,9 @@
 - #18 MCP-16 Replay reconstruct: PARTIALLY FIXED - `reconstruct_slot()` and RS decoding wired in replay_stage; remaining: full integration with bank execution.
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
 - #16 MCP-14 Voting: MCP block validation/vote logic exists but is unused; implied block computation skips proposer signature checks (`core/src/mcp_consensus_block.rs:333-368`).
-- #15 MCP-13 Consensus broadcast: PARTIALLY FIXED - `mcp_block_sender` wired in replay_stage for consensus broadcast; remaining: wire receiver in retransmit stage.
+- #15 MCP-13 Consensus broadcast: MOSTLY FIXED - `mcp_block_sender` wired replay_stage -> retransmit_stage; remaining: actual broadcast logic in retransmit.
 - #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; format consistency now fixed (all u32).
-- #13 MCP-11 Relay submit attestations: PARTIALLY FIXED - `RelayAttestationService` wired in window_service; remaining: wire keypair and UDP send to leader.
+- #13 MCP-11 Relay submit attestations: MOSTLY FIXED - `RelayAttestationService` creates attestations with keypair; remaining: UDP send to leader.
 - #12 MCP-09 Relay verify shreds: FIXED - Merkle verification now correctly compares full 32-byte root against commitment.
 - #11 MCP-07 Proposer distribute shreds: broadcaster repackages legacy shreds and does not RS-encode payload (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`).
 - #10 MCP-19 Bankless proposer/leader: no bankless integration in banking/replay.
