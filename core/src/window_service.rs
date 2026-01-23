@@ -37,6 +37,7 @@ use {
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
     solana_signature,
+    solana_keypair::Keypair,
     solana_streamer::evicting_sender::EvictingSender,
     solana_turbine::cluster_nodes,
     solana_votor_messages::migration::MigrationStatus,
@@ -265,6 +266,7 @@ fn run_insert<F>(
     mcp_tracker: &mut McpSlotTracker,
     mcp_reconstruction_sender: Option<&McpReconstructionSender>,
     relay_attestation_service: &mut RelayAttestationService,
+    relay_keypair: Option<&Arc<Keypair>>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -343,16 +345,29 @@ where
 
     // Check if any attestations are ready to send
     if let Some((slot, proposers)) = relay_attestation_service.check_attestation_ready() {
-        // Create attestation (requires keypair - would need to add this)
-        // For now, just log that attestation is ready
         info!(
             "MCP relay attestation ready for slot {} with {} proposers",
             slot,
             proposers.len()
         );
-        // TODO: Wire in keypair and leader address for actual attestation submission
-        // let attestation = relay_attestation_service.create_attestation(slot, proposers, keypair);
-        // submit_attestation(&attestation, leader_addr, socket);
+
+        // Create and send attestation if we have a keypair
+        if let Some(keypair) = relay_keypair {
+            let attestation = relay_attestation_service.create_attestation(
+                slot,
+                proposers,
+                keypair,
+            );
+            info!(
+                "MCP: Created attestation for slot {} from relay {} with {} entries",
+                slot,
+                attestation.relay_id,
+                attestation.entries.len()
+            );
+            // TODO: Send attestation to leader via UDP
+            // let leader_addr = get_attestation_leader_addr(leader_schedule_cache, slot);
+            // submit_attestation(&attestation, leader_addr, socket);
+        }
     }
 
     // Try reconstruction for slots that may have enough shreds
@@ -501,6 +516,8 @@ pub struct WindowServiceChannels {
     pub repair_service_channels: RepairServiceChannels,
     /// Sender for MCP reconstruction results to feed replay
     pub mcp_reconstruction_sender: Option<McpReconstructionSender>,
+    /// Optional keypair for relay attestation signing (only for relay nodes)
+    pub relay_keypair: Option<Arc<Keypair>>,
 }
 
 impl WindowServiceChannels {
@@ -518,6 +535,7 @@ impl WindowServiceChannels {
             duplicate_slots_sender,
             repair_service_channels,
             mcp_reconstruction_sender: None,
+            relay_keypair: None,
         }
     }
 
@@ -537,7 +555,14 @@ impl WindowServiceChannels {
             duplicate_slots_sender,
             repair_service_channels,
             mcp_reconstruction_sender: Some(mcp_reconstruction_sender),
+            relay_keypair: None,
         }
+    }
+
+    /// Set the relay keypair for attestation signing
+    pub fn with_relay_keypair(mut self, keypair: Arc<Keypair>) -> Self {
+        self.relay_keypair = Some(keypair);
+        self
     }
 }
 
@@ -573,6 +598,7 @@ impl WindowService {
             duplicate_slots_sender,
             repair_service_channels,
             mcp_reconstruction_sender,
+            relay_keypair,
         } = window_service_channels;
 
         let repair_service = RepairService::new(
@@ -608,6 +634,7 @@ impl WindowService {
             retransmit_sender,
             accept_repairs_only,
             mcp_reconstruction_sender,
+            relay_keypair,
         );
 
         WindowService {
@@ -660,6 +687,7 @@ impl WindowService {
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         accept_repairs_only: bool,
         mcp_reconstruction_sender: Option<McpReconstructionSender>,
+        relay_keypair: Option<Arc<Keypair>>,
     ) -> JoinHandle<()> {
         let handle_error = || {
             inc_new_counter_error!("solana-window-insert-error", 1, 1);
@@ -705,6 +733,7 @@ impl WindowService {
                         &mut mcp_tracker,
                         mcp_reconstruction_sender.as_ref(),
                         &mut relay_attestation_service,
+                        relay_keypair.as_ref(),
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
