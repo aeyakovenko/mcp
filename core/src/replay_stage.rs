@@ -2649,6 +2649,31 @@ impl ReplayStage {
         prioritization_fee_cache: &PrioritizationFeeCache,
         migration_status: &MigrationStatus,
     ) -> result::Result<usize, BlockstoreProcessorError> {
+        let slot = bank.slot();
+
+        // Check if this slot has MCP shreds for reconstruction
+        if blockstore.has_mcp_shreds(slot) {
+            if blockstore.can_reconstruct_mcp_slot(slot) {
+                // MCP slot ready for reconstruction
+                trace!(
+                    "Slot {} has MCP shreds ready for reconstruction",
+                    slot
+                );
+                // TODO: Full MCP reconstruction pipeline:
+                // 1. Load MCP shreds from blockstore via get_all_mcp_shreds_for_slot()
+                // 2. For each proposer, reconstruct using mcp_replay_reconstruction
+                // 3. Order transactions by proposer_id, then by ordering_fee (desc), then tx hash
+                // 4. De-duplicate transactions
+                // 5. Process through bank with fee-only first pass
+                // For now, fall through to regular processing as MCP is in parallel
+            } else {
+                trace!(
+                    "Slot {} has MCP shreds but not enough for reconstruction yet",
+                    slot
+                );
+            }
+        }
+
         let mut w_replay_stats = replay_stats.write().unwrap();
         let mut w_replay_progress = replay_progress.write().unwrap();
         let tx_count_before = w_replay_progress.num_txs;
