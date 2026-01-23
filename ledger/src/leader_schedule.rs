@@ -28,62 +28,66 @@ pub type RelayId = u16;
 
 /// MCP schedule for proposers in an epoch.
 ///
-/// Each slot has NUM_PROPOSERS active proposers. The schedule rotates
-/// one proposer per slot to ensure fair participation.
+/// Per MCP spec §3.3: Committee selection uses deterministic stake-weighted rotation.
+/// The committee for slot s+1 is derived by rotating the committee for slot s by 1 position
+/// and sampling 1 new validator (not already in committee) to fill the vacated position.
 #[derive(Debug, Clone)]
 pub struct ProposerSchedule {
-    /// Base proposer set for the epoch (stake-weighted selection of validators).
-    proposer_pool: Vec<Pubkey>,
+    /// Pre-computed committees for each slot in the epoch.
+    /// Each entry is a Vec of NUM_PROPOSERS pubkeys representing the committee for that slot.
+    slot_committees: Vec<Vec<Pubkey>>,
     /// Number of slots in this epoch
     num_slots: u64,
-    /// Map from pubkey to their position(s) in the pool
-    pubkey_to_positions: HashMap<Pubkey, Vec<usize>>,
 }
 
 impl ProposerSchedule {
     /// Create a new proposer schedule from stake-weighted validators.
+    ///
+    /// Per spec §3.3: For slot 0, fill committee by weighted sampling without replacement.
+    /// For slot s+1: rotate committee by 1, sample new validator from remaining pool.
     pub fn new<'a>(
         keyed_stakes: impl Iterator<Item = (&'a Pubkey, u64)>,
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
-        let proposer_pool = mcp_stake_weighted_selection(
-            keyed_stakes,
+        let validators: Vec<_> = keyed_stakes
+            .filter(|(_, stake)| *stake > 0)
+            .map(|(pk, stake)| (*pk, stake))
+            .collect();
+
+        // Pre-compute all slot committees
+        let slot_committees = compute_slot_committees(
+            &validators,
             epoch,
-            NUM_PROPOSERS as u64,
+            num_slots,
+            NUM_PROPOSERS as usize,
             0x50524F50, // "PROP" magic
         );
 
-        let pubkey_to_positions = build_mcp_position_map(&proposer_pool);
-
         Self {
-            proposer_pool,
+            slot_committees,
             num_slots,
-            pubkey_to_positions,
         }
     }
 
     /// Get the set of proposers active at the given slot index.
     pub fn get_proposers_at_slot_index(&self, slot_index: u64) -> Vec<Pubkey> {
-        let pool_len = self.proposer_pool.len();
-        let start = (slot_index as usize) % pool_len;
-
-        (0..NUM_PROPOSERS as usize)
-            .map(|i| self.proposer_pool[(start + i) % pool_len])
-            .collect()
+        let idx = (slot_index % self.num_slots) as usize;
+        if idx < self.slot_committees.len() {
+            self.slot_committees[idx].clone()
+        } else {
+            // Fallback: return the last committee (shouldn't happen)
+            self.slot_committees.last().cloned().unwrap_or_default()
+        }
     }
 
     /// Get the proposer ID for a given pubkey at a given slot index.
     pub fn get_proposer_id(&self, slot_index: u64, pubkey: &Pubkey) -> Option<ProposerId> {
-        let pool_len = self.proposer_pool.len();
-        let start = (slot_index as usize) % pool_len;
-
-        for i in 0..NUM_PROPOSERS as usize {
-            if self.proposer_pool[(start + i) % pool_len] == *pubkey {
-                return Some(i as ProposerId);
-            }
-        }
-        None
+        let committee = self.get_proposers_at_slot_index(slot_index);
+        committee
+            .iter()
+            .position(|pk| pk == pubkey)
+            .map(|pos| pos as ProposerId)
     }
 
     /// Check if a pubkey is an active proposer at the given slot index.
@@ -93,22 +97,10 @@ impl ProposerSchedule {
 
     /// Get all slot indices where the given pubkey is an active proposer.
     pub fn get_proposer_slots(&self, pubkey: &Pubkey) -> Vec<u64> {
-        let positions = match self.pubkey_to_positions.get(pubkey) {
-            Some(p) => p,
-            None => return vec![],
-        };
-
-        let pool_len = self.proposer_pool.len();
         let mut slots = Vec::new();
-
-        for slot in 0..self.num_slots {
-            let start = (slot as usize) % pool_len;
-            for i in 0..NUM_PROPOSERS as usize {
-                let pos = (start + i) % pool_len;
-                if positions.contains(&pos) {
-                    slots.push(slot);
-                    break;
-                }
+        for (slot_idx, committee) in self.slot_committees.iter().enumerate() {
+            if committee.contains(pubkey) {
+                slots.push(slot_idx as u64);
             }
         }
         slots
@@ -122,62 +114,66 @@ impl ProposerSchedule {
 
 /// MCP schedule for relays in an epoch.
 ///
-/// Each slot has NUM_RELAYS active relays. The schedule rotates
-/// one relay per slot to ensure fair participation.
+/// Per MCP spec §3.3: Committee selection uses deterministic stake-weighted rotation.
+/// The committee for slot s+1 is derived by rotating the committee for slot s by 1 position
+/// and sampling 1 new validator (not already in committee) to fill the vacated position.
 #[derive(Debug, Clone)]
 pub struct RelaySchedule {
-    /// Base relay set for the epoch (stake-weighted selection of validators).
-    relay_pool: Vec<Pubkey>,
+    /// Pre-computed committees for each slot in the epoch.
+    /// Each entry is a Vec of NUM_RELAYS pubkeys representing the committee for that slot.
+    slot_committees: Vec<Vec<Pubkey>>,
     /// Number of slots in this epoch
     num_slots: u64,
-    /// Map from pubkey to their position(s) in the pool
-    pubkey_to_positions: HashMap<Pubkey, Vec<usize>>,
 }
 
 impl RelaySchedule {
     /// Create a new relay schedule from stake-weighted validators.
+    ///
+    /// Per spec §3.3: For slot 0, fill committee by weighted sampling without replacement.
+    /// For slot s+1: rotate committee by 1, sample new validator from remaining pool.
     pub fn new<'a>(
         keyed_stakes: impl Iterator<Item = (&'a Pubkey, u64)>,
         epoch: Epoch,
         num_slots: u64,
     ) -> Self {
-        let relay_pool = mcp_stake_weighted_selection(
-            keyed_stakes,
+        let validators: Vec<_> = keyed_stakes
+            .filter(|(_, stake)| *stake > 0)
+            .map(|(pk, stake)| (*pk, stake))
+            .collect();
+
+        // Pre-compute all slot committees
+        let slot_committees = compute_slot_committees(
+            &validators,
             epoch,
-            NUM_RELAYS as u64,
+            num_slots,
+            NUM_RELAYS as usize,
             0x52454C59, // "RELY" magic
         );
 
-        let pubkey_to_positions = build_mcp_position_map(&relay_pool);
-
         Self {
-            relay_pool,
+            slot_committees,
             num_slots,
-            pubkey_to_positions,
         }
     }
 
     /// Get the set of relays active at the given slot index.
     pub fn get_relays_at_slot_index(&self, slot_index: u64) -> Vec<Pubkey> {
-        let pool_len = self.relay_pool.len();
-        let start = (slot_index as usize) % pool_len;
-
-        (0..NUM_RELAYS as usize)
-            .map(|i| self.relay_pool[(start + i) % pool_len])
-            .collect()
+        let idx = (slot_index % self.num_slots) as usize;
+        if idx < self.slot_committees.len() {
+            self.slot_committees[idx].clone()
+        } else {
+            // Fallback: return the last committee (shouldn't happen)
+            self.slot_committees.last().cloned().unwrap_or_default()
+        }
     }
 
     /// Get the relay ID for a given pubkey at a given slot index.
     pub fn get_relay_id(&self, slot_index: u64, pubkey: &Pubkey) -> Option<RelayId> {
-        let pool_len = self.relay_pool.len();
-        let start = (slot_index as usize) % pool_len;
-
-        for i in 0..NUM_RELAYS as usize {
-            if self.relay_pool[(start + i) % pool_len] == *pubkey {
-                return Some(i as RelayId);
-            }
-        }
-        None
+        let committee = self.get_relays_at_slot_index(slot_index);
+        committee
+            .iter()
+            .position(|pk| pk == pubkey)
+            .map(|pos| pos as RelayId)
     }
 
     /// Check if a pubkey is an active relay at the given slot index.
@@ -187,24 +183,12 @@ impl RelaySchedule {
 
     /// Get all slot indices where the given pubkey is an active relay.
     pub fn get_relay_slots(&self, pubkey: &Pubkey) -> Vec<u64> {
-        let positions = match self.pubkey_to_positions.get(pubkey) {
-            Some(p) => p,
-            None => return vec![],
-        };
-
         let mut slots = Vec::new();
-        for &pos in positions {
-            let first_slot = pos.saturating_sub(NUM_RELAYS as usize - 1);
-            let last_slot = pos.min(self.num_slots as usize - 1);
-
-            for slot in first_slot..=last_slot {
-                if !slots.contains(&(slot as u64)) {
-                    slots.push(slot as u64);
-                }
+        for (slot_idx, committee) in self.slot_committees.iter().enumerate() {
+            if committee.contains(pubkey) {
+                slots.push(slot_idx as u64);
             }
         }
-        slots.sort();
-        slots.dedup();
         slots
     }
 
@@ -266,92 +250,149 @@ impl McpSchedule {
     }
 }
 
-/// Generate stake-weighted selection for MCP without replacement.
-fn mcp_stake_weighted_selection<'a>(
-    keyed_stakes: impl Iterator<Item = (&'a Pubkey, u64)>,
+/// Compute slot committees for all slots in an epoch using per-slot sampling.
+///
+/// Per MCP spec §3.3:
+/// - Epoch initialization (slot 0): fill committee by weighted sampling without replacement
+/// - For slot s+1: rotate committee by 1 position, sample 1 new validator to fill vacancy
+///
+/// The sampling for slot s+1 uses rng_slot seeded with: seed_role || LE64(slot_index)
+fn compute_slot_committees(
+    validators: &[(Pubkey, u64)],
     epoch: Epoch,
-    pool_size: u64,
+    num_slots: u64,
+    committee_size: usize,
     magic: u32,
-) -> Vec<Pubkey> {
-    let mut stakes: Vec<_> = keyed_stakes.filter(|(_, stake)| *stake > 0).collect();
-
-    if stakes.is_empty() {
-        return vec![];
+) -> Vec<Vec<Pubkey>> {
+    if validators.is_empty() || committee_size == 0 {
+        return vec![vec![]; num_slots as usize];
     }
 
-    sort_stakes(&mut stakes);
+    // Sort validators by stake (descending) for deterministic ordering
+    let mut sorted_validators: Vec<_> = validators.to_vec();
+    sort_stakes_owned(&mut sorted_validators);
 
-    let validators: Vec<_> = stakes.into_iter().collect();
+    // Create base seed for this role
+    let mut base_seed = [0u8; 32];
+    base_seed[0..8].copy_from_slice(&epoch.to_le_bytes());
+    base_seed[8..12].copy_from_slice(&magic.to_le_bytes());
 
-    let mut seed = [0u8; 32];
-    seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-    seed[8..12].copy_from_slice(&magic.to_le_bytes());
+    let mut slot_committees = Vec::with_capacity(num_slots as usize);
 
-    let rng = &mut ChaChaRng::from_seed(seed);
+    // Initialize slot 0 committee by weighted sampling without replacement
+    let mut rng_slot0 = ChaChaRng::from_seed(compute_slot_seed(&base_seed, 0));
+    let initial_committee = sample_initial_committee(&sorted_validators, committee_size, &mut rng_slot0);
+    slot_committees.push(initial_committee);
 
-    let actual_pool_size = if pool_size == 0 {
-        validators.len()
-    } else {
-        pool_size as usize
-    };
+    // Compute committees for slots 1..num_slots
+    for slot_idx in 1..num_slots {
+        let prev_committee = &slot_committees[(slot_idx - 1) as usize];
 
-    let mut pool = Vec::with_capacity(actual_pool_size);
+        // Rotate: drop first element, shift left
+        // committee' = committee[1..] (the dropped element exits)
+        let mut new_committee: Vec<Pubkey> = prev_committee.iter().skip(1).cloned().collect();
 
-    while pool.len() < actual_pool_size {
-        let shuffled = mcp_weighted_shuffle_without_replacement(&validators, rng);
+        // Sample new validator from candidates not in the rotated committee
+        let mut rng_slot = ChaChaRng::from_seed(compute_slot_seed(&base_seed, slot_idx));
+        let new_member = sample_new_member(&sorted_validators, &new_committee, &mut rng_slot);
 
-        for pubkey in shuffled {
-            if pool.len() >= actual_pool_size {
-                break;
-            }
-            pool.push(pubkey);
-        }
+        // Append new member at the end
+        new_committee.push(new_member);
+
+        slot_committees.push(new_committee);
     }
 
-    pool
+    slot_committees
 }
 
-/// Perform weighted shuffle without replacement for MCP.
-fn mcp_weighted_shuffle_without_replacement(
-    validators: &[(&Pubkey, u64)],
+/// Compute the seed for a specific slot's RNG.
+/// seed_slot = SHA256(base_seed || LE64(slot_index))
+fn compute_slot_seed(base_seed: &[u8; 32], slot_index: u64) -> [u8; 32] {
+    use solana_sha256_hasher::hashv;
+    let slot_bytes = slot_index.to_le_bytes();
+    let hash = hashv(&[base_seed, &slot_bytes]);
+    hash.to_bytes()
+}
+
+/// Sample initial committee by weighted sampling without replacement.
+fn sample_initial_committee(
+    validators: &[(Pubkey, u64)],
+    committee_size: usize,
     rng: &mut ChaChaRng,
 ) -> Vec<Pubkey> {
-    let mut remaining: Vec<_> = validators.iter().map(|(pk, stake)| (*pk, *stake)).collect();
-    let mut result = Vec::with_capacity(remaining.len());
+    let actual_size = committee_size.min(validators.len());
+    let mut remaining: Vec<_> = validators.to_vec();
+    let mut committee = Vec::with_capacity(actual_size);
 
-    while !remaining.is_empty() {
-        let total_stake: u64 = remaining.iter().map(|(_, s)| s).sum();
-        if total_stake == 0 {
-            result.extend(remaining.iter().map(|(pk, _)| **pk));
-            break;
-        }
-
-        let target = rng.gen_range(0..total_stake);
-
-        let mut cumulative = 0u64;
-        let mut selected_idx = 0;
-        for (i, (_, stake)) in remaining.iter().enumerate() {
-            cumulative += stake;
-            if cumulative > target {
-                selected_idx = i;
-                break;
-            }
-        }
-
-        let (pubkey, _) = remaining.remove(selected_idx);
-        result.push(*pubkey);
+    while committee.len() < actual_size && !remaining.is_empty() {
+        let picked = weighted_sample_and_remove(&mut remaining, rng);
+        committee.push(picked);
     }
 
-    result
+    committee
 }
 
-/// Build a map from pubkey to positions in the pool for MCP schedules.
-fn build_mcp_position_map(pool: &[Pubkey]) -> HashMap<Pubkey, Vec<usize>> {
-    let mut map: HashMap<Pubkey, Vec<usize>> = HashMap::new();
-    for (pos, pubkey) in pool.iter().enumerate() {
-        map.entry(*pubkey).or_default().push(pos);
+/// Sample a new member from validators not already in the committee.
+fn sample_new_member(
+    validators: &[(Pubkey, u64)],
+    current_committee: &[Pubkey],
+    rng: &mut ChaChaRng,
+) -> Pubkey {
+    // Build candidate set: all validators not in current committee
+    let candidates: Vec<_> = validators
+        .iter()
+        .filter(|(pk, _)| !current_committee.contains(pk))
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        // Fallback: if all validators are in committee, sample from all
+        // This shouldn't happen if committee_size < validators.len()
+        let mut all = validators.to_vec();
+        return weighted_sample_and_remove(&mut all, rng);
     }
-    map
+
+    let mut candidates_mut = candidates;
+    weighted_sample_and_remove(&mut candidates_mut, rng)
+}
+
+/// Weighted sample one validator and remove from the list.
+fn weighted_sample_and_remove(validators: &mut Vec<(Pubkey, u64)>, rng: &mut ChaChaRng) -> Pubkey {
+    if validators.is_empty() {
+        return Pubkey::default();
+    }
+
+    if validators.len() == 1 {
+        return validators.remove(0).0;
+    }
+
+    let total_stake: u64 = validators.iter().map(|(_, s)| s).sum();
+    if total_stake == 0 {
+        // All zero stake, pick randomly
+        let idx = rng.gen_range(0..validators.len());
+        return validators.remove(idx).0;
+    }
+
+    let target = rng.gen_range(0..total_stake);
+    let mut cumulative = 0u64;
+    let mut selected_idx = 0;
+
+    for (i, (_, stake)) in validators.iter().enumerate() {
+        cumulative += stake;
+        if cumulative > target {
+            selected_idx = i;
+            break;
+        }
+    }
+
+    validators.remove(selected_idx).0
+}
+
+/// Sort validators by (stake descending, pubkey ascending) for deterministic ordering.
+fn sort_stakes_owned(stakes: &mut [(Pubkey, u64)]) {
+    stakes.sort_by(|(pk_a, stake_a), (pk_b, stake_b)| {
+        stake_b.cmp(stake_a).then_with(|| pk_a.cmp(pk_b))
+    });
 }
 
 // ============================================================================
