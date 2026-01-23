@@ -383,6 +383,15 @@ impl SlotAttestations {
         }
         None
     }
+
+    /// Get all attestations for block construction.
+    ///
+    /// Returns attestations sorted by relay_id for deterministic ordering.
+    pub fn get_all_attestations(&self) -> Vec<&RelayAttestation> {
+        let mut attestations: Vec<_> = self.attestations.values().collect();
+        attestations.sort_by_key(|a| a.relay_id);
+        attestations
+    }
 }
 
 /// Aggregates relay attestations for the consensus leader.
@@ -446,6 +455,16 @@ impl AttestationAggregator {
             .get(&slot)
             .map(|sa| sa.relay_count())
             .unwrap_or(0)
+    }
+
+    /// Get all attestations for a slot for block construction.
+    ///
+    /// Returns attestations sorted by relay_id for deterministic ordering.
+    pub fn get_all_attestations(&self, slot: Slot) -> Vec<&RelayAttestation> {
+        self.slot_attestations
+            .get(&slot)
+            .map(|sa| sa.get_all_attestations())
+            .unwrap_or_default()
     }
 
     /// Cleanup old slots.

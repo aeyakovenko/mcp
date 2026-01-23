@@ -39,7 +39,7 @@
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
 - #16 MCP-14 Voting: FIXED - `compute_implied_blocks_with_verification()` now called with proposer pubkeys from `leader_schedule_cache.get_proposers_at_slot()` in replay_stage (`core/src/replay_stage.rs:2733-2755`).
 - #15 MCP-13 Consensus broadcast: MOSTLY FIXED - `mcp_block_sender` wired replay_stage -> retransmit_stage; remaining: actual broadcast logic in retransmit.
-- #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; format consistency now fixed (all u32).
+- #14 MCP-12 Aggregate attestations: FIXED - `AttestationAggregator` wired in replay_stage, `get_all_attestations()` added to retrieve attestations for block construction, relay entries now properly populated (`core/src/mcp_relay_attestation.rs:387-394`, `core/src/replay_stage.rs:2937-2948`).
 - #13 MCP-11 Relay submit attestations: MOSTLY FIXED - `RelayAttestationService` creates attestations with keypair; remaining: UDP send to leader.
 - #12 MCP-09 Relay verify shreds: FIXED - Merkle verification now correctly compares full 32-byte root against commitment.
 - #11 MCP-07 Proposer distribute shreds: broadcaster repackages legacy shreds and does not RS-encode payload (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`).

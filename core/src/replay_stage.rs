@@ -2934,12 +2934,18 @@ impl ReplayStage {
             .unwrap_or_default();
 
         // Build relay entries from aggregated attestations
-        // TODO: Access internal attestations from aggregator - for now, use included proposers
+        let all_attestations = aggregator.get_all_attestations(slot);
         let included_proposers = aggregator.get_included_proposers(slot);
 
-        // Create a minimal block with the included proposers
-        // In a full implementation, we would include all relay attestation entries
-        let relay_entries: Vec<RelayEntryV1> = Vec::new(); // Placeholder - needs actual attestation data
+        // Convert RelayAttestation to RelayEntryV1 for block construction
+        let relay_entries: Vec<RelayEntryV1> = all_attestations
+            .iter()
+            .map(|attestation| RelayEntryV1 {
+                relay_index: attestation.relay_id as u32,
+                entries: attestation.entries.clone(),
+                relay_signature: attestation.relay_signature.as_ref().try_into().unwrap_or([0u8; 64]),
+            })
+            .collect();
 
         // Create the unsigned block
         let mut mcp_block = McpBlockV1::new_unsigned(
