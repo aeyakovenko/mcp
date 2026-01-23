@@ -1,6 +1,6 @@
 # MCP Audit Snapshot (spec vs code)
 - Repo: /home/anatoly/mcp
-- Audit time: 2026-01-23T09:11:09Z
+- Audit time: 2026-01-23T13:45:22Z
 - Spec reviewed: `mcp_spec.md` (source of truth)
 - GitHub issues: 20 open items (includes PR #21)
 - Assumption: lazy implementation; comments are not trusted
@@ -14,8 +14,8 @@
 - **Proposer signature message mismatch**: spec signs commitment only (`mcp_spec.md:346-351`), but code signs `slot || proposer_index || commitment` (`ledger/src/shred/mcp_shred.rs:277-289`, `ledger/src/mcp_attestation.rs:97-105`).
 - **MCP shred generation not spec-compliant**: spec requires RS-encoding a payload then constructing `McpShredV1` (`mcp_spec.md:548-557`), but broadcast code repackages existing legacy shreds and their payloads (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`) with no RS encoding.
 - **MCP shred detection is size-only**: spec requires versioned format validation (`mcp_spec.md:361-383`), but detection is `len == 1225` (`ledger/src/shred/mcp_shred.rs:393-396`, `core/src/window_service.rs:214-217`, `turbine/src/sigverify_shreds.rs:905-910`).
-- **Merkle proof verification is incorrect**: spec requires witness to open the full commitment (`mcp_spec.md:374-381`, `mcp_spec.md:564-575`). Code verifies against only the first 20 bytes of commitment (`ledger/src/mcp_merkle.rs:97-120`) and does not enforce the spec’s root semantics.
-- **Relay attestation format mismatch**: spec uses `proposer_index: u32` and includes proposer signatures (`mcp_spec.md:395-416`). Code defines two incompatible formats: `ledger/src/mcp_attestation.rs` uses `proposer_index: u8` (`ledger/src/mcp_attestation.rs:48-55`) while `ledger/src/shred/mcp_shred.rs` uses `u32` (`ledger/src/shred/mcp_shred.rs:423-456`). Consensus block code consumes the `u8` format (`core/src/mcp_consensus_block.rs:18-20`).
+- **Merkle proof verification**: FIXED - Code now correctly compares full 32-byte root against commitment per spec §4.4.5 (`ledger/src/mcp_merkle.rs:97-130`).
+- **Relay attestation format**: FIXED - All modules now use `proposer_index: u32` consistently (`ledger/src/mcp_attestation.rs`, `ledger/src/shred/mcp_shred.rs`, `core/src/mcp_consensus_block.rs`).
 - **Consensus payload type mismatch**: spec defines `AggregateAttestationV1` and block hash rules (`mcp_spec.md:418-618`), while code defines `McpBlockV1` in a separate module and does not wire it into consensus (`core/src/mcp_consensus_block.rs:1-80`).
 - **Transaction header format missing**: spec adds `transaction_config_mask` in the header and `target_proposer: u32` (`mcp_spec.md:500-511`), but code defines a separate config blob with a 1-byte mask and `target_proposer: Pubkey` (`ledger/src/mcp.rs:216-262`) and does not wire parsing into SDK/runtime.
 - **McpPayloadV1 not implemented**: spec defines `McpPayloadV1` and `tx_len: u16` (`mcp_spec.md:318-333`); no serialization/parsing exists in replay or banking.
@@ -39,9 +39,9 @@
 - #17 MCP-15 Empty slots: no replay-stage handling or execution output persistence.
 - #16 MCP-14 Voting: MCP block validation/vote logic exists but is unused; implied block computation skips proposer signature checks (`core/src/mcp_consensus_block.rs:333-368`).
 - #15 MCP-13 Consensus broadcast: PARTIALLY FIXED - `mcp_block_sender` wired in replay_stage for consensus broadcast; remaining: wire receiver in retransmit stage.
-- #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; remaining: attestation format consistency across modules.
+- #14 MCP-12 Aggregate attestations: PARTIALLY FIXED - `AttestationAggregator` wired in replay_stage main loop; format consistency now fixed (all u32).
 - #13 MCP-11 Relay submit attestations: PARTIALLY FIXED - `RelayAttestationService` wired in window_service; remaining: wire keypair and UDP send to leader.
-- #12 MCP-09 Relay verify shreds: Merkle verification uses truncated root and relay witness_len is not enforced to spec root semantics (`ledger/src/mcp_merkle.rs:97-120`, `turbine/src/sigverify_shreds.rs:929-957`).
+- #12 MCP-09 Relay verify shreds: FIXED - Merkle verification now correctly compares full 32-byte root against commitment.
 - #11 MCP-07 Proposer distribute shreds: broadcaster repackages legacy shreds and does not RS-encode payload (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`).
 - #10 MCP-19 Bankless proposer/leader: no bankless integration in banking/replay.
 - #9 MCP-10 Record attestation: MCP attestation CFs exist but no writes/reads from pipeline.
@@ -55,8 +55,8 @@
 - #1 MCP-18 Ordered output: FIXED - `build_ordered_transactions()` provides deterministic ordering (proposers 0..15, first occurrence wins); `TwoPhaseProcessor` integration added in replay_stage.rs.
 
 ## High-Risk Bugs
-- Invalid MCP shreds can be accepted because Merkle proof verification is not spec-correct (`ledger/src/mcp_merkle.rs:97-120`, `turbine/src/sigverify_shreds.rs:953-957`).
-- Multiple incompatible attestation formats can cause silent consensus splits (`ledger/src/mcp_attestation.rs:48-55`, `ledger/src/shred/mcp_shred.rs:423-456`, `core/src/mcp_consensus_block.rs:18-20`).
+- ~~Invalid MCP shreds can be accepted because Merkle proof verification is not spec-correct~~ FIXED - Now compares full 32-byte root.
+- ~~Multiple incompatible attestation formats can cause silent consensus splits~~ FIXED - All modules now use u32 for proposer_index.
 - MCP transaction header format mismatch will break clients built to spec (`mcp_spec.md:500-511`, `ledger/src/mcp.rs:216-262`).
 
 ## Commands Run
