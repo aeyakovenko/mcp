@@ -20,6 +20,7 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK},
         mcp_replay_reconstruction::{
             reconstruct_slot, ShredData, SlotReconstructionState,
         },
@@ -2670,35 +2671,58 @@ impl ReplayStage {
                     let mut state = SlotReconstructionState::new(slot);
 
                     // Track implied proposers (proposer_id -> commitment)
-                    let mut implied_proposers: Vec<(u32, Hash)> = Vec::new();
-
-                    for (proposer_id, proposer_shreds) in mcp_shreds {
-                        // Parse the first shred to get the commitment (they should all have the same)
-                        if let Some((_, first_shred_bytes)) = proposer_shreds.first() {
-                            if let Ok(first_shred) = McpShredV1::from_bytes(first_shred_bytes) {
-                                let commitment = Hash::new_from_array(first_shred.commitment);
-                                implied_proposers.push((proposer_id, commitment));
-
-                                // Add all shreds for this proposer to reconstruction state
-                                for (idx, (_shred_idx, shred_bytes)) in proposer_shreds.iter().enumerate() {
-                                    if let Ok(mcp_shred) = McpShredV1::from_bytes(shred_bytes) {
-                                        let shred_data = ShredData {
-                                            index: idx as u16,
-                                            is_data: idx < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
-                                            data: mcp_shred.shred_data.to_vec(),
-                                            merkle_proof: mcp_shred.witness.to_vec(),
-                                        };
-                                        state.add_shred(proposer_id, shred_data);
+                    // First, try to get implied proposers from MCP consensus block if available
+                    let implied_proposers: Vec<(u32, Hash)> = match blockstore.get_mcp_consensus_payload(slot, bank.parent_block_id().unwrap_or_default()) {
+                        Ok(Some(block_bytes)) => {
+                            // Parse MCP block and use compute_implied_blocks()
+                            match McpBlockV1::deserialize(&mut block_bytes.as_slice()) {
+                                Ok(mcp_block) => {
+                                    if mcp_block.relay_entries.len() >= MIN_RELAYS_IN_BLOCK {
+                                        // Use the block's implied proposers algorithm per spec §11.2
+                                        let implied = mcp_block.compute_implied_blocks();
+                                        info!(
+                                            "MCP slot {} using consensus block with {} relays, {} implied proposers",
+                                            slot, mcp_block.relay_entries.len(), implied.len()
+                                        );
+                                        implied
+                                    } else {
+                                        warn!(
+                                            "MCP slot {} has block with only {} relays (need {}), falling back to shred commitments",
+                                            slot, mcp_block.relay_entries.len(), MIN_RELAYS_IN_BLOCK
+                                        );
+                                        Self::extract_implied_proposers_from_shreds(&mcp_shreds)
                                     }
                                 }
+                                Err(e) => {
+                                    warn!("Failed to parse MCP consensus block for slot {}: {}", slot, e);
+                                    Self::extract_implied_proposers_from_shreds(&mcp_shreds)
+                                }
+                            }
+                        }
+                        _ => {
+                            // No consensus block available, use shred commitments directly
+                            // This is the fallback path before full MCP activation
+                            trace!("No MCP consensus block for slot {}, using shred commitments", slot);
+                            Self::extract_implied_proposers_from_shreds(&mcp_shreds)
+                        }
+                    };
+
+                    // 3. Add all shreds to reconstruction state
+                    for (proposer_id, proposer_shreds) in mcp_shreds {
+                        for (idx, (_shred_idx, shred_bytes)) in proposer_shreds.iter().enumerate() {
+                            if let Ok(mcp_shred) = McpShredV1::from_bytes(shred_bytes) {
+                                let shred_data = ShredData {
+                                    index: idx as u16,
+                                    is_data: idx < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
+                                    data: mcp_shred.shred_data.to_vec(),
+                                    merkle_proof: mcp_shred.witness.to_vec(),
+                                };
+                                state.add_shred(proposer_id, shred_data);
                             }
                         }
                     }
 
-                    // Sort implied_proposers by proposer_id for deterministic ordering
-                    implied_proposers.sort_by_key(|(id, _)| *id);
-
-                    // 3. Set implied proposers and reconstruct
+                    // 4. Set implied proposers and reconstruct
                     state.set_implied_proposers(implied_proposers.clone());
                     let reconstruction = reconstruct_slot(&state, &implied_proposers);
 
@@ -2710,7 +2734,7 @@ impl ReplayStage {
                         reconstruction.transaction_count()
                     );
 
-                    // 4. Process reconstructed transactions
+                    // 5. Process reconstructed transactions
                     // NOTE: Full MCP processing with fee-only first pass is deferred.
                     // For now, log the reconstruction results and continue with regular processing.
                     // The transactions from MCP proposers are available in reconstruction.ordered_transactions
@@ -2758,6 +2782,26 @@ impl ReplayStage {
         let tx_count_after = w_replay_progress.num_txs;
         let tx_count = tx_count_after - tx_count_before;
         Ok(tx_count)
+    }
+
+    /// Extract implied proposers from MCP shreds when no consensus block is available.
+    /// This is a fallback path before full MCP activation or for testing.
+    fn extract_implied_proposers_from_shreds(
+        mcp_shreds: &std::collections::HashMap<u32, Vec<(u64, Vec<u8>)>>,
+    ) -> Vec<(u32, Hash)> {
+        let mut implied_proposers = Vec::new();
+        for (proposer_id, proposer_shreds) in mcp_shreds {
+            // Parse the first shred to get the commitment (they should all have the same)
+            if let Some((_, first_shred_bytes)) = proposer_shreds.first() {
+                if let Ok(first_shred) = McpShredV1::from_bytes(first_shred_bytes) {
+                    let commitment = Hash::new_from_array(first_shred.commitment);
+                    implied_proposers.push((*proposer_id, commitment));
+                }
+            }
+        }
+        // Sort by proposer_id for deterministic ordering
+        implied_proposers.sort_by_key(|(id, _)| *id);
+        implied_proposers
     }
 
     #[allow(clippy::too_many_arguments)]

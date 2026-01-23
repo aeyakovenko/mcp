@@ -5,6 +5,15 @@
 use {
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
+        mcp_relay_attestation::{
+            ReceivedShredInfo, RelayAttestationConfig, RelayAttestationService,
+            // TODO: Wire in for actual attestation submission
+            // get_attestation_leader_addr, submit_attestation,
+        },
+        mcp_replay_reconstruction::{
+            reconstruct_proposer_payload, ProposerShreds, ReconstructionResult,
+            ShredData, SlotReconstruction,
+        },
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
@@ -15,21 +24,25 @@ use {
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::cluster_info::ClusterInfo,
+    solana_hash::Hash,
     solana_ledger::{
         blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
         shred::{self, mcp_shred::{McpShredV1, MCP_SHRED_TOTAL_BYTES}, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
+    solana_signature,
     solana_streamer::evicting_sender::EvictingSender,
     solana_turbine::cluster_nodes,
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
+        collections::HashMap,
         net::UdpSocket,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -42,6 +55,56 @@ use {
 
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
+
+/// MCP reconstruction result ready for replay
+pub type McpReconstructionSender = Sender<SlotReconstruction>;
+pub type McpReconstructionReceiver = Receiver<SlotReconstruction>;
+
+/// Track MCP shreds per slot for availability checking
+#[derive(Default)]
+struct McpSlotTracker {
+    /// Shred count per (slot, proposer_id)
+    shred_counts: HashMap<(Slot, u8), usize>,
+    /// Slots that have been reconstructed
+    reconstructed_slots: HashMap<Slot, bool>,
+}
+
+impl McpSlotTracker {
+    /// Record an MCP shred and return true if we should check reconstruction
+    fn record_shred(&mut self, slot: Slot, proposer_id: u8) -> bool {
+        // Don't track if already reconstructed
+        if self.reconstructed_slots.get(&slot).copied().unwrap_or(false) {
+            return false;
+        }
+
+        let key = (slot, proposer_id);
+        let count = self.shred_counts.entry(key).or_insert(0);
+        *count += 1;
+
+        // Check if we just hit the K threshold
+        *count == MCP_DATA_SHREDS_PER_FEC_BLOCK
+    }
+
+    /// Check if a proposer has enough shreds for reconstruction
+    fn can_reconstruct(&self, slot: Slot, proposer_id: u8) -> bool {
+        self.shred_counts
+            .get(&(slot, proposer_id))
+            .copied()
+            .unwrap_or(0) >= MCP_DATA_SHREDS_PER_FEC_BLOCK
+    }
+
+    /// Mark a slot as reconstructed
+    fn mark_reconstructed(&mut self, slot: Slot) {
+        self.reconstructed_slots.insert(slot, true);
+    }
+
+    /// Garbage collect old slots
+    #[allow(dead_code)]
+    fn gc_old_slots(&mut self, min_slot: Slot) {
+        self.shred_counts.retain(|(slot, _), _| *slot >= min_slot);
+        self.reconstructed_slots.retain(|slot, _| *slot >= min_slot);
+    }
+}
 
 #[derive(Default)]
 struct WindowServiceMetrics {
@@ -199,6 +262,9 @@ fn run_insert<F>(
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     reed_solomon_cache: &ReedSolomonCache,
     accept_repairs_only: bool,
+    mcp_tracker: &mut McpSlotTracker,
+    mcp_reconstruction_sender: Option<&McpReconstructionSender>,
+    relay_attestation_service: &mut RelayAttestationService,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -236,21 +302,76 @@ where
             .collect()
     });
 
-    // Handle MCP shreds - store them in MCP columns
+    // Handle MCP shreds - store them and track availability
     let mcp_count = mcp_shreds.len();
+    let mut slots_to_check: HashMap<Slot, Vec<u8>> = HashMap::new();
+
     for (shred_data, _repair, _block_location) in mcp_shreds {
         if let Ok(mcp_shred) = McpShredV1::from_bytes(&shred_data) {
+            let slot = mcp_shred.slot;
+            let proposer_id = mcp_shred.proposer_index as u8;
+            let commitment = Hash::new_from_array(mcp_shred.commitment);
+            let proposer_signature = solana_signature::Signature::from(mcp_shred.proposer_signature);
+
             // Store MCP shred in MCP columns
             if let Err(e) = blockstore.put_mcp_data_shred(
-                mcp_shred.slot,
-                mcp_shred.proposer_index as u8,
+                slot,
+                proposer_id,
                 mcp_shred.shred_index as u64,
                 &shred_data,
             ) {
                 debug!("Failed to store MCP shred: {}", e);
+                continue;
+            }
+
+            // Track the shred for relay attestation
+            relay_attestation_service.record_shred(ReceivedShredInfo {
+                slot,
+                proposer_id: proposer_id as u32,
+                shred_index: mcp_shred.shred_index,
+                commitment,
+                proposer_signature,
+            });
+
+            // Track the shred and check if we should try reconstruction
+            if mcp_tracker.record_shred(slot, proposer_id) {
+                // Just hit K threshold for this proposer - may need reconstruction
+                slots_to_check.entry(slot).or_default().push(proposer_id);
             }
         }
     }
+
+    // Check if any attestations are ready to send
+    if let Some((slot, proposers)) = relay_attestation_service.check_attestation_ready() {
+        // Create attestation (requires keypair - would need to add this)
+        // For now, just log that attestation is ready
+        info!(
+            "MCP relay attestation ready for slot {} with {} proposers",
+            slot,
+            proposers.len()
+        );
+        // TODO: Wire in keypair and leader address for actual attestation submission
+        // let attestation = relay_attestation_service.create_attestation(slot, proposers, keypair);
+        // submit_attestation(&attestation, leader_addr, socket);
+    }
+
+    // Try reconstruction for slots that may have enough shreds
+    if !slots_to_check.is_empty() {
+        if let Some(sender) = mcp_reconstruction_sender {
+            for (slot, proposers) in slots_to_check {
+                // Try to reconstruct this slot
+                if let Some(reconstruction) = try_mcp_reconstruction(blockstore, slot, &proposers, mcp_tracker) {
+                    if let Err(e) = sender.try_send(reconstruction) {
+                        debug!("Failed to send MCP reconstruction: {:?}", e);
+                    } else {
+                        mcp_tracker.mark_reconstructed(slot);
+                        info!("MCP reconstruction sent for slot {}", slot);
+                    }
+                }
+            }
+        }
+    }
+
     if mcp_count > 0 {
         trace!("Stored {} MCP shreds", mcp_count);
     }
@@ -274,12 +395,112 @@ where
     Ok(())
 }
 
+/// Try to reconstruct MCP payloads from stored shreds.
+///
+/// This function:
+/// 1. Reads MCP shreds from blockstore for each proposer
+/// 2. Performs RS decoding to reconstruct payloads
+/// 3. Builds the ordered transaction list with de-duplication
+fn try_mcp_reconstruction(
+    blockstore: &Blockstore,
+    slot: Slot,
+    _proposers_with_k: &[u8],
+    mcp_tracker: &McpSlotTracker,
+) -> Option<SlotReconstruction> {
+    use solana_ledger::mcp::NUM_PROPOSERS;
+
+    let mut reconstruction = SlotReconstruction::new(slot);
+    let mut any_success = false;
+
+    // Try to reconstruct each proposer that has K shreds
+    for proposer_id in 0..NUM_PROPOSERS as u8 {
+        if !mcp_tracker.can_reconstruct(slot, proposer_id) {
+            continue;
+        }
+
+        // Read shreds from blockstore for this proposer
+        let shreds = match blockstore.get_mcp_data_shreds_for_proposer(slot, proposer_id) {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("Failed to read MCP shreds for slot {} proposer {}: {}", slot, proposer_id, e);
+                continue;
+            }
+        };
+
+        if shreds.len() < MCP_DATA_SHREDS_PER_FEC_BLOCK {
+            debug!(
+                "Not enough MCP shreds for slot {} proposer {}: {} < {}",
+                slot, proposer_id, shreds.len(), MCP_DATA_SHREDS_PER_FEC_BLOCK
+            );
+            continue;
+        }
+
+        // Convert shreds to ShredData format for reconstruction
+        let mut shred_data: Vec<ShredData> = Vec::with_capacity(shreds.len());
+        let mut commitment: Option<Hash> = None;
+
+        for (index, data) in shreds {
+            if let Ok(mcp_shred) = McpShredV1::from_bytes(&data) {
+                // Get commitment from first shred
+                if commitment.is_none() {
+                    commitment = Some(Hash::new_from_array(mcp_shred.commitment));
+                }
+
+                shred_data.push(ShredData {
+                    index: index as u16,
+                    is_data: index < MCP_DATA_SHREDS_PER_FEC_BLOCK as u64,
+                    data: mcp_shred.shred_data.to_vec(),
+                    merkle_proof: mcp_shred.witness.iter().map(|w| {
+                        let mut arr = [0u8; 20];
+                        arr.copy_from_slice(w);
+                        arr
+                    }).collect(),
+                });
+            }
+        }
+
+        let Some(commitment) = commitment else {
+            debug!("No commitment found for slot {} proposer {}", slot, proposer_id);
+            continue;
+        };
+
+        // Create ProposerShreds tracker for reconstruction
+        let mut proposer_shreds = ProposerShreds::new(commitment);
+        for sd in shred_data {
+            proposer_shreds.add_shred(sd);
+        }
+
+        // Try reconstruction
+        let result = reconstruct_proposer_payload(&proposer_shreds, &commitment);
+        if matches!(result, ReconstructionResult::Success(_)) {
+            any_success = true;
+        }
+        reconstruction.add_payload(proposer_id as u32, result);
+    }
+
+    if any_success {
+        // Build the global ordered transaction list
+        reconstruction.build_ordered_transactions();
+        info!(
+            "MCP reconstruction for slot {}: {} proposers, {} txs",
+            slot,
+            reconstruction.successful_proposer_count(),
+            reconstruction.transaction_count()
+        );
+        Some(reconstruction)
+    } else {
+        None
+    }
+}
+
 pub struct WindowServiceChannels {
     pub verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     pub retransmit_sender: EvictingSender<Vec<shred::Payload>>,
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
+    /// Sender for MCP reconstruction results to feed replay
+    pub mcp_reconstruction_sender: Option<McpReconstructionSender>,
 }
 
 impl WindowServiceChannels {
@@ -296,6 +517,26 @@ impl WindowServiceChannels {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_reconstruction_sender: None,
+        }
+    }
+
+    /// Create channels with MCP reconstruction support
+    pub fn with_mcp_reconstruction(
+        verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
+        retransmit_sender: EvictingSender<Vec<shred::Payload>>,
+        completed_data_sets_sender: Option<CompletedDataSetsSender>,
+        duplicate_slots_sender: DuplicateSlotSender,
+        repair_service_channels: RepairServiceChannels,
+        mcp_reconstruction_sender: McpReconstructionSender,
+    ) -> Self {
+        Self {
+            verified_receiver,
+            retransmit_sender,
+            completed_data_sets_sender,
+            duplicate_slots_sender,
+            repair_service_channels,
+            mcp_reconstruction_sender: Some(mcp_reconstruction_sender),
         }
     }
 }
@@ -331,6 +572,7 @@ impl WindowService {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_reconstruction_sender,
         } = window_service_channels;
 
         let repair_service = RepairService::new(
@@ -365,6 +607,7 @@ impl WindowService {
             completed_data_sets_sender,
             retransmit_sender,
             accept_repairs_only,
+            mcp_reconstruction_sender,
         );
 
         WindowService {
@@ -416,6 +659,7 @@ impl WindowService {
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         accept_repairs_only: bool,
+        mcp_reconstruction_sender: Option<McpReconstructionSender>,
     ) -> JoinHandle<()> {
         let handle_error = || {
             inc_new_counter_error!("solana-window-insert-error", 1, 1);
@@ -438,6 +682,12 @@ impl WindowService {
                 };
                 let mut metrics = BlockstoreInsertionMetrics::default();
                 let mut ws_metrics = WindowServiceMetrics::default();
+                let mut mcp_tracker = McpSlotTracker::default();
+                // Create relay attestation service with default relay_id (0)
+                // TODO: Wire in actual relay_id from schedule
+                let mut relay_attestation_service = RelayAttestationService::new(
+                    RelayAttestationConfig::default()
+                );
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
@@ -452,6 +702,9 @@ impl WindowService {
                         &retransmit_sender,
                         &reed_solomon_cache,
                         accept_repairs_only,
+                        &mut mcp_tracker,
+                        mcp_reconstruction_sender.as_ref(),
+                        &mut relay_attestation_service,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
