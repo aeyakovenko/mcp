@@ -3,19 +3,19 @@
 //! This module defines the `RelayAttestation` struct for MCP relay attestations,
 //! including deterministic encoding and signature verification.
 //!
-//! # Wire Format (v1)
+//! # Wire Format (v1) - Per MCP spec §6.2
 //!
 //! ```text
 //! | version (1 byte) | slot (8 bytes) | relay_id (2 bytes) |
-//! | entries_len (2 bytes) | entries (variable) | relay_signature (64 bytes) |
+//! | num_attestations (1 byte) | entries (variable) | relay_signature (64 bytes) |
 //! ```
 //!
-//! Each entry in the entries array:
+//! Each entry in the entries array (AttestationEntryV1):
 //! ```text
-//! | proposer_id (1 byte) | merkle_root (32 bytes) |
+//! | proposer_index (1 byte) | commitment (32 bytes) | proposer_signature (64 bytes) |
 //! ```
 //!
-//! Entries MUST be sorted by proposer_id in ascending order.
+//! Entries MUST be sorted by proposer_index in ascending order.
 //! The relay signature is computed over all preceding bytes.
 
 use {
@@ -28,57 +28,82 @@ use {
 /// Current version of the relay attestation wire format.
 pub const RELAY_ATTESTATION_VERSION: u8 = 1;
 
-/// Size of a single attestation entry (proposer_id + merkle_root).
-pub const ATTESTATION_ENTRY_SIZE: usize = 1 + 32; // 33 bytes
+/// Size of a single attestation entry (proposer_index + commitment + proposer_signature).
+/// Per spec §6.2: 1 + 32 + 64 = 97 bytes
+pub const ATTESTATION_ENTRY_SIZE: usize = 1 + 32 + 64; // 97 bytes
 
 /// Maximum number of entries in an attestation (limited by NUM_PROPOSERS).
 pub const MAX_ATTESTATION_ENTRIES: usize = 16;
 
 /// Minimum size of a serialized attestation (header + signature, no entries).
-pub const MIN_ATTESTATION_SIZE: usize = 1 + 8 + 2 + 2 + 64; // 77 bytes
+/// version(1) + slot(8) + relay_id(2) + num_attestations(1) + relay_signature(64) = 76 bytes
+pub const MIN_ATTESTATION_SIZE: usize = 1 + 8 + 2 + 1 + 64; // 76 bytes
 
-/// A single entry in a relay attestation.
+/// A single entry in a relay attestation (AttestationEntryV1).
 ///
-/// Each entry represents a proposer's batch that the relay received
-/// and verified, identified by the merkle root of the shred batch.
+/// Per MCP spec §6.2, each entry represents a proposer's batch that the relay
+/// received and verified, including the proposer's signature for verification
+/// by the consensus leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttestationEntry {
-    /// The proposer ID (0-15 for standard proposers, 0xFF for consensus).
-    pub proposer_id: u8,
-    /// The merkle root of the proposer's shred batch.
-    pub merkle_root: Hash,
+    /// The proposer index (0-15 for standard proposers).
+    pub proposer_index: u8,
+    /// The merkle commitment of the proposer's shred batch.
+    pub commitment: Hash,
+    /// The proposer's signature over (slot, proposer_index, commitment).
+    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+    pub proposer_signature: Signature,
 }
 
 impl AttestationEntry {
     /// Create a new attestation entry.
-    pub const fn new(proposer_id: u8, merkle_root: Hash) -> Self {
+    pub const fn new(proposer_index: u8, commitment: Hash, proposer_signature: Signature) -> Self {
         Self {
-            proposer_id,
-            merkle_root,
+            proposer_index,
+            commitment,
+            proposer_signature,
         }
     }
 
     /// Serialize the entry to bytes.
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&[self.proposer_id])?;
-        writer.write_all(self.merkle_root.as_ref())?;
+        writer.write_all(&[self.proposer_index])?;
+        writer.write_all(self.commitment.as_ref())?;
+        writer.write_all(self.proposer_signature.as_ref())?;
         Ok(())
     }
 
     /// Deserialize an entry from bytes.
     pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let mut proposer_id_buf = [0u8; 1];
-        reader.read_exact(&mut proposer_id_buf)?;
-        let proposer_id = proposer_id_buf[0];
+        let mut proposer_index_buf = [0u8; 1];
+        reader.read_exact(&mut proposer_index_buf)?;
+        let proposer_index = proposer_index_buf[0];
 
-        let mut merkle_root_buf = [0u8; 32];
-        reader.read_exact(&mut merkle_root_buf)?;
-        let merkle_root = Hash::from(merkle_root_buf);
+        let mut commitment_buf = [0u8; 32];
+        reader.read_exact(&mut commitment_buf)?;
+        let commitment = Hash::from(commitment_buf);
+
+        let mut sig_buf = [0u8; 64];
+        reader.read_exact(&mut sig_buf)?;
+        let proposer_signature = Signature::from(sig_buf);
 
         Ok(Self {
-            proposer_id,
-            merkle_root,
+            proposer_index,
+            commitment,
+            proposer_signature,
         })
+    }
+
+    /// Verify the proposer signature against the given pubkey and slot.
+    ///
+    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || LE64(slot) || LE32(proposer_index) || commitment32
+    pub fn verify_proposer_signature(&self, proposer_pubkey: &Pubkey, slot: u64) -> bool {
+        let mut msg = Vec::with_capacity(17 + 8 + 4 + 32);
+        msg.extend_from_slice(b"mcp:commitment:v1");
+        msg.extend_from_slice(&slot.to_le_bytes());
+        msg.extend_from_slice(&(self.proposer_index as u32).to_le_bytes());
+        msg.extend_from_slice(self.commitment.as_ref());
+        self.proposer_signature.verify(proposer_pubkey.as_ref(), &msg)
     }
 }
 
@@ -90,7 +115,7 @@ impl PartialOrd for AttestationEntry {
 
 impl Ord for AttestationEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.proposer_id.cmp(&other.proposer_id)
+        self.proposer_index.cmp(&other.proposer_index)
     }
 }
 
@@ -149,16 +174,16 @@ impl RelayAttestation {
     }
 
     /// Returns the number of entries in this attestation.
-    pub fn entries_len(&self) -> u16 {
-        self.entries.len() as u16
+    pub fn entries_len(&self) -> u8 {
+        self.entries.len() as u8
     }
 
     /// Serialize the attestation to bytes.
     ///
-    /// The wire format is:
+    /// Per MCP spec §6.2, the wire format is:
     /// ```text
-    /// | version (1) | slot (8) | relay_id (2) | entries_len (2) |
-    /// | entries (entries_len * 33) | relay_signature (64) |
+    /// | version (1) | slot (8) | relay_id (2) | num_attestations (1) |
+    /// | entries (num_attestations * 97) | relay_signature (64) |
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0;
@@ -175,10 +200,10 @@ impl RelayAttestation {
         writer.write_all(&self.relay_id.to_le_bytes())?;
         bytes_written += 2;
 
-        // Entries length
-        let entries_len = self.entries.len() as u16;
-        writer.write_all(&entries_len.to_le_bytes())?;
-        bytes_written += 2;
+        // Number of attestation entries (u8 per spec)
+        let num_attestations = self.entries.len() as u8;
+        writer.write_all(&[num_attestations])?;
+        bytes_written += 1;
 
         // Entries
         for entry in &self.entries {
@@ -194,8 +219,13 @@ impl RelayAttestation {
     }
 
     /// Serialize only the portion that needs to be signed (everything except signature).
+    /// Per spec §6.2: relay_sig_msg = "mcp:relay-attestation:v1" || serialize_without_relay_signature
     pub fn serialize_for_signing<W: Write>(&self, writer: &mut W) -> io::Result<usize> {
         let mut bytes_written = 0;
+
+        // Domain prefix per spec
+        writer.write_all(b"mcp:relay-attestation:v1")?;
+        bytes_written += 24;
 
         // Version
         writer.write_all(&[self.version])?;
@@ -209,10 +239,10 @@ impl RelayAttestation {
         writer.write_all(&self.relay_id.to_le_bytes())?;
         bytes_written += 2;
 
-        // Entries length
-        let entries_len = self.entries.len() as u16;
-        writer.write_all(&entries_len.to_le_bytes())?;
-        bytes_written += 2;
+        // Number of attestation entries (u8 per spec)
+        let num_attestations = self.entries.len() as u8;
+        writer.write_all(&[num_attestations])?;
+        bytes_written += 1;
 
         // Entries
         for entry in &self.entries {
@@ -231,14 +261,19 @@ impl RelayAttestation {
         buffer
     }
 
-    /// Returns the size of the signing data (attestation without signature).
+    /// Returns the size of the signing data (domain prefix + attestation without signature).
     pub fn signing_data_size(&self) -> usize {
-        1 + 8 + 2 + 2 + (self.entries.len() * ATTESTATION_ENTRY_SIZE)
+        24 + 1 + 8 + 2 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) // domain prefix + header + entries
     }
 
-    /// Returns the total serialized size of this attestation.
+    /// Returns the size of just the wire-serialized attestation (no domain prefix, with signature).
+    pub fn wire_size(&self) -> usize {
+        1 + 8 + 2 + 1 + (self.entries.len() * ATTESTATION_ENTRY_SIZE) + 64 // header + entries + signature
+    }
+
+    /// Returns the total serialized size of this attestation (wire format).
     pub fn serialized_size(&self) -> usize {
-        self.signing_data_size() + 64 // + signature
+        self.wire_size()
     }
 
     /// Deserialize a relay attestation from bytes.
@@ -268,33 +303,33 @@ impl RelayAttestation {
         reader.read_exact(&mut relay_id_buf)?;
         let relay_id = u16::from_le_bytes(relay_id_buf);
 
-        // Entries length
-        let mut entries_len_buf = [0u8; 2];
-        reader.read_exact(&mut entries_len_buf)?;
-        let entries_len = u16::from_le_bytes(entries_len_buf) as usize;
+        // Number of attestation entries (u8 per spec)
+        let mut num_attestations_buf = [0u8; 1];
+        reader.read_exact(&mut num_attestations_buf)?;
+        let num_attestations = num_attestations_buf[0] as usize;
 
-        if entries_len > MAX_ATTESTATION_ENTRIES {
+        if num_attestations > MAX_ATTESTATION_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "too many attestation entries: {}, max {}",
-                    entries_len, MAX_ATTESTATION_ENTRIES
+                    num_attestations, MAX_ATTESTATION_ENTRIES
                 ),
             ));
         }
 
         // Entries
-        let mut entries = Vec::with_capacity(entries_len);
-        for _ in 0..entries_len {
+        let mut entries = Vec::with_capacity(num_attestations);
+        for _ in 0..num_attestations {
             entries.push(AttestationEntry::deserialize(reader)?);
         }
 
-        // Verify entries are sorted
+        // Verify entries are sorted by proposer_index
         for window in entries.windows(2) {
-            if window[0].proposer_id >= window[1].proposer_id {
+            if window[0].proposer_index >= window[1].proposer_index {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "attestation entries not sorted by proposer_id",
+                    "attestation entries not sorted by proposer_index",
                 ));
             }
         }
@@ -326,18 +361,44 @@ impl RelayAttestation {
     }
 
     /// Check if this attestation contains an entry for the given proposer.
-    pub fn has_proposer(&self, proposer_id: u8) -> bool {
+    pub fn has_proposer(&self, proposer_index: u8) -> bool {
         self.entries
-            .binary_search_by_key(&proposer_id, |e| e.proposer_id)
+            .binary_search_by_key(&proposer_index, |e| e.proposer_index)
             .is_ok()
     }
 
-    /// Get the merkle root for a specific proposer, if attested.
-    pub fn get_merkle_root(&self, proposer_id: u8) -> Option<&Hash> {
+    /// Get the commitment for a specific proposer, if attested.
+    pub fn get_commitment(&self, proposer_index: u8) -> Option<&Hash> {
         self.entries
-            .binary_search_by_key(&proposer_id, |e| e.proposer_id)
+            .binary_search_by_key(&proposer_index, |e| e.proposer_index)
             .ok()
-            .map(|idx| &self.entries[idx].merkle_root)
+            .map(|idx| &self.entries[idx].commitment)
+    }
+
+    /// Get the full attestation entry for a specific proposer, if attested.
+    pub fn get_entry(&self, proposer_index: u8) -> Option<&AttestationEntry> {
+        self.entries
+            .binary_search_by_key(&proposer_index, |e| e.proposer_index)
+            .ok()
+            .map(|idx| &self.entries[idx])
+    }
+
+    /// Verify all proposer signatures in this attestation.
+    ///
+    /// Takes a function to look up proposer pubkeys by their index.
+    pub fn verify_proposer_signatures<F>(&self, get_proposer_pubkey: F) -> Result<(), AttestationError>
+    where
+        F: Fn(u8) -> Option<Pubkey>,
+    {
+        for entry in &self.entries {
+            let Some(proposer_pubkey) = get_proposer_pubkey(entry.proposer_index) else {
+                return Err(AttestationError::InvalidProposerIndex(entry.proposer_index));
+            };
+            if !entry.verify_proposer_signature(&proposer_pubkey, self.slot) {
+                return Err(AttestationError::InvalidProposerSignature(entry.proposer_index));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -352,8 +413,12 @@ pub enum AttestationError {
     EntriesNotSorted,
     /// Too many entries in the attestation.
     TooManyEntries(usize),
-    /// Duplicate proposer ID in entries.
+    /// Duplicate proposer index in entries.
     DuplicateProposer(u8),
+    /// Invalid proposer index (not in schedule).
+    InvalidProposerIndex(u8),
+    /// Invalid proposer signature for entry.
+    InvalidProposerSignature(u8),
 }
 
 impl std::fmt::Display for AttestationError {
@@ -361,9 +426,11 @@ impl std::fmt::Display for AttestationError {
         match self {
             Self::InvalidSignature => write!(f, "invalid relay signature"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported attestation version: {}", v),
-            Self::EntriesNotSorted => write!(f, "attestation entries not sorted by proposer_id"),
+            Self::EntriesNotSorted => write!(f, "attestation entries not sorted by proposer_index"),
             Self::TooManyEntries(n) => write!(f, "too many attestation entries: {}", n),
-            Self::DuplicateProposer(id) => write!(f, "duplicate proposer_id in entries: {}", id),
+            Self::DuplicateProposer(id) => write!(f, "duplicate proposer_index in entries: {}", id),
+            Self::InvalidProposerIndex(id) => write!(f, "invalid proposer index: {}", id),
+            Self::InvalidProposerSignature(id) => write!(f, "invalid proposer signature for index: {}", id),
         }
     }
 }
@@ -392,9 +459,17 @@ impl RelayAttestationBuilder {
     }
 
     /// Add an attestation entry for a proposer.
-    pub fn add_entry(mut self, proposer_id: u8, merkle_root: Hash) -> Self {
+    ///
+    /// Per MCP spec §6.2, each entry must include the proposer's signature
+    /// over the commitment to enable verification by the consensus leader.
+    pub fn add_entry(
+        mut self,
+        proposer_index: u8,
+        commitment: Hash,
+        proposer_signature: Signature,
+    ) -> Self {
         self.entries
-            .push(AttestationEntry::new(proposer_id, merkle_root));
+            .push(AttestationEntry::new(proposer_index, commitment, proposer_signature));
         self
     }
 
@@ -419,9 +494,13 @@ mod tests {
         Hash::from([seed; 32])
     }
 
+    fn make_test_sig(seed: u8) -> Signature {
+        Signature::from([seed; 64])
+    }
+
     #[test]
     fn test_attestation_entry_serialization() {
-        let entry = AttestationEntry::new(5, make_test_hash(42));
+        let entry = AttestationEntry::new(5, make_test_hash(42), make_test_sig(0xAB));
 
         let mut buffer = Vec::new();
         entry.serialize(&mut buffer).unwrap();
@@ -435,9 +514,9 @@ mod tests {
 
     #[test]
     fn test_attestation_entry_ordering() {
-        let entry1 = AttestationEntry::new(1, make_test_hash(1));
-        let entry2 = AttestationEntry::new(5, make_test_hash(2));
-        let entry3 = AttestationEntry::new(10, make_test_hash(3));
+        let entry1 = AttestationEntry::new(1, make_test_hash(1), make_test_sig(1));
+        let entry2 = AttestationEntry::new(5, make_test_hash(2), make_test_sig(2));
+        let entry3 = AttestationEntry::new(10, make_test_hash(3), make_test_sig(3));
 
         assert!(entry1 < entry2);
         assert!(entry2 < entry3);
@@ -447,9 +526,9 @@ mod tests {
     #[test]
     fn test_relay_attestation_serialization_roundtrip() {
         let entries = vec![
-            AttestationEntry::new(3, make_test_hash(3)),
-            AttestationEntry::new(1, make_test_hash(1)),
-            AttestationEntry::new(7, make_test_hash(7)),
+            AttestationEntry::new(3, make_test_hash(3), make_test_sig(3)),
+            AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
+            AttestationEntry::new(7, make_test_hash(7), make_test_sig(7)),
         ];
 
         let attestation = RelayAttestation::new_signed(
@@ -476,25 +555,25 @@ mod tests {
     #[test]
     fn test_entries_sorted_on_creation() {
         let entries = vec![
-            AttestationEntry::new(10, make_test_hash(10)),
-            AttestationEntry::new(2, make_test_hash(2)),
-            AttestationEntry::new(5, make_test_hash(5)),
+            AttestationEntry::new(10, make_test_hash(10), make_test_sig(10)),
+            AttestationEntry::new(2, make_test_hash(2), make_test_sig(2)),
+            AttestationEntry::new(5, make_test_hash(5), make_test_sig(5)),
         ];
 
         let attestation = RelayAttestation::new(100, 1, entries);
 
-        // Entries should be sorted by proposer_id
-        assert_eq!(attestation.entries[0].proposer_id, 2);
-        assert_eq!(attestation.entries[1].proposer_id, 5);
-        assert_eq!(attestation.entries[2].proposer_id, 10);
+        // Entries should be sorted by proposer_index
+        assert_eq!(attestation.entries[0].proposer_index, 2);
+        assert_eq!(attestation.entries[1].proposer_index, 5);
+        assert_eq!(attestation.entries[2].proposer_index, 10);
     }
 
     #[test]
     fn test_has_proposer() {
         let entries = vec![
-            AttestationEntry::new(1, make_test_hash(1)),
-            AttestationEntry::new(5, make_test_hash(5)),
-            AttestationEntry::new(10, make_test_hash(10)),
+            AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
+            AttestationEntry::new(5, make_test_hash(5), make_test_sig(5)),
+            AttestationEntry::new(10, make_test_hash(10), make_test_sig(10)),
         ];
 
         let attestation = RelayAttestation::new(100, 1, entries);
@@ -508,34 +587,34 @@ mod tests {
     }
 
     #[test]
-    fn test_get_merkle_root() {
+    fn test_get_commitment() {
         let entries = vec![
-            AttestationEntry::new(1, make_test_hash(1)),
-            AttestationEntry::new(5, make_test_hash(5)),
+            AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
+            AttestationEntry::new(5, make_test_hash(5), make_test_sig(5)),
         ];
 
         let attestation = RelayAttestation::new(100, 1, entries);
 
-        assert_eq!(attestation.get_merkle_root(1), Some(&make_test_hash(1)));
-        assert_eq!(attestation.get_merkle_root(5), Some(&make_test_hash(5)));
-        assert_eq!(attestation.get_merkle_root(3), None);
+        assert_eq!(attestation.get_commitment(1), Some(&make_test_hash(1)));
+        assert_eq!(attestation.get_commitment(5), Some(&make_test_hash(5)));
+        assert_eq!(attestation.get_commitment(3), None);
     }
 
     #[test]
     fn test_builder() {
         let attestation = RelayAttestationBuilder::new(100, 42)
-            .add_entry(5, make_test_hash(5))
-            .add_entry(1, make_test_hash(1))
-            .add_entry(10, make_test_hash(10))
+            .add_entry(5, make_test_hash(5), make_test_sig(5))
+            .add_entry(1, make_test_hash(1), make_test_sig(1))
+            .add_entry(10, make_test_hash(10), make_test_sig(10))
             .build_unsigned();
 
         assert_eq!(attestation.slot, 100);
         assert_eq!(attestation.relay_id, 42);
         assert_eq!(attestation.entries.len(), 3);
         // Should be sorted
-        assert_eq!(attestation.entries[0].proposer_id, 1);
-        assert_eq!(attestation.entries[1].proposer_id, 5);
-        assert_eq!(attestation.entries[2].proposer_id, 10);
+        assert_eq!(attestation.entries[0].proposer_index, 1);
+        assert_eq!(attestation.entries[1].proposer_index, 5);
+        assert_eq!(attestation.entries[2].proposer_index, 10);
     }
 
     #[test]
@@ -555,16 +634,19 @@ mod tests {
     #[test]
     fn test_signing_data_size() {
         let entries = vec![
-            AttestationEntry::new(1, make_test_hash(1)),
-            AttestationEntry::new(5, make_test_hash(5)),
+            AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
+            AttestationEntry::new(5, make_test_hash(5), make_test_sig(5)),
         ];
 
         let attestation = RelayAttestation::new(100, 1, entries);
 
-        // 1 (version) + 8 (slot) + 2 (relay_id) + 2 (entries_len) + 2 * 33 (entries)
-        let expected = 1 + 8 + 2 + 2 + 2 * ATTESTATION_ENTRY_SIZE;
-        assert_eq!(attestation.signing_data_size(), expected);
-        assert_eq!(attestation.serialized_size(), expected + 64);
+        // Signing data: 24 (domain) + 1 (version) + 8 (slot) + 2 (relay_id) + 1 (num_attestations) + 2 * 97 (entries)
+        let expected_signing = 24 + 1 + 8 + 2 + 1 + 2 * ATTESTATION_ENTRY_SIZE;
+        assert_eq!(attestation.signing_data_size(), expected_signing);
+
+        // Wire size: 1 (version) + 8 (slot) + 2 (relay_id) + 1 (num_attestations) + 2 * 97 (entries) + 64 (sig)
+        let expected_wire = 1 + 8 + 2 + 1 + 2 * ATTESTATION_ENTRY_SIZE + 64;
+        assert_eq!(attestation.serialized_size(), expected_wire);
     }
 
     #[test]
