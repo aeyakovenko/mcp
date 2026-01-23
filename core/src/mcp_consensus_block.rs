@@ -740,7 +740,7 @@ pub enum AvailabilityCheckResult {
     /// Some proposers are missing shreds
     Waiting {
         /// Proposers that don't have enough shreds yet
-        missing: Vec<(u8, Hash, usize)>, // (proposer_id, commitment, current_count)
+        missing: Vec<(u32, Hash, usize)>, // (proposer_id, commitment, current_count)
     },
 }
 
@@ -755,7 +755,7 @@ pub trait ShredAvailability {
     fn count_verified_shreds(
         &self,
         slot: Slot,
-        proposer_id: u8,
+        proposer_id: u32,
         commitment: &Hash,
     ) -> usize;
 }
@@ -780,7 +780,7 @@ impl<'a, S: ShredAvailability> AvailabilityChecker<'a, S> {
     ///
     /// Returns Ready if all implied proposers have >= K_DATA_SHREDS shreds,
     /// otherwise returns Waiting with the list of proposers that need more shreds.
-    pub fn check_availability(&self, implied_blocks: &[(u8, Hash)]) -> AvailabilityCheckResult {
+    pub fn check_availability(&self, implied_blocks: &[(u32, Hash)]) -> AvailabilityCheckResult {
         let mut missing = Vec::new();
 
         for (proposer_id, commitment) in implied_blocks {
@@ -803,7 +803,7 @@ impl<'a, S: ShredAvailability> AvailabilityChecker<'a, S> {
     }
 
     /// Check if a single proposer has enough shreds
-    pub fn has_enough_shreds(&self, proposer_id: u8, commitment: &Hash) -> bool {
+    pub fn has_enough_shreds(&self, proposer_id: u32, commitment: &Hash) -> bool {
         self.availability.count_verified_shreds(self.slot, proposer_id, commitment) >= K_DATA_SHREDS
     }
 }
@@ -812,7 +812,7 @@ impl<'a, S: ShredAvailability> AvailabilityChecker<'a, S> {
 #[derive(Debug, Default)]
 pub struct InMemoryShredAvailability {
     /// Map of (slot, proposer_id, commitment) -> set of shred indices
-    shreds: HashMap<(Slot, u8, Hash), std::collections::HashSet<u16>>,
+    shreds: HashMap<(Slot, u32, Hash), std::collections::HashSet<u16>>,
 }
 
 impl InMemoryShredAvailability {
@@ -822,7 +822,7 @@ impl InMemoryShredAvailability {
     }
 
     /// Record a verified shred
-    pub fn record_shred(&mut self, slot: Slot, proposer_id: u8, commitment: Hash, shred_index: u16) {
+    pub fn record_shred(&mut self, slot: Slot, proposer_id: u32, commitment: Hash, shred_index: u16) {
         self.shreds
             .entry((slot, proposer_id, commitment))
             .or_default()
@@ -831,7 +831,7 @@ impl InMemoryShredAvailability {
 }
 
 impl ShredAvailability for InMemoryShredAvailability {
-    fn count_verified_shreds(&self, slot: Slot, proposer_id: u8, commitment: &Hash) -> usize {
+    fn count_verified_shreds(&self, slot: Slot, proposer_id: u32, commitment: &Hash) -> usize {
         self.shreds
             .get(&(slot, proposer_id, *commitment))
             .map(|s| s.len())

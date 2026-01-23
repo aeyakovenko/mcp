@@ -12,7 +12,7 @@
 //!
 //! Each entry in the entries array (AttestationEntryV1):
 //! ```text
-//! | proposer_index (1 byte) | commitment (32 bytes) | proposer_signature (64 bytes) |
+//! | proposer_index (4 bytes) | commitment (32 bytes) | proposer_signature (64 bytes) |
 //! ```
 //!
 //! Entries MUST be sorted by proposer_index in ascending order.
