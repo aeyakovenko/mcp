@@ -495,5 +495,18 @@ Invalid messages MUST be discarded and MUST NOT advance protocol state. The
 aggregate rules prevent a single equivocation from forcing inclusion; any
 proposer with multiple commitments in the aggregate is excluded. Relays and
 leaders are not trusted and their signatures only authenticate what they say
-they saw. Validators MUST perform all signature and witness checks before 
+they saw. Validators MUST perform all signature and witness checks before
 voting or replaying to avoid accepting unavailable or corrupted batches.
+
+11. Changelog
+
+This revision clarifies that stages may be pipelined across slots without
+changing per-slot rules, removes any prescriptive transaction prioritization
+policy for proposers, and makes per-proposer resource division explicit. It also
+adds a batch size bound tied to NUM_RELAYS and SHRED_DATA_BYTES so that each
+proposer encodes exactly one shred per relay and requires each Shred message to
+carry its witness.
+
+This revision further states that each relay emits at most one RelayAttestation
+per slot, and it relaxes the schedule rules to permit duplicate identities in
+proposer and relay lists when the underlying schedule produces them.
