@@ -61,6 +61,10 @@ The reconstruct and replay phase rebuilds proposer batches from shreds,
 verifies commitments, orders batches deterministically, and executes the
 resulting transaction log for the slot.
 
+Stages MAY be pipelined across slots, so a validator can execute different
+stages for different slots at the same time without changing the per-slot
+rules.
+
 ```text
 +-----------+    Txs    +--------+   Shreds  +-------+   Shreds   +---------------+
 | Client(s) | --------> | Leader | --------> | Relay | ---------> | Validator(s)  |<---+
@@ -126,16 +130,19 @@ trailing zero bytes added for padding MUST be ignored by decoders.
 3.2 Proposal Stage
 
 Each proposer collects pending transactions into a batch. Global block-level
-constraints on compute units (CU) and loaded account data are divided among the
-proposers. Proposers
-SHOULD prioritize transactions based on inclusion fee. The proposer then encodes
-the batch into NUM_RELAYS shreds using erasure coding with the parameters from
-Section 4. Each shred has SHRED_DATA_BYTES bytes. The encoder MUST define shred
-indices from 0 to NUM_RELAYS-1 and MUST output shreds in that order. The proposer
-computes the Merkle commitment over all shreds, computes the witness for each
-shred index, and signs the commitment. The proposer MUST send exactly one Shred
-message to each relay in Relays[s], with shred_index equal to that relay's index,
-and MUST NOT send conflicting commitments for the same slot.
+constraints on compute units (CU) and loaded account data are divided evenly
+among the proposers. The proposer then encodes the batch into NUM_RELAYS shreds
+using erasure coding with the parameters from Section 4. Each shred has
+SHRED_DATA_BYTES bytes. The serialized batch MUST NOT exceed
+NUM_RELAYS * SHRED_DATA_BYTES bytes so that the encoding yields exactly one shred
+per relay. The per-proposer CU and loaded account data limits MUST be set so that
+a batch that respects them can satisfy this size bound. The encoder MUST define
+shred indices from 0 to NUM_RELAYS-1 and MUST output shreds in that order. The
+proposer computes the Merkle commitment over all shreds, computes the witness for
+each shred index, and signs the commitment. The proposer MUST include the
+corresponding witness in each Shred message. The proposer MUST send exactly one
+Shred message to each relay in Relays[s], with shred_index equal to that relay's
+index, and MUST NOT send conflicting commitments for the same slot.
 
 3.3 Relay and Retransmit Stage
 
@@ -150,9 +157,11 @@ relay receives multiple valid shreds that imply different commitments for the
 same proposer and slot, it SHOULD NOT attest to any of them. At the relay
 deadline for slot s, each relay constructs RelayAttestation v1 containing all
 valid proposer entries it accepted for the slot, sorted by proposer_index,
-signs it, and sends it to Leader[s]. The relay MUST include the
-proposer_signature received in each entry so that other nodes can verify the
-commitment without contacting the proposer.
+signs it, and sends it to Leader[s]. Each relay MUST emit at most one
+RelayAttestation per slot. If additional shreds arrive after it has broadcast
+its attestation, it MUST NOT issue another RelayAttestation for that slot. The
+relay MUST include the proposer_signature received in each entry so that other
+nodes can verify the commitment without contacting the proposer.
 
 3.4 Consensus Leader Stage
 
@@ -243,10 +252,11 @@ the next NUM_PROPOSERS entries from the proposer schedule starting at the slot's
 index within the epoch, with wrap-around. Relays[s] is defined the same way from
 the relay schedule. Leader[s] is the consensus leader for slot s. A proposer
 index is the position of a validator in Proposers[s]. Proposers[s] and
-Relays[s] MUST contain distinct identities. A relay index is the
-position of a validator in Relays[s]. A leader index is the position of the
-leader in the consensus leader schedule for the slot. These indices are
-slot-scoped and MUST be used in message formats.
+Relays[s] MAY contain duplicate identities, and a validator MAY appear multiple
+times within a list or across lists. A relay index is the position of a
+validator in Relays[s]. A leader index is the position of the leader in the
+consensus leader schedule for the slot. These indices are slot-scoped and MUST
+be used in message formats.
 
 6. Cryptographic Primitives
 
