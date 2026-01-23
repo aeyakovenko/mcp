@@ -120,7 +120,7 @@ pub struct McpShredV1 {
     /// Contains `MERKLE_PROOF_ENTRIES` siblings along the path from leaf to root.
     pub witness: [[u8; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES],
 
-    /// Proposer's signature over (slot, proposer_index, commitment).
+    /// Proposer's signature over commitment (per spec §5.2).
     pub proposer_signature: Signature,
 }
 
@@ -425,7 +425,7 @@ pub struct AttestationEntryV1 {
     pub proposer_index: u32,
     /// The commitment (Merkle root) the relay received from this proposer.
     pub commitment: [u8; MERKLE_ROOT_BYTES],
-    /// The proposer's signature over (slot, proposer_index, commitment).
+    /// The proposer's signature over commitment (per spec §5.2).
     pub proposer_signature: Signature,
 }
 

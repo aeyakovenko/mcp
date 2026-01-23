@@ -352,8 +352,8 @@ impl McpBlockV1 {
     /// signature over their commitment is valid. Invalid signatures are treated
     /// as if the attestation didn't exist.
     ///
-    /// Per spec §11.2: The proposer signature is verified against the signing
-    /// message: "mcp:commitment:v1" || LE64(slot) || LE32(proposer_index) || commitment32
+    /// Per spec §5.2: The proposer signature is verified against the signing
+    /// message: "mcp:commitment:v1" || commitment32
     ///
     /// Returns: list of (proposer_id, commitment) pairs that are implied
     pub fn compute_implied_blocks_with_verification(
