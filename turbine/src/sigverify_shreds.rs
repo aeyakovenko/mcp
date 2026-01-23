@@ -950,8 +950,11 @@ pub fn verify_mcp_shred(
         return None;
     }
 
-    // TODO: Verify Merkle witness
+    // Verify Merkle witness
     // Per spec §9.1: Verify Merkle witness for shred_data at index shred_index yields commitment
+    if !mcp_shred.verify_merkle_witness() {
+        return None;
+    }
 
     Some(mcp_shred)
 }

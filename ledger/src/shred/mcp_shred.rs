@@ -305,6 +305,28 @@ impl McpShredV1 {
     pub fn is_for_relay(&self, relay_index: u16) -> bool {
         self.shred_index == relay_index as u32
     }
+
+    /// Verify the Merkle witness for this shred.
+    ///
+    /// Per MCP spec §9.1: Verify that the Merkle witness for shred_data at
+    /// index shred_index yields the commitment.
+    pub fn verify_merkle_witness(&self) -> bool {
+        use crate::mcp_merkle::{MerkleProof, TRUNCATED_HASH_SIZE};
+
+        // The shred_index % 256 gives the leaf index (tree has 256 leaves)
+        let leaf_index = (self.shred_index % 256) as u8;
+
+        // Convert the witness to the format expected by MerkleProof
+        let mut siblings = [[0u8; TRUNCATED_HASH_SIZE]; crate::mcp_merkle::PROOF_ENTRIES];
+        for (i, entry) in self.witness.iter().enumerate() {
+            siblings[i] = *entry;
+        }
+
+        let proof = MerkleProof::new(leaf_index, siblings);
+        let commitment = solana_hash::Hash::new_from_array(self.commitment);
+
+        proof.verify(&commitment, &self.shred_data)
+    }
 }
 
 // ============================================================================
