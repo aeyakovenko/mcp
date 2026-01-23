@@ -302,10 +302,10 @@ impl McpBlockV1 {
         for relay_entry in &self.relay_entries {
             for entry in &relay_entry.entries {
                 let proposer_counts = proposer_votes
-                    .entry(entry.proposer_id)
+                    .entry(entry.proposer_index)
                     .or_default();
                 *proposer_counts
-                    .entry(entry.merkle_root)
+                    .entry(entry.commitment)
                     .or_default() += 1;
             }
         }
@@ -351,9 +351,9 @@ impl McpBlockV1 {
         for relay_entry in &self.relay_entries {
             for entry in &relay_entry.entries {
                 *proposer_commitments
-                    .entry(entry.proposer_id)
+                    .entry(entry.proposer_index)
                     .or_default()
-                    .entry(entry.merkle_root)
+                    .entry(entry.commitment)
                     .or_default() += 1;
             }
         }
@@ -801,8 +801,16 @@ mod tests {
         Hash::from([seed; 32])
     }
 
-    fn make_test_attestation_entry(proposer_id: u8, merkle_root_seed: u8) -> AttestationEntry {
-        AttestationEntry::new(proposer_id, Hash::from([merkle_root_seed; 32]))
+    fn make_test_sig(seed: u8) -> solana_signature::Signature {
+        solana_signature::Signature::from([seed; 64])
+    }
+
+    fn make_test_attestation_entry(proposer_index: u8, commitment_seed: u8) -> AttestationEntry {
+        AttestationEntry::new(
+            proposer_index,
+            Hash::from([commitment_seed; 32]),
+            make_test_sig(commitment_seed),
+        )
     }
 
     fn make_test_relay_entry(relay_index: u32, proposer_entries: Vec<(u8, u8)>) -> RelayEntryV1 {
@@ -828,8 +836,8 @@ mod tests {
 
         assert_eq!(deserialized.relay_index, 42);
         assert_eq!(deserialized.entries.len(), 2);
-        assert_eq!(deserialized.entries[0].proposer_id, 0);
-        assert_eq!(deserialized.entries[1].proposer_id, 1);
+        assert_eq!(deserialized.entries[0].proposer_index, 0);
+        assert_eq!(deserialized.entries[1].proposer_index, 1);
     }
 
     #[test]

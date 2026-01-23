@@ -20,6 +20,9 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_replay_reconstruction::{
+            reconstruct_slot, ShredData, SlotReconstructionState,
+        },
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -56,6 +59,7 @@ use {
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        shred::mcp_shred::McpShredV1,
     },
     solana_measure::measure::Measure,
     solana_poh::{
@@ -2655,17 +2659,72 @@ impl ReplayStage {
         if blockstore.has_mcp_shreds(slot) {
             if blockstore.can_reconstruct_mcp_slot(slot) {
                 // MCP slot ready for reconstruction
-                trace!(
+                info!(
                     "Slot {} has MCP shreds ready for reconstruction",
                     slot
                 );
-                // TODO: Full MCP reconstruction pipeline:
-                // 1. Load MCP shreds from blockstore via get_all_mcp_shreds_for_slot()
-                // 2. For each proposer, reconstruct using mcp_replay_reconstruction
-                // 3. Order transactions by proposer_id, then by ordering_fee (desc), then tx hash
-                // 4. De-duplicate transactions
-                // 5. Process through bank with fee-only first pass
-                // For now, fall through to regular processing as MCP is in parallel
+
+                // 1. Load MCP shreds from blockstore
+                if let Ok(mcp_shreds) = blockstore.get_all_mcp_shreds_for_slot(slot) {
+                    // 2. Build reconstruction state
+                    let mut state = SlotReconstructionState::new(slot);
+
+                    // Track implied proposers (proposer_id -> commitment)
+                    let mut implied_proposers: Vec<(u8, Hash)> = Vec::new();
+
+                    for (proposer_id, proposer_shreds) in mcp_shreds {
+                        // Parse the first shred to get the commitment (they should all have the same)
+                        if let Some((_, first_shred_bytes)) = proposer_shreds.first() {
+                            if let Ok(first_shred) = McpShredV1::from_bytes(first_shred_bytes) {
+                                let commitment = Hash::new_from_array(first_shred.commitment);
+                                implied_proposers.push((proposer_id, commitment));
+
+                                // Add all shreds for this proposer to reconstruction state
+                                for (idx, (_shred_idx, shred_bytes)) in proposer_shreds.iter().enumerate() {
+                                    if let Ok(mcp_shred) = McpShredV1::from_bytes(shred_bytes) {
+                                        let shred_data = ShredData {
+                                            index: idx as u16,
+                                            is_data: idx < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
+                                            data: mcp_shred.shred_data.to_vec(),
+                                            merkle_proof: mcp_shred.witness.to_vec(),
+                                        };
+                                        state.add_shred(proposer_id, shred_data);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Sort implied_proposers by proposer_id for deterministic ordering
+                    implied_proposers.sort_by_key(|(id, _)| *id);
+
+                    // 3. Set implied proposers and reconstruct
+                    state.set_implied_proposers(implied_proposers.clone());
+                    let reconstruction = reconstruct_slot(&state, &implied_proposers);
+
+                    // Log reconstruction status
+                    info!(
+                        "MCP reconstruction for slot {}: {} proposers, {} transactions",
+                        slot,
+                        reconstruction.successful_proposer_count(),
+                        reconstruction.transaction_count()
+                    );
+
+                    // 4. Process reconstructed transactions
+                    // NOTE: Full MCP processing with fee-only first pass is deferred.
+                    // For now, log the reconstruction results and continue with regular processing.
+                    // The transactions from MCP proposers are available in reconstruction.ordered_transactions
+                    // and can be processed through the bank when MCP is fully activated.
+
+                    for (proposer_id, success, shred_count) in state.get_reconstruction_status() {
+                        debug!(
+                            "  Proposer {}: {} ({} shreds)",
+                            proposer_id,
+                            if success { "reconstructed" } else { "incomplete" },
+                            shred_count
+                        );
+                    }
+                }
             } else {
                 trace!(
                     "Slot {} has MCP shreds but not enough for reconstruction yet",

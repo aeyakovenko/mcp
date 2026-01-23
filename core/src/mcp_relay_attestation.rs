@@ -54,6 +54,8 @@ pub const MIN_RELAYS_FOR_BLOCK: usize = 120;
 pub struct ProposerShredTracker {
     /// Merkle commitment (same for all shreds from this proposer)
     pub commitment: Option<Hash>,
+    /// Proposer's signature over the commitment (from the shred)
+    pub proposer_signature: Option<solana_signature::Signature>,
     /// Indices of received shreds
     pub received_indices: Vec<u32>,
     /// When the first shred was received
@@ -62,9 +64,15 @@ pub struct ProposerShredTracker {
 
 impl ProposerShredTracker {
     /// Record a received shred.
-    pub fn record_shred(&mut self, shred_index: u32, commitment: Hash) {
+    pub fn record_shred(
+        &mut self,
+        shred_index: u32,
+        commitment: Hash,
+        proposer_signature: solana_signature::Signature,
+    ) {
         if self.commitment.is_none() {
             self.commitment = Some(commitment);
+            self.proposer_signature = Some(proposer_signature);
             self.first_received = Some(Instant::now());
         }
         if !self.received_indices.contains(&shred_index) {
@@ -105,19 +113,30 @@ impl SlotShredState {
     }
 
     /// Record a received shred.
-    pub fn record_shred(&mut self, proposer_id: u8, shred_index: u32, commitment: Hash) {
+    pub fn record_shred(
+        &mut self,
+        proposer_id: u8,
+        shred_index: u32,
+        commitment: Hash,
+        proposer_signature: solana_signature::Signature,
+    ) {
         self.proposers
             .entry(proposer_id)
             .or_default()
-            .record_shred(shred_index, commitment);
+            .record_shred(shred_index, commitment, proposer_signature);
     }
 
     /// Get proposers that have enough shreds for attestation.
-    pub fn attestable_proposers(&self) -> Vec<(u8, Hash)> {
+    /// Returns (proposer_id, commitment, proposer_signature) tuples.
+    pub fn attestable_proposers(&self) -> Vec<(u8, Hash, solana_signature::Signature)> {
         self.proposers
             .iter()
             .filter(|(_, tracker)| tracker.can_attest())
-            .filter_map(|(id, tracker)| tracker.commitment.map(|c| (*id, c)))
+            .filter_map(|(id, tracker)| {
+                tracker.commitment.and_then(|c| {
+                    tracker.proposer_signature.map(|s| (*id, c, s))
+                })
+            })
             .collect()
     }
 
@@ -146,6 +165,7 @@ pub struct ReceivedShredInfo {
     pub proposer_id: u8,
     pub shred_index: u32,
     pub commitment: Hash,
+    pub proposer_signature: solana_signature::Signature,
 }
 
 /// A signed attestation ready for submission.
@@ -219,12 +239,19 @@ impl RelayAttestationService {
             .slot_states
             .entry(info.slot)
             .or_insert_with(SlotShredState::new);
-        state.record_shred(info.proposer_id, info.shred_index, info.commitment);
+        state.record_shred(
+            info.proposer_id,
+            info.shred_index,
+            info.commitment,
+            info.proposer_signature,
+        );
     }
 
     /// Check if we should create an attestation for any slot.
-    /// Returns the slot and attestable proposers if ready.
-    pub fn check_attestation_ready(&mut self) -> Option<(Slot, Vec<(u8, Hash)>)> {
+    /// Returns the slot and attestable proposers (with their signatures) if ready.
+    pub fn check_attestation_ready(
+        &mut self,
+    ) -> Option<(Slot, Vec<(u8, Hash, solana_signature::Signature)>)> {
         for (&slot, state) in &mut self.slot_states {
             if state.should_send_attestation() && !state.attestation_sent {
                 let proposers = state.attestable_proposers();
@@ -241,13 +268,13 @@ impl RelayAttestationService {
     pub fn create_attestation(
         &mut self,
         slot: Slot,
-        proposers: Vec<(u8, Hash)>,
+        proposers: Vec<(u8, Hash, solana_signature::Signature)>,
         keypair: &Keypair,
     ) -> RelayAttestation {
         let mut builder = RelayAttestationBuilder::new(slot, self.config.relay_id);
 
-        for (proposer_id, commitment) in proposers {
-            builder = builder.add_entry(proposer_id, commitment);
+        for (proposer_id, commitment, proposer_signature) in proposers {
+            builder = builder.add_entry(proposer_id, commitment, proposer_signature);
         }
 
         let unsigned = builder.build_unsigned();
@@ -308,7 +335,7 @@ impl SlotAttestations {
 
         // Update proposer counts
         for entry in &attestation.entries {
-            *self.proposer_counts.entry(entry.proposer_id).or_insert(0) += 1;
+            *self.proposer_counts.entry(entry.proposer_index).or_insert(0) += 1;
         }
 
         self.attestations.insert(relay_id, attestation);
@@ -348,7 +375,7 @@ impl SlotAttestations {
     /// Get the commitment for a proposer (from any attestation that includes it).
     fn get_proposer_commitment(&self, proposer_id: u8) -> Option<Hash> {
         for attestation in self.attestations.values() {
-            if let Some(root) = attestation.get_merkle_root(proposer_id) {
+            if let Some(root) = attestation.get_commitment(proposer_id) {
                 return Some(*root);
             }
         }
@@ -469,6 +496,10 @@ mod tests {
         Hash::from([seed; 32])
     }
 
+    fn make_test_sig(seed: u8) -> solana_signature::Signature {
+        solana_signature::Signature::from([seed; 64])
+    }
+
     #[test]
     fn test_proposer_shred_tracker() {
         let mut tracker = ProposerShredTracker::default();
@@ -478,7 +509,7 @@ mod tests {
 
         // Add some shreds
         for i in 0..MIN_SHREDS_FOR_ATTESTATION {
-            tracker.record_shred(i as u32, make_test_hash(1));
+            tracker.record_shred(i as u32, make_test_hash(1), make_test_sig(1));
         }
 
         // Now can attest
@@ -492,12 +523,12 @@ mod tests {
 
         // Record shreds from proposer 0
         for i in 0..MIN_SHREDS_FOR_ATTESTATION {
-            state.record_shred(0, i as u32, make_test_hash(0));
+            state.record_shred(0, i as u32, make_test_hash(0), make_test_sig(0));
         }
 
         // Record shreds from proposer 1 (not enough)
         for i in 0..10 {
-            state.record_shred(1, i as u32, make_test_hash(1));
+            state.record_shred(1, i as u32, make_test_hash(1), make_test_sig(1));
         }
 
         // Only proposer 0 should be attestable
@@ -521,6 +552,7 @@ mod tests {
                 proposer_id: 0,
                 shred_index: i as u32,
                 commitment: make_test_hash(0),
+                proposer_signature: make_test_sig(0),
             });
         }
 
@@ -544,8 +576,8 @@ mod tests {
                 100,
                 relay_id,
                 vec![
-                    AttestationEntry::new(0, make_test_hash(0)),
-                    AttestationEntry::new(1, make_test_hash(1)),
+                    AttestationEntry::new(0, make_test_hash(0), make_test_sig(0)),
+                    AttestationEntry::new(1, make_test_hash(1), make_test_sig(1)),
                 ],
                 solana_signature::Signature::default(),
             );
@@ -570,7 +602,7 @@ mod tests {
             let attestation = RelayAttestation::new_signed(
                 100,
                 relay_id,
-                vec![AttestationEntry::new(0, make_test_hash(0))],
+                vec![AttestationEntry::new(0, make_test_hash(0), make_test_sig(0))],
                 solana_signature::Signature::default(),
             );
             slot_attestations.add_attestation(attestation);
@@ -586,7 +618,7 @@ mod tests {
             let attestation = RelayAttestation::new_signed(
                 100,
                 relay_id,
-                vec![AttestationEntry::new(1, make_test_hash(1))],
+                vec![AttestationEntry::new(1, make_test_hash(1), make_test_sig(1))],
                 solana_signature::Signature::default(),
             );
             slot_attestations.add_attestation(attestation);
@@ -600,7 +632,7 @@ mod tests {
         let attestation = RelayAttestation::new_signed(
             100,
             159,
-            vec![AttestationEntry::new(1, make_test_hash(1))],
+            vec![AttestationEntry::new(1, make_test_hash(1), make_test_sig(1))],
             solana_signature::Signature::default(),
         );
         slot_attestations.add_attestation(attestation);
