@@ -61,7 +61,7 @@ impl ProposerSchedule {
             epoch,
             num_slots,
             NUM_PROPOSERS as usize,
-            0x50524F50, // "PROP" magic
+            "proposer", // role per spec §3.3.1
         );
 
         Self {
@@ -147,7 +147,7 @@ impl RelaySchedule {
             epoch,
             num_slots,
             NUM_RELAYS as usize,
-            0x52454C59, // "RELY" magic
+            "relay", // role per spec §3.3.1
         );
 
         Self {
@@ -262,7 +262,7 @@ fn compute_slot_committees(
     epoch: Epoch,
     num_slots: u64,
     committee_size: usize,
-    magic: u32,
+    role: &str,
 ) -> Vec<Vec<Pubkey>> {
     if validators.is_empty() || committee_size == 0 {
         return vec![vec![]; num_slots as usize];
@@ -272,10 +272,12 @@ fn compute_slot_committees(
     let mut sorted_validators: Vec<_> = validators.to_vec();
     sort_stakes_owned(&mut sorted_validators);
 
-    // Create base seed for this role
-    let mut base_seed = [0u8; 32];
-    base_seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-    base_seed[8..12].copy_from_slice(&magic.to_le_bytes());
+    // Create base seed for this role per spec §3.3.1:
+    // seed_role = SHA256("mcp:committee:" || role || LE64(epoch_number))
+    use solana_sha256_hasher::hashv;
+    let epoch_bytes = epoch.to_le_bytes();
+    let base_seed_hash = hashv(&[b"mcp:committee:", role.as_bytes(), &epoch_bytes]);
+    let base_seed: [u8; 32] = base_seed_hash.to_bytes();
 
     let mut slot_committees = Vec::with_capacity(num_slots as usize);
 

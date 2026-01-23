@@ -2670,7 +2670,7 @@ impl ReplayStage {
                     let mut state = SlotReconstructionState::new(slot);
 
                     // Track implied proposers (proposer_id -> commitment)
-                    let mut implied_proposers: Vec<(u8, Hash)> = Vec::new();
+                    let mut implied_proposers: Vec<(u32, Hash)> = Vec::new();
 
                     for (proposer_id, proposer_shreds) in mcp_shreds {
                         // Parse the first shred to get the commitment (they should all have the same)

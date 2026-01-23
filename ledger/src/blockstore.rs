@@ -3281,10 +3281,10 @@ impl Blockstore {
 
     /// Get all MCP shreds for a slot across all proposers.
     /// Returns a map of proposer_id -> list of (shred_index, shred_bytes).
-    pub fn get_all_mcp_shreds_for_slot(&self, slot: Slot) -> Result<std::collections::HashMap<u8, Vec<(u64, Vec<u8>)>>> {
+    pub fn get_all_mcp_shreds_for_slot(&self, slot: Slot) -> Result<std::collections::HashMap<u32, Vec<(u64, Vec<u8>)>>> {
         let mut result = std::collections::HashMap::new();
-        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u8 {
-            let shreds = self.get_mcp_data_shreds_for_proposer(slot, proposer_id)?;
+        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u32 {
+            let shreds = self.get_mcp_data_shreds_for_proposer(slot, proposer_id as u8)?;
             if !shreds.is_empty() {
                 result.insert(proposer_id, shreds);
             }
@@ -3299,8 +3299,8 @@ impl Blockstore {
         const K_DATA_SHREDS: usize = crate::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK;
 
         // Check if we have enough shreds for at least one proposer
-        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u8 {
-            if let Ok(shreds) = self.get_mcp_data_shreds_for_proposer(slot, proposer_id) {
+        for proposer_id in 0..crate::mcp::NUM_PROPOSERS as u32 {
+            if let Ok(shreds) = self.get_mcp_data_shreds_for_proposer(slot, proposer_id as u8) {
                 if shreds.len() >= K_DATA_SHREDS {
                     return true;
                 }

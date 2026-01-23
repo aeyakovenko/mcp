@@ -117,7 +117,7 @@ pub enum FeeDeductionResult {
     /// Fees successfully deducted
     Success {
         fees: TransactionFees,
-        including_proposer: u8,
+        including_proposer: u32,
     },
     /// Fee payer couldn't cover the fees
     InsufficientFunds {
@@ -134,7 +134,7 @@ pub struct SlotFeeTracker {
     /// Slot number
     pub slot: Slot,
     /// Fees accumulated per proposer
-    pub proposer_fees: HashMap<u8, u64>,
+    pub proposer_fees: HashMap<u32, u64>,
     /// Total validator fees accumulated
     pub validator_fees: u64,
     /// Number of transactions processed
@@ -178,7 +178,7 @@ impl SlotFeeTracker {
     }
 
     /// Get fees for a specific proposer
-    pub fn get_proposer_fee(&self, proposer_id: u8) -> u64 {
+    pub fn get_proposer_fee(&self, proposer_id: u32) -> u64 {
         self.proposer_fees.get(&proposer_id).copied().unwrap_or(0)
     }
 }
@@ -199,7 +199,7 @@ pub struct TwoPhaseProcessor {
     /// Fee tracker for the current slot
     fee_tracker: SlotFeeTracker,
     /// Map of txid -> proposer_id for fee routing
-    tx_proposer_map: HashMap<Hash, u8>,
+    tx_proposer_map: HashMap<Hash, u32>,
 }
 
 impl TwoPhaseProcessor {
@@ -223,7 +223,7 @@ impl TwoPhaseProcessor {
     }
 
     /// Get the including proposer for a transaction
-    pub fn get_including_proposer(&self, txid: &Hash) -> Option<u8> {
+    pub fn get_including_proposer(&self, txid: &Hash) -> Option<u32> {
         self.tx_proposer_map.get(txid).copied()
     }
 

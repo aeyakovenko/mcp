@@ -20,11 +20,11 @@ pub const LEAF_PREFIX: u8 = 0x00;
 /// Domain separation prefix for node hashes
 pub const NODE_PREFIX: u8 = 0x01;
 
-/// Domain string for leaf hashes
-pub const LEAF_DOMAIN: &[u8] = b"SOLANA_MCP_MERKLE_LEAF_V1";
+/// Domain string for leaf hashes (spec §4.4.1)
+pub const LEAF_DOMAIN: &[u8] = b"SOLANA_MERKLE_SHREDS_LEAF";
 
-/// Domain string for node hashes
-pub const NODE_DOMAIN: &[u8] = b"SOLANA_MCP_MERKLE_NODE_V1";
+/// Domain string for node hashes (spec §4.4.1)
+pub const NODE_DOMAIN: &[u8] = b"SOLANA_MERKLE_SHREDS_NODE";
 
 /// Number of leaves in the fixed-depth tree (2^8 = 256)
 pub const NUM_LEAVES: usize = 256;
@@ -95,29 +95,38 @@ impl MerkleProof {
     }
 
     /// Verify this proof against a commitment and leaf data
+    ///
+    /// Per spec §4.4.5: At the root level, keep the full 32-byte node_hash
+    /// and compare against the full 32-byte commitment.
     pub fn verify(&self, commitment: &Hash, leaf_data: &[u8]) -> bool {
-        // Compute leaf hash
+        // Compute leaf hash and truncate
         let leaf_hash = compute_leaf_hash(leaf_data);
-        let mut current_hash = truncate_hash(&leaf_hash);
+        let mut current_trunc = truncate_hash(&leaf_hash);
 
-        // Walk up the tree
+        // Walk up the tree, keeping track of the full hash at the root level
         let mut index = self.leaf_index as usize;
-        for sibling in &self.siblings {
+        let mut root_hash = Hash::default();
+
+        for (level, sibling) in self.siblings.iter().enumerate() {
             let (left, right) = if index % 2 == 0 {
-                (&current_hash, sibling)
+                (&current_trunc, sibling)
             } else {
-                (sibling, &current_hash)
+                (sibling, &current_trunc)
             };
 
             let node_hash = compute_node_hash(left, right);
-            current_hash = truncate_hash(&node_hash);
+
+            // At the root level (level 7), keep the full 32-byte hash
+            if level == PROOF_ENTRIES - 1 {
+                root_hash = node_hash;
+            } else {
+                current_trunc = truncate_hash(&node_hash);
+            }
             index /= 2;
         }
 
-        // The final hash should match the commitment
-        // Note: commitment is 32 bytes, current_hash is truncated to 20 bytes
-        // We need to compare the first 20 bytes of the commitment
-        commitment.as_ref()[..TRUNCATED_HASH_SIZE] == current_hash
+        // Compare full 32-byte root against commitment (spec §4.4.5)
+        root_hash == *commitment
     }
 }
 

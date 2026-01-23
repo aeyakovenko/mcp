@@ -95,7 +95,7 @@ impl ProposerShredTracker {
 #[derive(Debug, Default)]
 pub struct SlotShredState {
     /// Per-proposer tracking
-    pub proposers: HashMap<u8, ProposerShredTracker>,
+    pub proposers: HashMap<u32, ProposerShredTracker>,
     /// When tracking started for this slot
     pub started: Option<Instant>,
     /// Whether attestation has been sent
@@ -115,7 +115,7 @@ impl SlotShredState {
     /// Record a received shred.
     pub fn record_shred(
         &mut self,
-        proposer_id: u8,
+        proposer_id: u32,
         shred_index: u32,
         commitment: Hash,
         proposer_signature: solana_signature::Signature,
@@ -128,7 +128,7 @@ impl SlotShredState {
 
     /// Get proposers that have enough shreds for attestation.
     /// Returns (proposer_id, commitment, proposer_signature) tuples.
-    pub fn attestable_proposers(&self) -> Vec<(u8, Hash, solana_signature::Signature)> {
+    pub fn attestable_proposers(&self) -> Vec<(u32, Hash, solana_signature::Signature)> {
         self.proposers
             .iter()
             .filter(|(_, tracker)| tracker.can_attest())
@@ -162,7 +162,7 @@ impl SlotShredState {
 #[derive(Debug, Clone)]
 pub struct ReceivedShredInfo {
     pub slot: Slot,
-    pub proposer_id: u8,
+    pub proposer_id: u32,
     pub shred_index: u32,
     pub commitment: Hash,
     pub proposer_signature: solana_signature::Signature,
@@ -251,7 +251,7 @@ impl RelayAttestationService {
     /// Returns the slot and attestable proposers (with their signatures) if ready.
     pub fn check_attestation_ready(
         &mut self,
-    ) -> Option<(Slot, Vec<(u8, Hash, solana_signature::Signature)>)> {
+    ) -> Option<(Slot, Vec<(u32, Hash, solana_signature::Signature)>)> {
         for (&slot, state) in &mut self.slot_states {
             if state.should_send_attestation() && !state.attestation_sent {
                 let proposers = state.attestable_proposers();

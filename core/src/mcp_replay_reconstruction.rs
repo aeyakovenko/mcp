@@ -202,9 +202,9 @@ pub struct SlotReconstructionState {
     /// Slot number
     pub slot: Slot,
     /// Shred data per proposer
-    pub proposers: HashMap<u8, ProposerShreds>,
+    pub proposers: HashMap<u32, ProposerShreds>,
     /// Set of implied proposers from the block
-    pub implied_proposers: HashSet<u8>,
+    pub implied_proposers: HashSet<u32>,
 }
 
 impl SlotReconstructionState {
@@ -218,7 +218,7 @@ impl SlotReconstructionState {
     }
 
     /// Set the implied proposers from the consensus block
-    pub fn set_implied_proposers(&mut self, proposers: Vec<(u8, Hash)>) {
+    pub fn set_implied_proposers(&mut self, proposers: Vec<(u32, Hash)>) {
         for (proposer_id, commitment) in proposers {
             self.implied_proposers.insert(proposer_id);
             self.proposers
@@ -228,7 +228,7 @@ impl SlotReconstructionState {
     }
 
     /// Add a shred for a proposer
-    pub fn add_shred(&mut self, proposer_id: u8, shred: ShredData) {
+    pub fn add_shred(&mut self, proposer_id: u32, shred: ShredData) {
         self.proposers
             .entry(proposer_id)
             .or_default()
@@ -246,8 +246,8 @@ impl SlotReconstructionState {
     }
 
     /// Get reconstruction status for each proposer
-    pub fn get_reconstruction_status(&self) -> Vec<(u8, bool, usize)> {
-        (0..NUM_PROPOSERS as u8)
+    pub fn get_reconstruction_status(&self) -> Vec<(u32, bool, usize)> {
+        (0..NUM_PROPOSERS as u32)
             .map(|p| {
                 let (can_reconstruct, count) = self
                     .proposers
@@ -264,7 +264,7 @@ impl SlotReconstructionState {
 #[derive(Debug, Clone)]
 pub struct OrderedTransaction {
     /// The proposer that included this transaction
-    pub proposer_id: u8,
+    pub proposer_id: u32,
     /// The raw transaction bytes
     pub tx_bytes: Vec<u8>,
     /// Transaction ID (SHA256 of tx_bytes)
@@ -273,7 +273,7 @@ pub struct OrderedTransaction {
 
 impl OrderedTransaction {
     /// Create a new ordered transaction
-    pub fn new(proposer_id: u8, tx_bytes: Vec<u8>) -> Self {
+    pub fn new(proposer_id: u32, tx_bytes: Vec<u8>) -> Self {
         // Compute txid = SHA256(tx_bytes)
         use solana_sha256_hasher::Hasher;
         let mut hasher = Hasher::default();
@@ -294,7 +294,7 @@ pub struct SlotReconstruction {
     /// Slot number
     pub slot: Slot,
     /// Reconstructed payloads per proposer (None if failed)
-    pub payloads: HashMap<u8, ReconstructionResult>,
+    pub payloads: HashMap<u32, ReconstructionResult>,
     /// Global ordered and de-duplicated transaction list
     pub ordered_transactions: Vec<OrderedTransaction>,
 }
@@ -310,7 +310,7 @@ impl SlotReconstruction {
     }
 
     /// Add a payload reconstruction result
-    pub fn add_payload(&mut self, proposer_id: u8, result: ReconstructionResult) {
+    pub fn add_payload(&mut self, proposer_id: u32, result: ReconstructionResult) {
         self.payloads.insert(proposer_id, result);
     }
 
@@ -320,7 +320,7 @@ impl SlotReconstruction {
         let mut ordered = Vec::new();
 
         // Iterate proposers by increasing proposer_id
-        for proposer_id in 0..NUM_PROPOSERS as u8 {
+        for proposer_id in 0..NUM_PROPOSERS as u32 {
             if let Some(ReconstructionResult::Success(payload)) = self.payloads.get(&proposer_id) {
                 // Add transactions from this proposer
                 for tx_bytes in &payload.tx_data {
@@ -496,7 +496,7 @@ pub fn reconstruct_proposer_payload(
 /// Reconstruct all proposers for a slot
 pub fn reconstruct_slot(
     state: &SlotReconstructionState,
-    implied_proposers: &[(u8, Hash)],
+    implied_proposers: &[(u32, Hash)],
 ) -> SlotReconstruction {
     let mut result = SlotReconstruction::new(state.slot);
 
