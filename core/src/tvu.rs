@@ -414,6 +414,7 @@ impl Tvu {
             votor_event_sender,
             own_vote_sender: consensus_message_sender,
             optimistic_parent_sender,
+            mcp_block_sender: None, // TODO: Wire MCP block receiver in retransmit stage
         };
 
         let replay_receivers = ReplayReceivers {

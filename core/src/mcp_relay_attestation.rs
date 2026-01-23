@@ -12,6 +12,7 @@
 //! - The leader needs attestations from >= 60% of relays to finalize a slot
 
 use {
+    crate::mcp_consensus_block::MIN_RELAYS_IN_BLOCK,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
@@ -47,7 +48,8 @@ pub const ATTESTATION_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 pub const MIN_RELAY_PERCENTAGE: f64 = 0.60;
 
 /// Minimum number of relays needed (ceil(0.60 * 200) = 120)
-pub const MIN_RELAYS_FOR_BLOCK: usize = 120;
+/// Re-exported from mcp_consensus_block for convenience
+pub const MIN_RELAYS_FOR_BLOCK: usize = MIN_RELAYS_IN_BLOCK;
 
 /// Tracks shreds received from a single proposer.
 #[derive(Debug, Default)]

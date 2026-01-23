@@ -45,6 +45,7 @@ use {
 // ============================================================================
 
 /// Number of proposers in MCP.
+/// TODO: Move to a shared crate (solana-mcp-config) to avoid duplication with ledger/src/mcp.rs
 pub const MCP_NUM_PROPOSERS: u8 = 16;
 
 /// Errors that can occur during MCP fee payer validation.

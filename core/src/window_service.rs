@@ -30,7 +30,7 @@ use {
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
-        shred::{self, mcp_shred::{McpShredV1, MCP_SHRED_TOTAL_BYTES}, ReedSolomonCache, Shred},
+        shred::{self, mcp_shred::{is_mcp_shred_packet, McpShredV1}, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
@@ -277,10 +277,10 @@ where
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
 
-    // Separate MCP shreds from regular shreds
+    // Separate MCP shreds from regular shreds using format validation
     let (mcp_shreds, regular_shreds): (Vec<_>, Vec<_>) = shreds
         .into_iter()
-        .partition(|(shred, _, _)| shred.len() == MCP_SHRED_TOTAL_BYTES);
+        .partition(|(shred, _, _)| is_mcp_shred_packet(shred));
 
     // Handle regular shreds
     let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {

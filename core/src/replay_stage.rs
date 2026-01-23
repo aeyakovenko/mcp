@@ -22,6 +22,7 @@ use {
         cost_update_service::CostUpdate,
         mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK, BANKHASH_DELAY_SLOTS},
         mcp_relay_attestation::{AttestationAggregator, MIN_RELAYS_FOR_BLOCK},
+        mcp_fee_mechanics::TwoPhaseProcessor,
         mcp_replay_reconstruction::{
             reconstruct_slot, ShredData, SlotReconstructionState,
         },
@@ -313,6 +314,9 @@ pub struct ReplayStageConfig {
     pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
 }
 
+/// MCP block for consensus broadcast
+pub type McpBlockBroadcast = (Slot, Vec<u8>);
+
 pub struct ReplaySenders {
     pub rpc_subscriptions: Option<Arc<RpcSubscriptions>>,
     pub slot_status_notifier: Option<SlotStatusNotifier>,
@@ -332,6 +336,8 @@ pub struct ReplaySenders {
     pub votor_event_sender: VotorEventSender,
     pub own_vote_sender: Sender<ConsensusMessage>,
     pub optimistic_parent_sender: Sender<LeaderWindowInfo>,
+    /// MCP block broadcast sender (for consensus leader to distribute McpBlockV1)
+    pub mcp_block_sender: Option<Sender<McpBlockBroadcast>>,
 }
 
 pub struct ReplayReceivers {
@@ -658,6 +664,7 @@ impl ReplayStage {
             votor_event_sender,
             own_vote_sender,
             optimistic_parent_sender,
+            mcp_block_sender,
         } = senders;
 
         let ReplayReceivers {
@@ -961,6 +968,7 @@ impl ReplayStage {
                                         &blockstore,
                                         &bank_forks,
                                         &identity_keypair,
+                                        &mcp_block_sender,
                                     );
                                     mcp_blocks_built.insert(slot);
                                 }
@@ -2781,11 +2789,24 @@ impl ReplayStage {
                         reconstruction.transaction_count()
                     );
 
-                    // 5. Process reconstructed transactions
-                    // NOTE: Full MCP processing with fee-only first pass is deferred.
-                    // For now, log the reconstruction results and continue with regular processing.
-                    // The transactions from MCP proposers are available in reconstruction.ordered_transactions
-                    // and can be processed through the bank when MCP is fully activated.
+                    // 5. Initialize two-phase processor with deterministic ordering
+                    // Per MCP spec §13.2: The ordered_transactions list determines:
+                    // - The deterministic execution order (proposers in order 0..15)
+                    // - The including proposer for fee attribution (first occurrence)
+                    let mut mcp_processor = TwoPhaseProcessor::new(slot);
+                    mcp_processor.set_ordered_transactions(&reconstruction.ordered_transactions);
+
+                    info!(
+                        "MCP: Initialized two-phase processor for slot {} with {} transactions",
+                        slot,
+                        reconstruction.transaction_count()
+                    );
+
+                    // TODO: Integrate mcp_processor with blockstore_processor::confirm_slot
+                    // to execute transactions using two-phase fee mechanics:
+                    // - Phase A: Deduct fees using mcp_processor.process_phase_a()
+                    // - Phase B: Execute transactions that passed Phase A
+                    // For now, we've established the deterministic ordering.
 
                     for (proposer_id, success, shred_count) in state.get_reconstruction_status() {
                         debug!(
@@ -2857,6 +2878,7 @@ impl ReplayStage {
     /// - Leader aggregates relay attestations
     /// - When >= 120 relays have attested, build the MCP block
     /// - Block includes all relay attestations and is signed by the leader
+    /// - Block is broadcast through turbine for consensus
     fn try_build_mcp_block(
         slot: Slot,
         _my_pubkey: &Pubkey,
@@ -2864,6 +2886,7 @@ impl ReplayStage {
         blockstore: &Blockstore,
         bank_forks: &RwLock<BankForks>,
         identity_keypair: &Keypair,
+        mcp_block_sender: &Option<Sender<McpBlockBroadcast>>,
     ) {
         use crate::mcp_consensus_block::RelayEntryV1;
 
@@ -2918,6 +2941,15 @@ impl ReplayStage {
                     slot,
                     included_proposers.len()
                 );
+
+                // Broadcast the block through turbine for consensus
+                if let Some(sender) = mcp_block_sender {
+                    if let Err(e) = sender.send((slot, block_bytes)) {
+                        error!("MCP: Failed to broadcast block for slot {}: {:?}", slot, e);
+                    } else {
+                        info!("MCP: Broadcast block for slot {} to network", slot);
+                    }
+                }
             }
         }
     }

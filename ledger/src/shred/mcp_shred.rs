@@ -390,10 +390,19 @@ pub fn get_mcp_signature(data: &[u8]) -> Option<Signature> {
     Some(Signature::from(bytes))
 }
 
-/// Check if a packet could be an MCP shred based on size.
+/// Check if a packet could be an MCP shred based on size and format validation.
+///
+/// Per MCP spec §6.1, MCP shreds have a fixed 1225-byte format.
+/// We validate both the size and the witness_len field to distinguish
+/// MCP shreds from legacy shreds that happen to be the same size.
 #[inline]
 pub fn is_mcp_shred_packet(data: &[u8]) -> bool {
-    data.len() == MCP_SHRED_TOTAL_BYTES
+    if data.len() != MCP_SHRED_TOTAL_BYTES {
+        return false;
+    }
+    // Validate witness_len field per spec - must be MERKLE_PROOF_ENTRIES (8)
+    // This provides format validation beyond just size checking
+    data[OFFSET_WITNESS_LEN] == MERKLE_PROOF_ENTRIES as u8
 }
 
 /// Get the shred data payload range.
