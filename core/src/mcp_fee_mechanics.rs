@@ -13,9 +13,11 @@
 
 use {
     crate::mcp_replay_reconstruction::OrderedTransaction,
+    solana_account::AccountSharedData,
     solana_clock::Slot,
     solana_hash::Hash,
     solana_pubkey::Pubkey,
+    solana_svm::account_loader::{execute_fee_phase, FeePhaseResult, McpFeeBreakdown},
     std::collections::HashMap,
 };
 
@@ -278,6 +280,71 @@ impl TwoPhaseProcessor {
     /// Get mutable fee tracker
     pub fn fee_tracker_mut(&mut self) -> &mut SlotFeeTracker {
         &mut self.fee_tracker
+    }
+
+    /// Execute Phase A fee deduction through SVM account_loader.
+    ///
+    /// This is the integration point that connects MCP two-phase processing
+    /// with the actual SVM fee deduction logic.
+    ///
+    /// Per MCP spec §13.3: Phase A deducts all fees from the fee payer
+    /// before any transaction execution occurs.
+    pub fn execute_fee_phase_on_account(
+        &mut self,
+        txid: &Hash,
+        fee_payer: &Pubkey,
+        fee_payer_account: &mut AccountSharedData,
+        fees: TransactionFees,
+        min_balance: u64,
+    ) -> FeeDeductionResult {
+        // Determine including proposer first
+        let including_proposer = match self.get_including_proposer(txid) {
+            Some(p) => p,
+            None => {
+                let result = FeeDeductionResult::PreCheckFailed(
+                    "Transaction not in ordered list".to_string(),
+                );
+                self.fee_tracker.record_fee_deduction(&result);
+                return result;
+            }
+        };
+
+        // Convert MCP fees to SVM fee breakdown
+        let mcp_fee_breakdown = McpFeeBreakdown {
+            signature_fee: fees.signature_fee,
+            prioritization_fee: fees.prioritization_fee,
+            inclusion_fee: fees.inclusion_fee,
+            ordering_fee: fees.ordering_fee,
+        };
+
+        // Execute fee phase through SVM
+        let fee_result = execute_fee_phase(
+            fee_payer,
+            fee_payer_account,
+            mcp_fee_breakdown,
+            min_balance,
+        );
+
+        // Convert FeePhaseResult to FeeDeductionResult
+        let result = match fee_result {
+            FeePhaseResult::Success { fees: breakdown, .. } => {
+                FeeDeductionResult::Success {
+                    fees: TransactionFees {
+                        signature_fee: breakdown.signature_fee,
+                        prioritization_fee: breakdown.prioritization_fee,
+                        inclusion_fee: breakdown.inclusion_fee,
+                        ordering_fee: breakdown.ordering_fee,
+                    },
+                    including_proposer,
+                }
+            }
+            FeePhaseResult::Failure { error, .. } => {
+                FeeDeductionResult::PreCheckFailed(format!("{:?}", error))
+            }
+        };
+
+        self.fee_tracker.record_fee_deduction(&result);
+        result
     }
 }
 

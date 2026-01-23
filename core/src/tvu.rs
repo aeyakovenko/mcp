@@ -425,6 +425,7 @@ impl Tvu {
             popular_pruned_forks_receiver,
             consensus_message_receiver,
             votor_event_receiver,
+            mcp_attestation_receiver: None, // TODO: Wire attestation receiving socket
         };
 
         let replay_stage_config = ReplayStageConfig {

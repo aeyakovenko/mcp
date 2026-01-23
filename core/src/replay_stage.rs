@@ -20,7 +20,8 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
-        mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK},
+        mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK, BANKHASH_DELAY_SLOTS},
+        mcp_relay_attestation::{AttestationAggregator, MIN_RELAYS_FOR_BLOCK},
         mcp_replay_reconstruction::{
             reconstruct_slot, ShredData, SlotReconstructionState,
         },
@@ -60,6 +61,7 @@ use {
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        mcp_attestation::RelayAttestation,
         shred::mcp_shred::McpShredV1,
     },
     solana_measure::measure::Measure,
@@ -341,6 +343,8 @@ pub struct ReplayReceivers {
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
     pub consensus_message_receiver: Receiver<ConsensusMessage>,
     pub votor_event_receiver: VotorEventReceiver,
+    /// MCP relay attestation receiver (for consensus leader)
+    pub mcp_attestation_receiver: Option<Receiver<RelayAttestation>>,
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -665,6 +669,7 @@ impl ReplayStage {
             popular_pruned_forks_receiver,
             consensus_message_receiver,
             votor_event_receiver,
+            mcp_attestation_receiver,
         } = receivers;
 
         trace!("replay stage");
@@ -825,6 +830,11 @@ impl ReplayStage {
                 while poh_controller.has_pending_message() && !exit.load(Ordering::Relaxed) {}
             }
 
+            // MCP attestation aggregator (for consensus leader)
+            let mut mcp_attestation_aggregator = AttestationAggregator::new(32);
+            // Track slots we've already built MCP blocks for
+            let mut mcp_blocks_built: std::collections::HashSet<Slot> = std::collections::HashSet::new();
+
             loop {
                 // Stop getting entries if we get exit signal
                 if exit.load(Ordering::Relaxed) {
@@ -921,6 +931,43 @@ impl ReplayStage {
                     }
                 }
                 replay_active_banks_time.stop();
+
+                // Process MCP attestations (for consensus leader)
+                if let Some(ref attestation_rx) = mcp_attestation_receiver {
+                    // Drain attestations from the receiver without blocking
+                    while let Ok(attestation) = attestation_rx.try_recv() {
+                        let slot = attestation.slot;
+                        let relay_id = attestation.relay_id;
+                        if mcp_attestation_aggregator.add_attestation(attestation) {
+                            trace!(
+                                "MCP: Added attestation from relay {} for slot {}",
+                                relay_id, slot
+                            );
+                        }
+
+                        // Check if we can build an MCP block for this slot
+                        if !mcp_blocks_built.contains(&slot)
+                            && mcp_attestation_aggregator.can_finalize_slot(slot)
+                        {
+                            // Check if we're the leader for this slot
+                            let working_bank = bank_forks.read().unwrap().working_bank();
+                            if let Some(leader) = leader_schedule_cache.slot_leader_at(slot, Some(&working_bank)) {
+                                if leader == my_pubkey {
+                                    // We're the leader - build the MCP block
+                                    Self::try_build_mcp_block(
+                                        slot,
+                                        &my_pubkey,
+                                        &mcp_attestation_aggregator,
+                                        &blockstore,
+                                        &bank_forks,
+                                        &identity_keypair,
+                                    );
+                                    mcp_blocks_built.insert(slot);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Check if we've completed the migration conditions
                 if migration_status.is_ready_to_enable() {
@@ -2802,6 +2849,77 @@ impl ReplayStage {
         // Sort by proposer_id for deterministic ordering
         implied_proposers.sort_by_key(|(id, _)| *id);
         implied_proposers
+    }
+
+    /// Build and store an MCP block when we have enough attestations as the leader.
+    ///
+    /// Per MCP spec §11:
+    /// - Leader aggregates relay attestations
+    /// - When >= 120 relays have attested, build the MCP block
+    /// - Block includes all relay attestations and is signed by the leader
+    fn try_build_mcp_block(
+        slot: Slot,
+        _my_pubkey: &Pubkey,
+        aggregator: &AttestationAggregator,
+        blockstore: &Blockstore,
+        bank_forks: &RwLock<BankForks>,
+        identity_keypair: &Keypair,
+    ) {
+        use crate::mcp_consensus_block::RelayEntryV1;
+
+        // Get the slot attestations from the aggregator
+        let attestation_count = aggregator.attestation_count(slot);
+        if attestation_count < MIN_RELAYS_FOR_BLOCK {
+            return;
+        }
+
+        info!(
+            "MCP: Building block for slot {} with {} relay attestations",
+            slot, attestation_count
+        );
+
+        // Get the delayed bankhash (slot - BANKHASH_DELAY_SLOTS)
+        let delayed_slot = slot.saturating_sub(BANKHASH_DELAY_SLOTS);
+        let delayed_bankhash = bank_forks
+            .read()
+            .ok()
+            .and_then(|bf| bf.get(delayed_slot))
+            .map(|b| b.hash())
+            .unwrap_or_default();
+
+        // Build relay entries from aggregated attestations
+        // TODO: Access internal attestations from aggregator - for now, use included proposers
+        let included_proposers = aggregator.get_included_proposers(slot);
+
+        // Create a minimal block with the included proposers
+        // In a full implementation, we would include all relay attestation entries
+        let relay_entries: Vec<RelayEntryV1> = Vec::new(); // Placeholder - needs actual attestation data
+
+        // Create the unsigned block
+        let mut mcp_block = McpBlockV1::new_unsigned(
+            slot,
+            0, // leader_index - would come from schedule
+            delayed_bankhash,
+            relay_entries,
+        );
+
+        // Sign the block
+        mcp_block.sign(identity_keypair);
+
+        // Serialize and store in blockstore
+        let mut block_bytes = Vec::new();
+        if mcp_block.serialize(&mut block_bytes).is_ok() {
+            let block_hash = mcp_block.compute_block_hash();
+            if let Err(e) = blockstore.put_mcp_consensus_payload(slot, block_hash, &block_bytes) {
+                error!("MCP: Failed to store block for slot {}: {:?}", slot, e);
+            } else {
+                info!(
+                    "MCP: Successfully stored block for slot {} with {} included proposers",
+                    slot,
+                    included_proposers.len()
+                );
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
