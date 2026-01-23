@@ -33,7 +33,8 @@ pub const MAX_PROPOSER_PAYLOAD_BYTES: usize = K_DATA_SHARDS * MCP_SHARD_SIZE;
 pub const MAX_TX_SIZE: usize = 4096;
 
 /// Domain separator for proposer signature
-pub const PROPOSER_SIG_DOMAIN: &[u8] = b"mcp:proposer-sig:v1";
+/// Domain prefix for proposer commitment signature per spec §5.2.
+pub const PROPOSER_SIG_DOMAIN: &[u8] = b"mcp:commitment:v1";
 
 /// Error type for proposer operations
 #[derive(Debug)]
@@ -422,12 +423,11 @@ impl McpProposer {
         Ok(mcp_shreds)
     }
 
-    /// Sign the commitment: Ed25519Sign(SK, domain || slot || proposer_id || commitment)
+    /// Sign the commitment: Ed25519Sign(SK, domain || commitment)
+    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
     fn sign_commitment(&self, commitment: &Hash) -> [u8; 64] {
-        let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 8 + 1 + 32);
+        let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 32);
         message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-        message.extend_from_slice(&self.slot.to_le_bytes());
-        message.extend_from_slice(&[self.proposer_id]);
         message.extend_from_slice(commitment.as_ref());
 
         let signature = self.keypair.sign_message(&message);
@@ -463,18 +463,15 @@ impl McpProposer {
     }
 }
 
-/// Verify a proposer's signature on a commitment
+/// Verify a proposer's signature on a commitment.
+/// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
 pub fn verify_proposer_signature(
     proposer_pubkey: &solana_pubkey::Pubkey,
-    slot: Slot,
-    proposer_id: u8,
     commitment: &Hash,
     signature: &[u8; 64],
 ) -> bool {
-    let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 8 + 1 + 32);
+    let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 32);
     message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-    message.extend_from_slice(&slot.to_le_bytes());
-    message.extend_from_slice(&[proposer_id]);
     message.extend_from_slice(commitment.as_ref());
 
     let sig = solana_signature::Signature::from(*signature);
@@ -643,11 +640,9 @@ mod tests {
         let shreds = proposer.create_shreds(&payload).unwrap();
         let shred = &shreds[0];
 
-        // Verify signature
+        // Verify signature - per spec §5.2, signature is over domain || commitment only
         assert!(verify_proposer_signature(
             &proposer.pubkey(),
-            shred.slot,
-            shred.proposer_id,
             &shred.commitment,
             &shred.proposer_signature,
         ));
@@ -656,8 +651,6 @@ mod tests {
         let wrong_keypair = Keypair::new();
         assert!(!verify_proposer_signature(
             &wrong_keypair.pubkey(),
-            shred.slot,
-            shred.proposer_id,
             &shred.commitment,
             &shred.proposer_signature,
         ));

@@ -29,8 +29,8 @@ use {
 pub const RELAY_ATTESTATION_VERSION: u8 = 1;
 
 /// Size of a single attestation entry (proposer_index + commitment + proposer_signature).
-/// Per spec §6.2: 1 + 32 + 64 = 97 bytes
-pub const ATTESTATION_ENTRY_SIZE: usize = 1 + 32 + 64; // 97 bytes
+/// Per spec §6.2: proposer_index(4) + commitment(32) + proposer_signature(64) = 100 bytes
+pub const ATTESTATION_ENTRY_SIZE: usize = 4 + 32 + 64; // 100 bytes
 
 /// Maximum number of entries in an attestation (limited by NUM_PROPOSERS).
 pub const MAX_ATTESTATION_ENTRIES: usize = 16;
@@ -46,18 +46,18 @@ pub const MIN_ATTESTATION_SIZE: usize = 1 + 8 + 2 + 1 + 64; // 76 bytes
 /// by the consensus leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttestationEntry {
-    /// The proposer index (0-15 for standard proposers).
-    pub proposer_index: u8,
+    /// The proposer index (per spec §6.2: u32, range 0 to NUM_PROPOSERS-1).
+    pub proposer_index: u32,
     /// The merkle commitment of the proposer's shred batch.
     pub commitment: Hash,
-    /// The proposer's signature over (slot, proposer_index, commitment).
+    /// The proposer's signature over the commitment.
     /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
     pub proposer_signature: Signature,
 }
 
 impl AttestationEntry {
     /// Create a new attestation entry.
-    pub const fn new(proposer_index: u8, commitment: Hash, proposer_signature: Signature) -> Self {
+    pub const fn new(proposer_index: u32, commitment: Hash, proposer_signature: Signature) -> Self {
         Self {
             proposer_index,
             commitment,
@@ -65,9 +65,9 @@ impl AttestationEntry {
         }
     }
 
-    /// Serialize the entry to bytes.
+    /// Serialize the entry to bytes (4 + 32 + 64 = 100 bytes per spec §6.2).
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&[self.proposer_index])?;
+        writer.write_all(&self.proposer_index.to_le_bytes())?;
         writer.write_all(self.commitment.as_ref())?;
         writer.write_all(self.proposer_signature.as_ref())?;
         Ok(())
@@ -75,9 +75,9 @@ impl AttestationEntry {
 
     /// Deserialize an entry from bytes.
     pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let mut proposer_index_buf = [0u8; 1];
+        let mut proposer_index_buf = [0u8; 4];
         reader.read_exact(&mut proposer_index_buf)?;
-        let proposer_index = proposer_index_buf[0];
+        let proposer_index = u32::from_le_bytes(proposer_index_buf);
 
         let mut commitment_buf = [0u8; 32];
         reader.read_exact(&mut commitment_buf)?;
@@ -94,14 +94,14 @@ impl AttestationEntry {
         })
     }
 
-    /// Verify the proposer signature against the given pubkey and slot.
+    /// Verify the proposer signature against the given pubkey.
     ///
-    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || LE64(slot) || LE32(proposer_index) || commitment32
-    pub fn verify_proposer_signature(&self, proposer_pubkey: &Pubkey, slot: u64) -> bool {
-        let mut msg = Vec::with_capacity(17 + 8 + 4 + 32);
+    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+    /// The commitment already binds to slot/proposer because the payload header
+    /// is inside the committed RS shards.
+    pub fn verify_proposer_signature(&self, proposer_pubkey: &Pubkey) -> bool {
+        let mut msg = Vec::with_capacity(17 + 32);
         msg.extend_from_slice(b"mcp:commitment:v1");
-        msg.extend_from_slice(&slot.to_le_bytes());
-        msg.extend_from_slice(&(self.proposer_index as u32).to_le_bytes());
         msg.extend_from_slice(self.commitment.as_ref());
         self.proposer_signature.verify(proposer_pubkey.as_ref(), &msg)
     }
@@ -361,14 +361,14 @@ impl RelayAttestation {
     }
 
     /// Check if this attestation contains an entry for the given proposer.
-    pub fn has_proposer(&self, proposer_index: u8) -> bool {
+    pub fn has_proposer(&self, proposer_index: u32) -> bool {
         self.entries
             .binary_search_by_key(&proposer_index, |e| e.proposer_index)
             .is_ok()
     }
 
     /// Get the commitment for a specific proposer, if attested.
-    pub fn get_commitment(&self, proposer_index: u8) -> Option<&Hash> {
+    pub fn get_commitment(&self, proposer_index: u32) -> Option<&Hash> {
         self.entries
             .binary_search_by_key(&proposer_index, |e| e.proposer_index)
             .ok()
@@ -376,7 +376,7 @@ impl RelayAttestation {
     }
 
     /// Get the full attestation entry for a specific proposer, if attested.
-    pub fn get_entry(&self, proposer_index: u8) -> Option<&AttestationEntry> {
+    pub fn get_entry(&self, proposer_index: u32) -> Option<&AttestationEntry> {
         self.entries
             .binary_search_by_key(&proposer_index, |e| e.proposer_index)
             .ok()
@@ -388,13 +388,13 @@ impl RelayAttestation {
     /// Takes a function to look up proposer pubkeys by their index.
     pub fn verify_proposer_signatures<F>(&self, get_proposer_pubkey: F) -> Result<(), AttestationError>
     where
-        F: Fn(u8) -> Option<Pubkey>,
+        F: Fn(u32) -> Option<Pubkey>,
     {
         for entry in &self.entries {
             let Some(proposer_pubkey) = get_proposer_pubkey(entry.proposer_index) else {
                 return Err(AttestationError::InvalidProposerIndex(entry.proposer_index));
             };
-            if !entry.verify_proposer_signature(&proposer_pubkey, self.slot) {
+            if !entry.verify_proposer_signature(&proposer_pubkey) {
                 return Err(AttestationError::InvalidProposerSignature(entry.proposer_index));
             }
         }
@@ -414,11 +414,11 @@ pub enum AttestationError {
     /// Too many entries in the attestation.
     TooManyEntries(usize),
     /// Duplicate proposer index in entries.
-    DuplicateProposer(u8),
+    DuplicateProposer(u32),
     /// Invalid proposer index (not in schedule).
-    InvalidProposerIndex(u8),
+    InvalidProposerIndex(u32),
     /// Invalid proposer signature for entry.
-    InvalidProposerSignature(u8),
+    InvalidProposerSignature(u32),
 }
 
 impl std::fmt::Display for AttestationError {
@@ -464,7 +464,7 @@ impl RelayAttestationBuilder {
     /// over the commitment to enable verification by the consensus leader.
     pub fn add_entry(
         mut self,
-        proposer_index: u8,
+        proposer_index: u32,
         commitment: Hash,
         proposer_signature: Signature,
     ) -> Self {

@@ -268,7 +268,7 @@ impl RelayAttestationService {
     pub fn create_attestation(
         &mut self,
         slot: Slot,
-        proposers: Vec<(u8, Hash, solana_signature::Signature)>,
+        proposers: Vec<(u32, Hash, solana_signature::Signature)>,
         keypair: &Keypair,
     ) -> RelayAttestation {
         let mut builder = RelayAttestationBuilder::new(slot, self.config.relay_id);
@@ -320,7 +320,7 @@ pub struct SlotAttestations {
     /// Attestations indexed by relay_id
     pub attestations: HashMap<u16, RelayAttestation>,
     /// Per-proposer attestation counts
-    pub proposer_counts: HashMap<u8, usize>,
+    pub proposer_counts: HashMap<u32, usize>,
 }
 
 impl SlotAttestations {
@@ -354,7 +354,7 @@ impl SlotAttestations {
 
     /// Get proposers with enough attestations for inclusion.
     /// Per spec: need attestations from >= 40% of relays (80 relays).
-    pub fn get_included_proposers(&self) -> Vec<(u8, Hash)> {
+    pub fn get_included_proposers(&self) -> Vec<(u32, Hash)> {
         const MIN_ATTESTATIONS_PER_PROPOSER: usize = 80; // ceil(0.40 * 200)
 
         let mut result = Vec::new();
@@ -373,7 +373,7 @@ impl SlotAttestations {
     }
 
     /// Get the commitment for a proposer (from any attestation that includes it).
-    fn get_proposer_commitment(&self, proposer_id: u8) -> Option<Hash> {
+    fn get_proposer_commitment(&self, proposer_id: u32) -> Option<Hash> {
         for attestation in self.attestations.values() {
             if let Some(root) = attestation.get_commitment(proposer_id) {
                 return Some(*root);
@@ -431,7 +431,7 @@ impl AttestationAggregator {
     }
 
     /// Get the included proposers for a slot.
-    pub fn get_included_proposers(&self, slot: Slot) -> Vec<(u8, Hash)> {
+    pub fn get_included_proposers(&self, slot: Slot) -> Vec<(u32, Hash)> {
         self.slot_attestations
             .get(&slot)
             .map(|sa| sa.get_included_proposers())

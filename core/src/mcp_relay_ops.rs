@@ -9,7 +9,7 @@
 //! and create attestations to submit to the consensus leader.
 
 use {
-    crate::mcp_proposer::{McpShred, PROPOSER_SIG_DOMAIN},
+    crate::mcp_proposer::McpShred,
     solana_clock::Slot,
     solana_hash::Hash,
     solana_ledger::{
@@ -161,20 +161,19 @@ impl ShredVerifier {
         Ok(())
     }
 
-    /// Verify the proposer signature over (slot, proposer_index, commitment)
+    /// Verify the proposer signature over commitment.
+    ///
+    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+    /// The commitment already binds to slot/proposer because the payload header
+    /// is inside the committed RS shards.
     fn verify_proposer_signature(
         &self,
         shred: &McpShred,
         proposer_pubkey: &Pubkey,
     ) -> Result<(), RelayError> {
-        // Build the signing message per spec §5.2:
-        // proposer_sig_msg = ASCII("mcp:commitment:v1") || LE64(slot) || LE32(proposer_index) || commitment32
-        // Note: PROPOSER_SIG_DOMAIN is "mcp:proposer-sig:v1" but spec uses "mcp:commitment:v1"
-        // We use the domain defined in the proposer module for consistency
-        let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 8 + 4 + 32);
-        message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-        message.extend_from_slice(&shred.slot.to_le_bytes());
-        message.extend_from_slice(&(shred.proposer_id as u32).to_le_bytes());
+        // Build the signing message per spec §5.2
+        let mut message = Vec::with_capacity(17 + 32);
+        message.extend_from_slice(b"mcp:commitment:v1");
         message.extend_from_slice(shred.commitment.as_ref());
 
         // Verify signature using Ed25519
@@ -434,12 +433,11 @@ impl RelayOperations {
     }
 }
 
-/// Helper to build the proposer signature message for verification
-pub fn build_proposer_sig_message(slot: Slot, proposer_id: u8, commitment: &Hash) -> Vec<u8> {
-    let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 8 + 4 + 32);
-    message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-    message.extend_from_slice(&slot.to_le_bytes());
-    message.extend_from_slice(&(proposer_id as u32).to_le_bytes());
+/// Helper to build the proposer signature message for verification.
+/// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+pub fn build_proposer_sig_message(commitment: &Hash) -> Vec<u8> {
+    let mut message = Vec::with_capacity(17 + 32);
+    message.extend_from_slice(b"mcp:commitment:v1");
     message.extend_from_slice(commitment.as_ref());
     message
 }
@@ -478,8 +476,8 @@ mod tests {
         // Get proof for this shred (get_proof takes u8)
         let proof = tree.get_proof(shred_index as u8);
 
-        // Build signature
-        let sig_message = build_proposer_sig_message(slot, proposer_id, &commitment);
+        // Build signature per spec §5.2
+        let sig_message = build_proposer_sig_message(&commitment);
         let signature = keypair.sign_message(&sig_message);
 
         McpShred {
@@ -656,24 +654,13 @@ mod tests {
 
     #[test]
     fn test_build_proposer_sig_message() {
-        let slot = 12345u64;
-        let proposer_id = 7u8;
         let commitment = Hash::from([0xAB; 32]);
 
-        let message = build_proposer_sig_message(slot, proposer_id, &commitment);
+        let message = build_proposer_sig_message(&commitment);
 
-        // Verify structure
-        assert_eq!(&message[0..PROPOSER_SIG_DOMAIN.len()], PROPOSER_SIG_DOMAIN);
-
-        let slot_offset = PROPOSER_SIG_DOMAIN.len();
-        let slot_bytes = &message[slot_offset..slot_offset + 8];
-        assert_eq!(u64::from_le_bytes(slot_bytes.try_into().unwrap()), slot);
-
-        let proposer_offset = slot_offset + 8;
-        let proposer_bytes = &message[proposer_offset..proposer_offset + 4];
-        assert_eq!(u32::from_le_bytes(proposer_bytes.try_into().unwrap()), proposer_id as u32);
-
-        let commitment_offset = proposer_offset + 4;
-        assert_eq!(&message[commitment_offset..], commitment.as_ref());
+        // Verify structure per spec §5.2: domain || commitment only
+        assert_eq!(&message[0..17], b"mcp:commitment:v1");
+        assert_eq!(&message[17..49], commitment.as_ref());
+        assert_eq!(message.len(), 17 + 32);
     }
 }

@@ -295,8 +295,8 @@ impl McpBlockV1 {
 
     /// Get proposer commitments implied by this block.
     /// Returns a map of proposer_index -> (commitment, attestation_count)
-    pub fn get_implied_proposer_commitments(&self) -> HashMap<u8, (Hash, usize)> {
-        let mut proposer_votes: HashMap<u8, HashMap<Hash, usize>> = HashMap::new();
+    pub fn get_implied_proposer_commitments(&self) -> HashMap<u32, (Hash, usize)> {
+        let mut proposer_votes: HashMap<u32, HashMap<Hash, usize>> = HashMap::new();
 
         // Count attestations for each (proposer, commitment) pair
         for relay_entry in &self.relay_entries {
@@ -344,7 +344,7 @@ impl McpBlockV1 {
     /// `compute_implied_blocks_with_verification` for full signature verification.
     ///
     /// Returns: list of (proposer_id, commitment) pairs that are implied
-    pub fn compute_implied_blocks(&self) -> Vec<(u8, Hash)> {
+    pub fn compute_implied_blocks(&self) -> Vec<(u32, Hash)> {
         self.compute_implied_blocks_impl(None)
     }
 
@@ -361,7 +361,7 @@ impl McpBlockV1 {
     pub fn compute_implied_blocks_with_verification(
         &self,
         proposer_pubkeys: &[solana_pubkey::Pubkey],
-    ) -> Vec<(u8, Hash)> {
+    ) -> Vec<(u32, Hash)> {
         self.compute_implied_blocks_impl(Some(proposer_pubkeys))
     }
 
@@ -369,25 +369,23 @@ impl McpBlockV1 {
     fn compute_implied_blocks_impl(
         &self,
         proposer_pubkeys: Option<&[solana_pubkey::Pubkey]>,
-    ) -> Vec<(u8, Hash)> {
+    ) -> Vec<(u32, Hash)> {
         // Minimum attestations required per proposer (40% of 200 = 80)
         const MIN_RELAYS_PER_PROPOSER: usize = 80;
 
         // Track all commitments seen for each proposer, along with valid signatures
         // Map: proposer_id -> commitment -> (count, has_valid_signature)
-        let mut proposer_commitments: HashMap<u8, HashMap<Hash, (usize, bool)>> = HashMap::new();
+        let mut proposer_commitments: HashMap<u32, HashMap<Hash, (usize, bool)>> = HashMap::new();
 
         for relay_entry in &self.relay_entries {
             for entry in &relay_entry.entries {
                 let proposer_id = entry.proposer_index;
 
                 // Check signature validity if proposer_pubkeys provided
+                // Per spec §5.2: signature is over "mcp:commitment:v1" || commitment32
                 let sig_valid = if let Some(pubkeys) = proposer_pubkeys {
                     if (proposer_id as usize) < pubkeys.len() {
-                        entry.verify_proposer_signature(
-                            &pubkeys[proposer_id as usize],
-                            self.slot,
-                        )
+                        entry.verify_proposer_signature(&pubkeys[proposer_id as usize])
                     } else {
                         false // Invalid proposer_id
                     }
@@ -859,7 +857,7 @@ mod tests {
         solana_signature::Signature::from([seed; 64])
     }
 
-    fn make_test_attestation_entry(proposer_index: u8, commitment_seed: u8) -> AttestationEntry {
+    fn make_test_attestation_entry(proposer_index: u32, commitment_seed: u8) -> AttestationEntry {
         AttestationEntry::new(
             proposer_index,
             Hash::from([commitment_seed; 32]),
@@ -867,7 +865,7 @@ mod tests {
         )
     }
 
-    fn make_test_relay_entry(relay_index: u32, proposer_entries: Vec<(u8, u8)>) -> RelayEntryV1 {
+    fn make_test_relay_entry(relay_index: u32, proposer_entries: Vec<(u32, u8)>) -> RelayEntryV1 {
         let entries = proposer_entries
             .into_iter()
             .map(|(p, c)| make_test_attestation_entry(p, c))

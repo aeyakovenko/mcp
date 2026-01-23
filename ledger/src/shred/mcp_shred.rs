@@ -278,13 +278,13 @@ impl McpShredV1 {
     ///
     /// Per MCP spec §5.2:
     /// ```text
-    /// proposer_sig_msg = ASCII("mcp:commitment:v1") || LE64(slot) || LE32(proposer_index) || commitment32
+    /// proposer_sig_msg = ASCII("mcp:commitment:v1") || commitment32
     /// ```
+    /// The commitment already binds to slot/proposer because the payload header
+    /// is inside the committed RS shards.
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(17 + 8 + 4 + 32);
+        let mut msg = Vec::with_capacity(17 + 32);
         msg.extend_from_slice(b"mcp:commitment:v1");
-        msg.extend_from_slice(&self.slot.to_le_bytes());
-        msg.extend_from_slice(&self.proposer_index.to_le_bytes());
         msg.extend_from_slice(&self.commitment);
         msg
     }
@@ -984,12 +984,10 @@ mod tests {
 
         let msg = shred.signing_message();
 
-        // Verify message structure
+        // Verify message structure per spec §5.2: domain || commitment only
         assert_eq!(&msg[..17], b"mcp:commitment:v1");
-        assert_eq!(&msg[17..25], &12345u64.to_le_bytes());
-        assert_eq!(&msg[25..29], &5u32.to_le_bytes());
-        assert_eq!(&msg[29..61], &[0xAB; 32]);
-        assert_eq!(msg.len(), 17 + 8 + 4 + 32);
+        assert_eq!(&msg[17..49], &[0xAB; 32]);
+        assert_eq!(msg.len(), 17 + 32);
     }
 
     #[test]

@@ -673,11 +673,10 @@ impl StandardBroadcastRun {
         let commitment = merkle_tree.commitment();
 
         // Step 3: Create and sign the commitment message
-        // Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || slot || proposer_index || commitment
-        let mut sig_msg = Vec::with_capacity(17 + 8 + 4 + 32);
+        // Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+        // The commitment already binds to slot/proposer because the payload header is inside the committed RS shards
+        let mut sig_msg = Vec::with_capacity(17 + 32);
         sig_msg.extend_from_slice(b"mcp:commitment:v1");
-        sig_msg.extend_from_slice(&slot.to_le_bytes());
-        sig_msg.extend_from_slice(&(proposer_id as u32).to_le_bytes());
         sig_msg.extend_from_slice(commitment.as_ref());
         let proposer_signature = keypair.sign_message(&sig_msg);
 
