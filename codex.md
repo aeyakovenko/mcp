@@ -44,7 +44,7 @@
 - #12 MCP-09 Relay verify shreds: FIXED - Merkle verification now correctly compares full 32-byte root against commitment.
 - #11 MCP-07 Proposer distribute shreds: broadcaster repackages legacy shreds and does not RS-encode payload (`turbine/src/broadcast_stage/standard_broadcast_run.rs:658-699`).
 - #10 MCP-19 Bankless proposer/leader: no bankless integration in banking/replay.
-- #9 MCP-10 Record attestation: PARTIALLY FIXED - `McpRelayAttestation` column added with put/get methods (`ledger/src/blockstore/column.rs:372-381`, `ledger/src/blockstore.rs:3337-3358`); remaining: wire writes from attestation aggregation path.
+- #9 MCP-10 Record attestation: FIXED - `McpRelayAttestation` column added with put/get methods, attestation writes wired in replay_stage (`ledger/src/blockstore/column.rs:372-381`, `ledger/src/blockstore.rs:3337-3358`, `core/src/replay_stage.rs:950-956`).
 - #8 MCP-17 Fee-only replay: PARTIALLY FIXED - `TwoPhaseProcessor` initialized in replay_stage with ordered transactions; remaining: integrate with blockstore_processor execution.
 - #7 MCP-05 Proposer ID in shreds: legacy shred header modified, but MCP shreds are separate; no unified path.
 - #6 MCP-08 Fee payer check: MCP fee validation is enforced in transaction processor but relies on a config not parsed from transactions (`svm/src/transaction_processor.rs:633-652`, `ledger/src/mcp.rs:216-262`).
