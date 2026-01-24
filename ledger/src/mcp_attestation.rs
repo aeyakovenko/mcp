@@ -51,7 +51,7 @@ pub struct AttestationEntry {
     /// The merkle commitment of the proposer's shred batch.
     pub commitment: Hash,
     /// The proposer's signature over the commitment.
-    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+    /// Per spec §7.2: signature is over just the 32-byte commitment (no domain prefix)
     pub proposer_signature: Signature,
 }
 
@@ -96,14 +96,10 @@ impl AttestationEntry {
 
     /// Verify the proposer signature against the given pubkey.
     ///
-    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
-    /// The commitment already binds to slot/proposer because the payload header
-    /// is inside the committed RS shards.
+    /// Per spec §7.2: "The proposer_signature is computed by the proposer
+    /// over the 32-byte commitment."
     pub fn verify_proposer_signature(&self, proposer_pubkey: &Pubkey) -> bool {
-        let mut msg = Vec::with_capacity(17 + 32);
-        msg.extend_from_slice(b"mcp:commitment:v1");
-        msg.extend_from_slice(self.commitment.as_ref());
-        self.proposer_signature.verify(proposer_pubkey.as_ref(), &msg)
+        self.proposer_signature.verify(proposer_pubkey.as_ref(), self.commitment.as_ref())
     }
 }
 

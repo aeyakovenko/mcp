@@ -32,10 +32,6 @@ pub const MAX_PROPOSER_PAYLOAD_BYTES: usize = K_DATA_SHARDS * MCP_SHARD_SIZE;
 /// Maximum serialized transaction size
 pub const MAX_TX_SIZE: usize = 4096;
 
-/// Domain separator for proposer signature
-/// Domain prefix for proposer commitment signature per spec §5.2.
-pub const PROPOSER_SIG_DOMAIN: &[u8] = b"mcp:commitment:v1";
-
 /// Error type for proposer operations
 #[derive(Debug)]
 pub enum ProposerError {
@@ -423,14 +419,11 @@ impl McpProposer {
         Ok(mcp_shreds)
     }
 
-    /// Sign the commitment: Ed25519Sign(SK, domain || commitment)
-    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+    /// Sign the commitment: Ed25519Sign(SK, commitment)
+    /// Per spec §7.2: "The proposer_signature is computed by the proposer
+    /// over the 32-byte commitment."
     fn sign_commitment(&self, commitment: &Hash) -> [u8; 64] {
-        let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 32);
-        message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-        message.extend_from_slice(commitment.as_ref());
-
-        let signature = self.keypair.sign_message(&message);
+        let signature = self.keypair.sign_message(commitment.as_ref());
         let mut sig_bytes = [0u8; 64];
         sig_bytes.copy_from_slice(signature.as_ref());
         sig_bytes
@@ -464,18 +457,15 @@ impl McpProposer {
 }
 
 /// Verify a proposer's signature on a commitment.
-/// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+/// Per spec §7.2: "The proposer_signature is computed by the proposer
+/// over the 32-byte commitment."
 pub fn verify_proposer_signature(
     proposer_pubkey: &solana_pubkey::Pubkey,
     commitment: &Hash,
     signature: &[u8; 64],
 ) -> bool {
-    let mut message = Vec::with_capacity(PROPOSER_SIG_DOMAIN.len() + 32);
-    message.extend_from_slice(PROPOSER_SIG_DOMAIN);
-    message.extend_from_slice(commitment.as_ref());
-
     let sig = solana_signature::Signature::from(*signature);
-    sig.verify(proposer_pubkey.as_ref(), &message)
+    sig.verify(proposer_pubkey.as_ref(), commitment.as_ref())
 }
 
 // ============================================================================

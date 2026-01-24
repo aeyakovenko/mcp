@@ -26,13 +26,18 @@ use {
     },
 };
 
-/// Domain separator for block hash computation
+/// NOTE: Per spec §7.5 and §7.6, signatures are over raw data, not domain-prefixed.
+/// These constants are DEPRECATED and kept only for backward compatibility.
+#[deprecated(note = "Spec does not use domain prefixes for signatures")]
+#[allow(dead_code)]
 pub const BLOCK_HASH_DOMAIN: &[u8] = b"mcp:block-hash:v1";
 
-/// Domain separator for block signature
+#[deprecated(note = "Spec does not use domain prefixes for signatures")]
+#[allow(dead_code)]
 pub const BLOCK_SIG_DOMAIN: &[u8] = b"mcp:block-sig:v1";
 
-/// Domain separator for vote signature
+#[deprecated(note = "Spec does not use domain prefixes for signatures")]
+#[allow(dead_code)]
 pub const VOTE_SIG_DOMAIN: &[u8] = b"mcp:vote:v1";
 
 /// Minimum number of relays required for a valid block
@@ -129,10 +134,362 @@ impl RelayEntryV1 {
 }
 
 // ============================================================================
-// McpBlockV1
+// AggregateAttestation (spec §7.4)
+// ============================================================================
+
+/// AggregateAttestation v1 per spec §7.4.
+///
+/// Wire format:
+/// - version: u8 (1 byte)
+/// - slot: u64 (8 bytes)
+/// - leader_index: u32 (4 bytes)
+/// - relays_len: u16 (2 bytes)
+/// - relay_entries: relays_len × RelayEntryV1
+#[derive(Debug, Clone)]
+pub struct AggregateAttestation {
+    pub version: u8,
+    pub slot: Slot,
+    pub leader_index: u32,
+    pub relay_entries: Vec<RelayEntryV1>,
+}
+
+impl AggregateAttestation {
+    /// Current version
+    pub const VERSION: u8 = 1;
+
+    /// Create a new aggregate attestation
+    pub fn new(slot: Slot, leader_index: u32, relay_entries: Vec<RelayEntryV1>) -> Self {
+        Self {
+            version: Self::VERSION,
+            slot,
+            leader_index,
+            relay_entries,
+        }
+    }
+
+    /// Size when serialized
+    pub fn serialized_size(&self) -> usize {
+        let relay_size: usize = self.relay_entries.iter()
+            .map(|e| e.serialized_size())
+            .sum();
+        1 + 8 + 4 + 2 + relay_size // version + slot + leader_index + relays_len + entries
+    }
+
+    /// Serialize to bytes per spec §7.4
+    pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&[self.version])?;
+        writer.write_all(&self.slot.to_le_bytes())?;
+        writer.write_all(&self.leader_index.to_le_bytes())?;
+        writer.write_all(&(self.relay_entries.len() as u16).to_le_bytes())?;
+        for entry in &self.relay_entries {
+            entry.serialize(writer)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize to a Vec
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.serialized_size());
+        self.serialize(&mut buf).expect("vec write should not fail");
+        buf
+    }
+
+    /// Deserialize from bytes
+    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut buf1 = [0u8; 1];
+        reader.read_exact(&mut buf1)?;
+        let version = buf1[0];
+        if version != Self::VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid version"));
+        }
+
+        let mut slot_bytes = [0u8; 8];
+        reader.read_exact(&mut slot_bytes)?;
+        let slot = Slot::from_le_bytes(slot_bytes);
+
+        let mut leader_index_bytes = [0u8; 4];
+        reader.read_exact(&mut leader_index_bytes)?;
+        let leader_index = u32::from_le_bytes(leader_index_bytes);
+
+        let mut relays_len_bytes = [0u8; 2];
+        reader.read_exact(&mut relays_len_bytes)?;
+        let relays_len = u16::from_le_bytes(relays_len_bytes) as usize;
+
+        let mut relay_entries = Vec::with_capacity(relays_len);
+        for _ in 0..relays_len {
+            relay_entries.push(RelayEntryV1::deserialize(reader)?);
+        }
+
+        Ok(Self {
+            version,
+            slot,
+            leader_index,
+            relay_entries,
+        })
+    }
+}
+
+// ============================================================================
+// ConsensusBlock (spec §7.5)
+// ============================================================================
+
+/// ConsensusBlock v1 per spec §7.5.
+///
+/// Wire format:
+/// - version: u8 (1 byte)
+/// - slot: u64 (8 bytes)
+/// - leader_index: u32 (4 bytes)
+/// - aggregate_len: u32 (4 bytes)
+/// - aggregate_bytes: aggregate_len bytes (canonical AggregateAttestation v1)
+/// - consensus_meta_len: u32 (4 bytes)
+/// - consensus_meta: consensus_meta_len bytes
+/// - delayed_bankhash: [u8; 32]
+/// - leader_signature: [u8; 64]
+#[derive(Debug, Clone)]
+pub struct ConsensusBlock {
+    pub version: u8,
+    pub slot: Slot,
+    pub leader_index: u32,
+    pub aggregate: AggregateAttestation,
+    pub consensus_meta: Vec<u8>,
+    pub delayed_bankhash: Hash,
+    pub leader_signature: [u8; 64],
+}
+
+impl ConsensusBlock {
+    /// Current version
+    pub const VERSION: u8 = 1;
+
+    /// Create a new unsigned consensus block
+    pub fn new_unsigned(
+        slot: Slot,
+        leader_index: u32,
+        aggregate: AggregateAttestation,
+        consensus_meta: Vec<u8>,
+        delayed_bankhash: Hash,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            slot,
+            leader_index,
+            aggregate,
+            consensus_meta,
+            delayed_bankhash,
+            leader_signature: [0u8; 64],
+        }
+    }
+
+    /// Serialize the portion to be signed (everything except leader_signature)
+    pub fn serialize_for_signing<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&[self.version])?;
+        writer.write_all(&self.slot.to_le_bytes())?;
+        writer.write_all(&self.leader_index.to_le_bytes())?;
+        let aggregate_bytes = self.aggregate.to_bytes();
+        writer.write_all(&(aggregate_bytes.len() as u32).to_le_bytes())?;
+        writer.write_all(&aggregate_bytes)?;
+        writer.write_all(&(self.consensus_meta.len() as u32).to_le_bytes())?;
+        writer.write_all(&self.consensus_meta)?;
+        writer.write_all(self.delayed_bankhash.as_ref())?;
+        Ok(())
+    }
+
+    /// Get the bytes to be signed
+    pub fn get_signing_data(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.serialize_for_signing(&mut buf).expect("vec write should not fail");
+        buf
+    }
+
+    /// Sign the block with the leader's keypair
+    pub fn sign(&mut self, keypair: &Keypair) {
+        let signing_data = self.get_signing_data();
+        let sig = keypair.sign_message(&signing_data);
+        self.leader_signature.copy_from_slice(sig.as_ref());
+    }
+
+    /// Serialize the complete block
+    pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.serialize_for_signing(writer)?;
+        writer.write_all(&self.leader_signature)?;
+        Ok(())
+    }
+
+    /// Deserialize from bytes
+    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+        let mut buf1 = [0u8; 1];
+        reader.read_exact(&mut buf1)?;
+        let version = buf1[0];
+        if version != Self::VERSION {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid version"));
+        }
+
+        let mut slot_bytes = [0u8; 8];
+        reader.read_exact(&mut slot_bytes)?;
+        let slot = Slot::from_le_bytes(slot_bytes);
+
+        let mut leader_index_bytes = [0u8; 4];
+        reader.read_exact(&mut leader_index_bytes)?;
+        let leader_index = u32::from_le_bytes(leader_index_bytes);
+
+        let mut aggregate_len_bytes = [0u8; 4];
+        reader.read_exact(&mut aggregate_len_bytes)?;
+        let aggregate_len = u32::from_le_bytes(aggregate_len_bytes) as usize;
+
+        let mut aggregate_bytes = vec![0u8; aggregate_len];
+        reader.read_exact(&mut aggregate_bytes)?;
+        let aggregate = AggregateAttestation::deserialize(&mut std::io::Cursor::new(aggregate_bytes))?;
+
+        let mut meta_len_bytes = [0u8; 4];
+        reader.read_exact(&mut meta_len_bytes)?;
+        let meta_len = u32::from_le_bytes(meta_len_bytes) as usize;
+
+        let mut consensus_meta = vec![0u8; meta_len];
+        reader.read_exact(&mut consensus_meta)?;
+
+        let mut delayed_bankhash_bytes = [0u8; 32];
+        reader.read_exact(&mut delayed_bankhash_bytes)?;
+        let delayed_bankhash = Hash::from(delayed_bankhash_bytes);
+
+        let mut leader_signature = [0u8; 64];
+        reader.read_exact(&mut leader_signature)?;
+
+        Ok(Self {
+            version,
+            slot,
+            leader_index,
+            aggregate,
+            consensus_meta,
+            delayed_bankhash,
+            leader_signature,
+        })
+    }
+
+    /// Compute implied blocks (proposers with sufficient attestation support).
+    ///
+    /// Per spec §11.2: A proposer is included if at least 40% of relays (80/200)
+    /// attest to the same commitment. Proposers with equivocations (different
+    /// commitments from the same proposer) are excluded.
+    ///
+    /// This version does NOT verify proposer signatures. Use
+    /// `compute_implied_blocks_with_verification` for full signature verification.
+    ///
+    /// Returns: list of (proposer_id, commitment) pairs that are implied
+    pub fn compute_implied_blocks(&self) -> Vec<(u32, Hash)> {
+        self.compute_implied_blocks_impl(None)
+    }
+
+    /// Compute implied blocks with proposer signature verification.
+    ///
+    /// Same as `compute_implied_blocks` but also verifies that each proposer's
+    /// signature over their commitment is valid. Invalid signatures are treated
+    /// as if the attestation didn't exist.
+    ///
+    /// Per spec §7.2: The proposer signature is verified against just the
+    /// 32-byte commitment (no domain prefix)
+    ///
+    /// # Arguments
+    /// * `proposer_pubkeys` - Array of proposer public keys indexed by proposer_id
+    pub fn compute_implied_blocks_with_verification(
+        &self,
+        proposer_pubkeys: &[solana_pubkey::Pubkey],
+    ) -> Vec<(u32, Hash)> {
+        self.compute_implied_blocks_impl(Some(proposer_pubkeys))
+    }
+
+    /// Internal implementation of compute_implied_blocks with optional signature verification.
+    fn compute_implied_blocks_impl(
+        &self,
+        proposer_pubkeys: Option<&[solana_pubkey::Pubkey]>,
+    ) -> Vec<(u32, Hash)> {
+        // Minimum attestations required per proposer (40% of 200 = 80)
+        const MIN_RELAYS_PER_PROPOSER: usize = 80;
+
+        // Track all commitments seen for each proposer, along with valid signatures
+        // Map: proposer_id -> commitment -> (count, has_valid_signature)
+        let mut proposer_commitments: std::collections::HashMap<u32, std::collections::HashMap<Hash, (usize, bool)>> = std::collections::HashMap::new();
+
+        for relay_entry in &self.aggregate.relay_entries {
+            for entry in &relay_entry.entries {
+                let proposer_id = entry.proposer_index;
+
+                // Check signature validity if proposer_pubkeys provided
+                // Per spec §7.2: signature is over just the 32-byte commitment
+                let sig_valid = if let Some(pubkeys) = proposer_pubkeys {
+                    if (proposer_id as usize) < pubkeys.len() {
+                        entry.verify_proposer_signature(&pubkeys[proposer_id as usize])
+                    } else {
+                        false // Invalid proposer_id
+                    }
+                } else {
+                    true // No verification requested, assume valid
+                };
+
+                let entry_data = proposer_commitments
+                    .entry(proposer_id)
+                    .or_default()
+                    .entry(entry.commitment)
+                    .or_insert((0, false));
+
+                entry_data.0 += 1;
+                if sig_valid {
+                    entry_data.1 = true;
+                }
+            }
+        }
+
+        let mut implied_blocks = Vec::new();
+
+        for (proposer_id, commitment_data) in proposer_commitments {
+            // Filter to only commitments with valid signatures (if verification was requested)
+            let valid_commitments: Vec<(Hash, usize)> = commitment_data
+                .into_iter()
+                .filter(|(_, (_, has_valid_sig))| *has_valid_sig)
+                .map(|(commitment, (count, _))| (commitment, count))
+                .collect();
+
+            // Check for equivocation: if there are 2+ different commitments
+            // with valid signatures, the proposer is equivocating
+            if valid_commitments.len() > 1 {
+                // Proposer equivocation detected - exclude this proposer
+                continue;
+            }
+
+            // Find the commitment with max support, tie-break by lex order
+            let mut best: Option<(Hash, usize)> = None;
+            for (commitment, count) in valid_commitments {
+                match &best {
+                    None => best = Some((commitment, count)),
+                    Some((best_commitment, best_count)) => {
+                        if count > *best_count
+                            || (count == *best_count && commitment.as_ref() < best_commitment.as_ref())
+                        {
+                            best = Some((commitment, count));
+                        }
+                    }
+                }
+            }
+
+            // Include if meets threshold
+            if let Some((commitment, count)) = best {
+                if count >= MIN_RELAYS_PER_PROPOSER {
+                    implied_blocks.push((proposer_id, commitment));
+                }
+            }
+        }
+
+        // Sort by proposer_id for deterministic ordering
+        implied_blocks.sort_by_key(|(id, _)| *id);
+        implied_blocks
+    }
+}
+
+// ============================================================================
+// McpBlockV1 (DEPRECATED - use ConsensusBlock instead)
 // ============================================================================
 
 /// MCP Block payload for a slot.
+///
+/// NOTE: This format is deprecated. Use ConsensusBlock per spec §7.5 instead.
 ///
 /// Wire format:
 /// - slot: u64 (8 bytes)
@@ -141,6 +498,7 @@ impl RelayEntryV1 {
 /// - num_relays: u16 (2 bytes)
 /// - relay_entries: num_relays × RelayEntryV1
 /// - leader_signature: [u8; 64]
+#[deprecated(note = "Use ConsensusBlock per spec §7.5 instead")]
 #[derive(Debug, Clone)]
 pub struct McpBlockV1 {
     pub slot: Slot,
@@ -229,12 +587,16 @@ impl McpBlockV1 {
         })
     }
 
-    /// Compute the block hash according to spec:
-    /// block_hash = SHA256("mcp:block-hash:v1" || block_body)
+    /// DEPRECATED: Compute a block hash.
+    ///
+    /// NOTE: Per spec §7.5, block_id is NOT computed by hashing aggregate_bytes.
+    /// It is defined by the underlying ledger rules and carried in consensus_meta.
+    /// This method is kept for backward compatibility but is non-compliant.
+    /// Use ConsensusBlock and its consensus_meta field instead.
+    #[deprecated(note = "block_id comes from consensus_meta, not computed. Use ConsensusBlock.")]
     pub fn compute_block_hash(&self) -> Hash {
         use solana_sha256_hasher::Hasher;
         let mut hasher = Hasher::default();
-        hasher.hash(BLOCK_HASH_DOMAIN);
 
         let mut body = Vec::new();
         self.serialize_body(&mut body).expect("serialization to vec cannot fail");
@@ -243,29 +605,25 @@ impl McpBlockV1 {
         Hash::new_from_array(hasher.result().to_bytes())
     }
 
-    /// Sign the block and update leader_signature
+    /// DEPRECATED: Sign the block.
+    ///
+    /// NOTE: Per spec §7.5, leader_signature is over all preceding bytes in
+    /// ConsensusBlock, not over a domain-prefixed hash. Use ConsensusBlock.sign().
+    #[deprecated(note = "Non-compliant signing. Use ConsensusBlock.")]
+    #[allow(deprecated)]
     pub fn sign(&mut self, keypair: &Keypair) {
         let block_hash = self.compute_block_hash();
-
-        // Construct message: domain || block_hash
-        let mut message = Vec::with_capacity(BLOCK_SIG_DOMAIN.len() + 32);
-        message.extend_from_slice(BLOCK_SIG_DOMAIN);
-        message.extend_from_slice(block_hash.as_ref());
-
-        let signature = keypair.sign_message(&message);
+        let signature = keypair.sign_message(block_hash.as_ref());
         self.leader_signature.copy_from_slice(signature.as_ref());
     }
 
-    /// Verify the leader signature
+    /// DEPRECATED: Verify the leader signature.
+    #[deprecated(note = "Non-compliant verification. Use ConsensusBlock.")]
+    #[allow(deprecated)]
     pub fn verify_leader_signature(&self, leader_pubkey: &solana_pubkey::Pubkey) -> bool {
         let block_hash = self.compute_block_hash();
-
-        let mut message = Vec::with_capacity(BLOCK_SIG_DOMAIN.len() + 32);
-        message.extend_from_slice(BLOCK_SIG_DOMAIN);
-        message.extend_from_slice(block_hash.as_ref());
-
         let signature = solana_signature::Signature::from(self.leader_signature);
-        signature.verify(leader_pubkey.as_ref(), &message)
+        signature.verify(leader_pubkey.as_ref(), block_hash.as_ref())
     }
 
     /// Check if the block has minimum required relays
@@ -352,8 +710,8 @@ impl McpBlockV1 {
     /// signature over their commitment is valid. Invalid signatures are treated
     /// as if the attestation didn't exist.
     ///
-    /// Per spec §5.2: The proposer signature is verified against the signing
-    /// message: "mcp:commitment:v1" || commitment32
+    /// Per spec §7.2: The proposer signature is verified against just the
+    /// 32-byte commitment (no domain prefix)
     ///
     /// Returns: list of (proposer_id, commitment) pairs that are implied
     pub fn compute_implied_blocks_with_verification(
@@ -380,7 +738,7 @@ impl McpBlockV1 {
                 let proposer_id = entry.proposer_index;
 
                 // Check signature validity if proposer_pubkeys provided
-                // Per spec §5.2: signature is over "mcp:commitment:v1" || commitment32
+                // Per spec §7.2: signature is over just the 32-byte commitment
                 let sig_valid = if let Some(pubkeys) = proposer_pubkeys {
                     if (proposer_id as usize) < pubkeys.len() {
                         entry.verify_proposer_signature(&pubkeys[proposer_id as usize])
@@ -544,31 +902,24 @@ impl McpVoteV1 {
         })
     }
 
-    /// Sign the vote and update signature
+    /// Sign the vote and update signature per spec §7.6.
+    ///
+    /// Signature is over the raw body fields (no domain prefix).
     pub fn sign(&mut self, keypair: &Keypair) {
         let mut body = Vec::with_capacity(53);
         self.serialize_body(&mut body).expect("serialization to vec cannot fail");
 
-        // Construct message: domain || body
-        let mut message = Vec::with_capacity(VOTE_SIG_DOMAIN.len() + body.len());
-        message.extend_from_slice(VOTE_SIG_DOMAIN);
-        message.extend_from_slice(&body);
-
-        let signature = keypair.sign_message(&message);
+        let signature = keypair.sign_message(&body);
         self.signature.copy_from_slice(signature.as_ref());
     }
 
-    /// Verify the vote signature
+    /// Verify the vote signature per spec §7.6.
     pub fn verify_signature(&self, voter_pubkey: &solana_pubkey::Pubkey) -> bool {
         let mut body = Vec::with_capacity(53);
         self.serialize_body(&mut body).expect("serialization to vec cannot fail");
 
-        let mut message = Vec::with_capacity(VOTE_SIG_DOMAIN.len() + body.len());
-        message.extend_from_slice(VOTE_SIG_DOMAIN);
-        message.extend_from_slice(&body);
-
         let signature = solana_signature::Signature::from(self.signature);
-        signature.verify(voter_pubkey.as_ref(), &message)
+        signature.verify(voter_pubkey.as_ref(), &body)
     }
 }
 

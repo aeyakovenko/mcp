@@ -41,84 +41,79 @@ pub enum ReconstructionResult {
     MalformedPayload(String),
 }
 
-/// MCP payload wire format per spec §5.
+/// MCP payload wire format per spec §3.1.
 ///
-/// Wire format (McpPayloadV1):
+/// Wire format:
 /// ```text
-/// | payload_version (1) | slot (8) | proposer_index (4) | payload_len (4) |
-/// | tx_count (2) | TxEntry[tx_count] | reserved (zero-padded) |
-///
-/// TxEntry = | tx_len (2) | tx_bytes[tx_len] |
+/// | tx_count (u32) | (tx_len (u32), tx_bytes[tx_len])... |
 /// ```
+///
+/// The slot and proposer_index are carried in the shred header, not the payload.
+/// Trailing zero bytes from RS padding MUST be ignored by decoders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpPayload {
-    /// Payload version (must be 1)
-    pub payload_version: u8,
-    /// Slot number
-    pub slot: u64,
-    /// Proposer index [0..NUM_PROPOSERS-1]
-    pub proposer_index: u32,
-    /// Payload body length (bytes after this field)
-    pub payload_len: u32,
     /// Number of transactions
-    pub tx_count: u16,
+    pub tx_count: u32,
     /// Raw transaction data
     pub tx_data: Vec<Vec<u8>>,
 }
 
 impl McpPayload {
-    /// Create an empty payload for a given slot and proposer
-    pub fn empty(slot: u64, proposer_index: u32) -> Self {
+    /// Create an empty payload
+    pub fn empty() -> Self {
         Self {
-            payload_version: 1,
-            slot,
-            proposer_index,
-            payload_len: 2, // just tx_count (2 bytes)
             tx_count: 0,
             tx_data: Vec::new(),
         }
     }
 
-    /// Parse payload from raw bytes per spec §5
+    /// Parse payload from raw bytes per spec §3.1
+    /// Format: u32 count followed by (u32 len, tx_bytes) pairs
     pub fn from_bytes(data: &[u8]) -> io::Result<Self> {
-        let mut cursor = std::io::Cursor::new(data);
-
-        // Read payload_version (1 byte)
-        let mut buf1 = [0u8; 1];
-        cursor.read_exact(&mut buf1)?;
-        let payload_version = buf1[0];
-        if payload_version != 1 {
+        if data.len() < 4 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid payload version: {}", payload_version),
+                io::ErrorKind::UnexpectedEof,
+                "Payload too short for tx_count",
             ));
         }
 
-        // Read slot (8 bytes)
-        let mut buf8 = [0u8; 8];
-        cursor.read_exact(&mut buf8)?;
-        let slot = u64::from_le_bytes(buf8);
+        let mut cursor = std::io::Cursor::new(data);
 
-        // Read proposer_index (4 bytes)
+        // Read tx_count (u32)
         let mut buf4 = [0u8; 4];
         cursor.read_exact(&mut buf4)?;
-        let proposer_index = u32::from_le_bytes(buf4);
+        let tx_count = u32::from_le_bytes(buf4);
 
-        // Read payload_len (4 bytes)
-        cursor.read_exact(&mut buf4)?;
-        let payload_len = u32::from_le_bytes(buf4);
+        // Sanity check: tx_count shouldn't be unreasonably large
+        if tx_count > 10000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unreasonable tx_count: {}", tx_count),
+            ));
+        }
 
-        // Read tx_count (2 bytes)
-        let mut buf2 = [0u8; 2];
-        cursor.read_exact(&mut buf2)?;
-        let tx_count = u16::from_le_bytes(buf2);
-
-        // Read TxEntries: each is tx_len (2 bytes) + tx_bytes
+        // Read (u32 len, tx_bytes) pairs
         let mut tx_data = Vec::with_capacity(tx_count as usize);
         for _ in 0..tx_count {
-            // Read tx_len (2 bytes)
-            cursor.read_exact(&mut buf2)?;
-            let tx_len = u16::from_le_bytes(buf2);
+            // Read tx_len (u32)
+            if cursor.read_exact(&mut buf4).is_err() {
+                // Per spec: trailing zero bytes from padding should be ignored
+                // If we can't read more, we're done
+                break;
+            }
+            let tx_len = u32::from_le_bytes(buf4);
+
+            // Zero length indicates padding (per spec: trailing zeros ignored)
+            if tx_len == 0 {
+                break;
+            }
+
+            // Sanity check: tx_len shouldn't exceed remaining data
+            let remaining = data.len().saturating_sub(cursor.position() as usize);
+            if tx_len as usize > remaining {
+                // Malformed or we hit padding
+                break;
+            }
 
             // Read tx_bytes
             let mut tx_bytes = vec![0u8; tx_len as usize];
@@ -127,30 +122,23 @@ impl McpPayload {
         }
 
         Ok(Self {
-            payload_version,
-            slot,
-            proposer_index,
-            payload_len,
-            tx_count,
+            tx_count: tx_data.len() as u32, // actual count parsed
             tx_data,
         })
     }
 
-    /// Serialize payload to bytes per spec §5
+    /// Serialize payload to bytes per spec §3.1
+    /// Format: u32 count followed by (u32 len, tx_bytes) pairs
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Calculate payload body size: tx_count (2) + sum(2 + tx_len for each tx)
-        let body_len: usize = 2 + self.tx_data.iter().map(|tx| 2 + tx.len()).sum::<usize>();
+        let total_tx_data: usize = self.tx_data.iter().map(|tx| tx.len()).sum();
+        let capacity = 4 + (self.tx_data.len() * 4) + total_tx_data;
 
-        let mut bytes = Vec::with_capacity(17 + body_len);
-        bytes.push(self.payload_version);
-        bytes.extend_from_slice(&self.slot.to_le_bytes());
-        bytes.extend_from_slice(&self.proposer_index.to_le_bytes());
-        bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
+        let mut bytes = Vec::with_capacity(capacity);
+        // u32 count
         bytes.extend_from_slice(&self.tx_count.to_le_bytes());
-
-        // Write TxEntries
+        // (u32 len, tx_bytes) pairs
         for tx in &self.tx_data {
-            bytes.extend_from_slice(&(tx.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&(tx.len() as u32).to_le_bytes());
             bytes.extend_from_slice(tx);
         }
         bytes
@@ -303,6 +291,8 @@ pub struct OrderedTransaction {
     pub tx_bytes: Vec<u8>,
     /// Transaction ID (SHA256 of tx_bytes)
     pub txid: Hash,
+    /// Ordering fee per spec §3.5 (higher = higher priority)
+    pub ordering_fee: u32,
 }
 
 impl OrderedTransaction {
@@ -314,11 +304,75 @@ impl OrderedTransaction {
         hasher.hash(&tx_bytes);
         let txid = Hash::new_from_array(hasher.result().to_bytes());
 
+        // Extract ordering_fee from transaction bytes per spec §7.1
+        let ordering_fee = Self::extract_ordering_fee(&tx_bytes);
+
         Self {
             proposer_id,
             tx_bytes,
             txid,
+            ordering_fee,
         }
+    }
+
+    /// Extract ordering_fee from transaction bytes per spec §7.1.
+    ///
+    /// Transaction format:
+    /// - VersionByte (1)
+    /// - LegacyHeader (3)
+    /// - TransactionConfigMask (4) at offset 4
+    /// - LifetimeSpecifier (32)
+    /// - NumInstructions (1)
+    /// - NumAddresses (1) at offset 41
+    /// - Addresses (32 * NumAddresses)
+    /// - ConfigValues (4 bytes each, in bit order)
+    fn extract_ordering_fee(tx_bytes: &[u8]) -> u32 {
+        // Need at least header bytes to read mask and NumAddresses
+        if tx_bytes.len() < 42 {
+            return 0;
+        }
+
+        // TransactionConfigMask at offset 4
+        let mask = u32::from_le_bytes([
+            tx_bytes[4],
+            tx_bytes[5],
+            tx_bytes[6],
+            tx_bytes[7],
+        ]);
+
+        // Check if ordering_fee bit (bit 1) is set
+        const ORDERING_FEE_BIT: u32 = 1 << 1;
+        if mask & ORDERING_FEE_BIT == 0 {
+            return 0;
+        }
+
+        // NumAddresses at offset 41
+        let num_addresses = tx_bytes[41] as usize;
+
+        // ConfigValues start after Addresses
+        let config_start = 42 + 32 * num_addresses;
+        if config_start + 8 > tx_bytes.len() {
+            return 0; // Not enough bytes
+        }
+
+        // Count how many config values come before ordering_fee
+        // Per spec: fields appear in ascending bit order
+        // Bit 0 = inclusion_fee, Bit 1 = ordering_fee
+        const INCLUSION_FEE_BIT: u32 = 1 << 0;
+        let fields_before = if mask & INCLUSION_FEE_BIT != 0 { 1 } else { 0 };
+
+        // Each config value is 4 bytes
+        let ordering_fee_offset = config_start + fields_before * 4;
+        if ordering_fee_offset + 4 > tx_bytes.len() {
+            return 0;
+        }
+
+        u32::from_le_bytes([
+            tx_bytes[ordering_fee_offset],
+            tx_bytes[ordering_fee_offset + 1],
+            tx_bytes[ordering_fee_offset + 2],
+            tx_bytes[ordering_fee_offset + 3],
+        ])
     }
 }
 
@@ -348,27 +402,44 @@ impl SlotReconstruction {
         self.payloads.insert(proposer_id, result);
     }
 
-    /// Build the global ordered transaction list from payloads
+    /// Build the global ordered transaction list from payloads per spec §3.5.
+    ///
+    /// Per spec: "validators concatenate the transactions from the surviving
+    /// proposer batches and order them by ordering_fee. If two transactions
+    /// have the same ordering_fee, their relative order MUST follow their
+    /// order in the concatenated proposer batches ordered by proposer_index."
     pub fn build_ordered_transactions(&mut self) {
         let mut seen_txids: HashSet<Hash> = HashSet::new();
         let mut ordered = Vec::new();
 
-        // Iterate proposers by increasing proposer_id
+        // First, concatenate all transactions in proposer_id order
+        // Track original position for stable sort tie-breaking
+        let mut position = 0u32;
         for proposer_id in 0..NUM_PROPOSERS as u32 {
             if let Some(ReconstructionResult::Success(payload)) = self.payloads.get(&proposer_id) {
-                // Add transactions from this proposer
                 for tx_bytes in &payload.tx_data {
                     let tx = OrderedTransaction::new(proposer_id, tx_bytes.clone());
 
                     // De-duplication: only keep first occurrence
                     if seen_txids.insert(tx.txid) {
-                        ordered.push(tx);
+                        ordered.push((position, tx));
+                        position += 1;
                     }
                 }
             }
         }
 
-        self.ordered_transactions = ordered;
+        // Sort by ordering_fee (descending), then by original position (ascending) for tie-breaking
+        // Per spec: higher ordering_fee = higher priority
+        ordered.sort_by(|(pos_a, tx_a), (pos_b, tx_b)| {
+            // First compare by ordering_fee (descending - higher fee first)
+            tx_b.ordering_fee
+                .cmp(&tx_a.ordering_fee)
+                // Then by original position (ascending - preserves proposer order)
+                .then_with(|| pos_a.cmp(pos_b))
+        });
+
+        self.ordered_transactions = ordered.into_iter().map(|(_, tx)| tx).collect();
     }
 
     /// Get the number of successfully reconstructed proposers
@@ -577,11 +648,8 @@ mod tests {
 
     #[test]
     fn test_mcp_payload_serialization() {
+        // Per spec §3.1: u32 count followed by (u32 len, tx_bytes) pairs
         let payload = McpPayload {
-            payload_version: 1,
-            slot: 12345,
-            proposer_index: 3,
-            payload_len: 56, // 2 + (2+20) + (2+30) = 56
             tx_count: 2,
             tx_data: vec![vec![1u8; 20], vec![2u8; 30]],
         };
@@ -589,13 +657,12 @@ mod tests {
         let bytes = payload.to_bytes();
         let parsed = McpPayload::from_bytes(&bytes).unwrap();
 
-        assert_eq!(parsed.payload_version, 1);
-        assert_eq!(parsed.slot, 12345);
-        assert_eq!(parsed.proposer_index, 3);
         assert_eq!(parsed.tx_count, 2);
         assert_eq!(parsed.tx_data.len(), 2);
         assert_eq!(parsed.tx_data[0].len(), 20);
         assert_eq!(parsed.tx_data[1].len(), 30);
+        assert_eq!(parsed.tx_data[0], vec![1u8; 20]);
+        assert_eq!(parsed.tx_data[1], vec![2u8; 30]);
     }
 
     #[test]
@@ -710,7 +777,7 @@ mod tests {
 
     #[test]
     fn test_reconstruction_result_variants() {
-        let payload = McpPayload::empty(100, 0);
+        let payload = McpPayload::empty();
 
         let success = ReconstructionResult::Success(payload);
         assert!(matches!(success, ReconstructionResult::Success(_)));

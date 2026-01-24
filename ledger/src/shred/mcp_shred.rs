@@ -83,6 +83,9 @@ pub enum McpShredError {
     #[error("Invalid witness length: expected {MERKLE_PROOF_ENTRIES}, got {0}")]
     InvalidWitnessLen(u8),
 
+    #[error("Invalid version: expected 1, got {0}")]
+    InvalidVersion(u8),
+
     #[error("Signature verification failed")]
     SignatureVerificationFailed,
 
@@ -171,9 +174,28 @@ impl McpShredV1 {
     }
 
     /// Deserialize an MCP shred from raw bytes.
+    ///
+    /// Per spec §7.2: Shred wire format is variable-length with witness_len
+    /// controlling the witness size. The expected size is:
+    /// header(48) + shred_data(SHRED_DATA_BYTES) + witness_len(1) + witness(32*witness_len) + sig(64)
     pub fn from_bytes(data: &[u8]) -> Result<Self, McpShredError> {
-        if data.len() != MCP_SHRED_TOTAL_BYTES {
+        // Need at least header + shred_data + witness_len to determine full size
+        let min_size = OFFSET_WITNESS_LEN + 1;
+        if data.len() < min_size {
             return Err(McpShredError::InvalidSize(data.len()));
+        }
+
+        // Read witness_len to compute expected size per spec §7.2
+        let witness_len = data[OFFSET_WITNESS_LEN] as usize;
+        let expected_size = SHRED_HEADER_BYTES + SHRED_DATA_BYTES + 1 + (32 * witness_len) + SIGNATURE_BYTES;
+
+        if data.len() != expected_size {
+            return Err(McpShredError::InvalidSize(data.len()));
+        }
+
+        // For current parameters, witness_len must be MERKLE_PROOF_ENTRIES
+        if witness_len != MERKLE_PROOF_ENTRIES {
+            return Err(McpShredError::InvalidWitnessLen(witness_len as u8));
         }
 
         let slot = u64::from_le_bytes(
@@ -210,19 +232,16 @@ impl McpShredV1 {
             .try_into()
             .expect("slice length checked");
 
-        let witness_len = data[OFFSET_WITNESS_LEN];
-        if witness_len != MERKLE_PROOF_ENTRIES as u8 {
-            return Err(McpShredError::InvalidWitnessLen(witness_len));
-        }
-
         let mut witness = [[0u8; MERKLE_PROOF_ENTRY_BYTES]; MERKLE_PROOF_ENTRIES];
         for (i, entry) in witness.iter_mut().enumerate() {
             let start = OFFSET_WITNESS + i * MERKLE_PROOF_ENTRY_BYTES;
             entry.copy_from_slice(&data[start..start + MERKLE_PROOF_ENTRY_BYTES]);
         }
 
+        // Signature offset depends on witness_len
+        let sig_offset = OFFSET_WITNESS + witness_len * 32;
         let signature_bytes: [u8; SIGNATURE_BYTES] = data
-            [OFFSET_SIGNATURE..OFFSET_SIGNATURE + SIGNATURE_BYTES]
+            [sig_offset..sig_offset + SIGNATURE_BYTES]
             .try_into()
             .expect("slice length checked");
         let proposer_signature = Signature::from(signature_bytes);
@@ -285,17 +304,10 @@ impl McpShredV1 {
 
     /// Returns the message that should be signed by the proposer.
     ///
-    /// Per MCP spec §5.2:
-    /// ```text
-    /// proposer_sig_msg = ASCII("mcp:commitment:v1") || commitment32
-    /// ```
-    /// The commitment already binds to slot/proposer because the payload header
-    /// is inside the committed RS shards.
+    /// Per MCP spec §7.2: "The proposer_signature is computed by the proposer
+    /// over the 32-byte commitment."
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(17 + 32);
-        msg.extend_from_slice(b"mcp:commitment:v1");
-        msg.extend_from_slice(&self.commitment);
-        msg
+        self.commitment.to_vec()
     }
 
     /// Verify the proposer signature.
@@ -388,12 +400,20 @@ pub fn get_mcp_commitment(data: &[u8]) -> Option<[u8; MERKLE_ROOT_BYTES]> {
 }
 
 /// Extract the signature from an MCP shred payload without full parsing.
+///
+/// Per spec §7.2: Signature is at the end, offset depends on witness_len.
 #[inline]
 pub fn get_mcp_signature(data: &[u8]) -> Option<Signature> {
-    if data.len() < OFFSET_SIGNATURE + SIGNATURE_BYTES {
+    // Need at least header + shred_data + witness_len to read witness_len
+    if data.len() < OFFSET_WITNESS_LEN + 1 {
         return None;
     }
-    let bytes: [u8; SIGNATURE_BYTES] = data[OFFSET_SIGNATURE..OFFSET_SIGNATURE + SIGNATURE_BYTES]
+    let witness_len = data[OFFSET_WITNESS_LEN] as usize;
+    let sig_offset = OFFSET_WITNESS + witness_len * 32;
+    if data.len() < sig_offset + SIGNATURE_BYTES {
+        return None;
+    }
+    let bytes: [u8; SIGNATURE_BYTES] = data[sig_offset..sig_offset + SIGNATURE_BYTES]
         .try_into()
         .ok()?;
     Some(Signature::from(bytes))
@@ -402,17 +422,25 @@ pub fn get_mcp_signature(data: &[u8]) -> Option<Signature> {
 /// Check if a packet could be an MCP shred based on size and format validation.
 ///
 /// Per MCP spec §7.2, MCP shreds have a variable-length format determined by
-/// SHRED_DATA_BYTES and witness_len. For current parameters this is 1393 bytes.
-/// We validate both the size and the witness_len field to distinguish
-/// MCP shreds from legacy shreds.
+/// SHRED_DATA_BYTES and witness_len. The expected size is computed as:
+/// header(48) + shred_data(SHRED_DATA_BYTES) + witness_len(1) + witness(32*witness_len) + sig(64)
 #[inline]
 pub fn is_mcp_shred_packet(data: &[u8]) -> bool {
-    if data.len() != MCP_SHRED_TOTAL_BYTES {
+    // Need at least header + shred_data + witness_len
+    if data.len() < OFFSET_WITNESS_LEN + 1 {
         return false;
     }
-    // Validate witness_len field per spec - must be MERKLE_PROOF_ENTRIES (8)
-    // This provides format validation beyond just size checking
-    data[OFFSET_WITNESS_LEN] == MERKLE_PROOF_ENTRIES as u8
+
+    // Read witness_len and compute expected size per spec §7.2
+    let witness_len = data[OFFSET_WITNESS_LEN] as usize;
+    let expected_size = SHRED_HEADER_BYTES + SHRED_DATA_BYTES + 1 + (32 * witness_len) + SIGNATURE_BYTES;
+
+    if data.len() != expected_size {
+        return false;
+    }
+
+    // For current parameters, witness_len must be MERKLE_PROOF_ENTRIES (8)
+    witness_len == MERKLE_PROOF_ENTRIES
 }
 
 /// Get the shred data payload range.
@@ -516,15 +544,13 @@ impl RelayAttestationV1 {
 
     /// Returns the message that should be signed by the relay.
     ///
-    /// Per MCP spec §6.2:
-    /// ```text
-    /// relay_sig_msg = ASCII("mcp:relay-attestation:v1") || serialize_without_relay_signature(attestation)
-    /// ```
+    /// Per MCP spec §7.3: relay_signature is computed over the bytes of
+    /// version, slot, relay_index, entries_len, and entries (NO domain prefix).
     pub fn signing_message(&self) -> Vec<u8> {
-        let prefix = b"mcp:relay-attestation:v1";
-        let body_size = 8 + 4 + 1 + self.entries.len() * AttestationEntryV1::SIZE;
-        let mut msg = Vec::with_capacity(prefix.len() + body_size);
-        msg.extend_from_slice(prefix);
+        // Per spec §7.3: sign version (1) + slot (8) + relay_index (4) + entries_len (1) + entries
+        let body_size = 1 + 8 + 4 + 1 + self.entries.len() * AttestationEntryV1::SIZE;
+        let mut msg = Vec::with_capacity(body_size);
+        msg.push(1u8); // version = 1
         msg.extend_from_slice(&self.slot.to_le_bytes());
         msg.extend_from_slice(&self.relay_index.to_le_bytes());
         msg.push(self.entries.len() as u8);
@@ -540,10 +566,14 @@ impl RelayAttestationV1 {
         self.relay_signature.verify(relay_pubkey.as_ref(), &msg)
     }
 
-    /// Serialize to bytes.
+    /// Serialize to bytes per spec §7.3.
+    ///
+    /// Wire format: version (1) + slot (8) + relay_index (4) + entries_len (1) +
+    /// entries (entries_len * 100) + relay_signature (64)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let size = 8 + 4 + 1 + self.entries.len() * AttestationEntryV1::SIZE + SIGNATURE_BYTES;
+        let size = 1 + 8 + 4 + 1 + self.entries.len() * AttestationEntryV1::SIZE + SIGNATURE_BYTES;
         let mut buf = Vec::with_capacity(size);
+        buf.push(1u8); // version = 1 per spec §7.3
         buf.extend_from_slice(&self.slot.to_le_bytes());
         buf.extend_from_slice(&self.relay_index.to_le_bytes());
         buf.push(self.entries.len() as u8);
@@ -554,26 +584,38 @@ impl RelayAttestationV1 {
         buf
     }
 
-    /// Deserialize from bytes.
+    /// Deserialize from bytes per spec §7.3.
+    ///
+    /// Wire format: version (1) + slot (8) + relay_index (4) + entries_len (1) +
+    /// entries (entries_len * 100) + relay_signature (64)
     pub fn from_bytes(data: &[u8]) -> Result<Self, McpShredError> {
-        if data.len() < 8 + 4 + 1 + SIGNATURE_BYTES {
+        // Minimum: version (1) + slot (8) + relay_index (4) + entries_len (1) + signature (64)
+        if data.len() < 1 + 8 + 4 + 1 + SIGNATURE_BYTES {
             return Err(McpShredError::InvalidSize(data.len()));
         }
-        let slot = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let relay_index = u32::from_le_bytes(data[8..12].try_into().unwrap());
+
+        // Version must be 1
+        let version = data[0];
+        if version != 1 {
+            return Err(McpShredError::InvalidVersion(version));
+        }
+
+        let slot = u64::from_le_bytes(data[1..9].try_into().unwrap());
+        let relay_index = u32::from_le_bytes(data[9..13].try_into().unwrap());
         if relay_index >= NUM_RELAYS as u32 {
             return Err(McpShredError::InvalidShredIndex(relay_index));
         }
-        let num_entries = data[12] as usize;
+        let num_entries = data[13] as usize;
         if num_entries > Self::MAX_ENTRIES {
             return Err(McpShredError::InvalidProposerIndex(num_entries as u32));
         }
-        let expected_size = 13 + num_entries * AttestationEntryV1::SIZE + SIGNATURE_BYTES;
+        // Expected size: version (1) + slot (8) + relay_index (4) + entries_len (1) + entries + sig (64)
+        let expected_size = 14 + num_entries * AttestationEntryV1::SIZE + SIGNATURE_BYTES;
         if data.len() < expected_size {
             return Err(McpShredError::InvalidSize(data.len()));
         }
         let mut entries = Vec::with_capacity(num_entries);
-        let mut offset = 13;
+        let mut offset = 14;
         for _ in 0..num_entries {
             let entry = AttestationEntryV1::from_bytes(&data[offset..offset + AttestationEntryV1::SIZE])?;
             entries.push(entry);
@@ -713,36 +755,27 @@ impl McpBlockV1 {
         }
     }
 
-    /// Compute the block hash.
+    /// DEPRECATED: Compute a block hash.
     ///
-    /// Per MCP spec §6.3:
-    /// ```text
-    /// block_body = serialize_without_leader_signature(McpBlockV1)
-    /// block_hash = SHA256(ASCII("mcp:block-hash:v1") || block_body)
-    /// ```
+    /// NOTE: Per spec §7.5, block_id is NOT computed by hashing the block body.
+    /// It comes from consensus_meta. This method is kept for backward compatibility.
+    /// Use core::mcp_consensus_block::ConsensusBlock instead.
+    #[deprecated(note = "block_id comes from consensus_meta. Use ConsensusBlock.")]
     pub fn block_hash(&self) -> [u8; 32] {
         use solana_sha256_hasher::Hasher;
-        let prefix = b"mcp:block-hash:v1";
         let body = self.serialize_without_signature();
         let mut hasher = Hasher::default();
-        hasher.hash(prefix);
         hasher.hash(&body);
         hasher.result().to_bytes()
     }
 
     /// Returns the message that should be signed by the leader.
     ///
-    /// Per MCP spec §6.3:
-    /// ```text
-    /// leader_signature = Ed25519Sign(SK_leader, ASCII("mcp:block-sig:v1") || block_hash)
-    /// ```
+    /// Per spec §7.5: leader_signature is over all preceding bytes (no domain prefix).
+    #[allow(deprecated)]
     pub fn signing_message(&self) -> Vec<u8> {
-        let prefix = b"mcp:block-sig:v1";
-        let block_hash = self.block_hash();
-        let mut msg = Vec::with_capacity(prefix.len() + 32);
-        msg.extend_from_slice(prefix);
-        msg.extend_from_slice(&block_hash);
-        msg
+        // Per spec §7.5: sign the raw body, no domain prefix
+        self.serialize_without_signature()
     }
 
     /// Verify the leader signature.
@@ -1004,10 +1037,9 @@ mod tests {
 
         let msg = shred.signing_message();
 
-        // Verify message structure per spec §5.2: domain || commitment only
-        assert_eq!(&msg[..17], b"mcp:commitment:v1");
-        assert_eq!(&msg[17..49], &[0xAB; 32]);
-        assert_eq!(msg.len(), 17 + 32);
+        // Verify message structure per spec §7.2: just the 32-byte commitment
+        assert_eq!(msg.as_slice(), &[0xAB; 32]);
+        assert_eq!(msg.len(), 32);
     }
 
     #[test]

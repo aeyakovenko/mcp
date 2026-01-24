@@ -23,8 +23,9 @@ pub const K_PARITY_SHARDS: usize = MCP_CODING_SHREDS_PER_FEC_BLOCK; // 160
 /// Total number of shards (N)
 pub const N_TOTAL_SHARDS: usize = K_DATA_SHARDS + K_PARITY_SHARDS; // 200
 
-/// MCP shred payload size (from spec)
-pub const MCP_SHARD_SIZE: usize = 952;
+/// MCP shred payload size (SHRED_DATA_BYTES per spec §4)
+/// Must match ledger/src/shred/mcp_shred.rs::SHRED_DATA_BYTES
+pub const MCP_SHARD_SIZE: usize = 1024;
 
 /// Error type for MCP RS operations
 #[derive(Debug, Clone, PartialEq, Eq)]

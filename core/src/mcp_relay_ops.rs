@@ -163,22 +163,16 @@ impl ShredVerifier {
 
     /// Verify the proposer signature over commitment.
     ///
-    /// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
-    /// The commitment already binds to slot/proposer because the payload header
-    /// is inside the committed RS shards.
+    /// Per spec §7.2: "The proposer_signature is computed by the proposer
+    /// over the 32-byte commitment."
     fn verify_proposer_signature(
         &self,
         shred: &McpShred,
         proposer_pubkey: &Pubkey,
     ) -> Result<(), RelayError> {
-        // Build the signing message per spec §5.2
-        let mut message = Vec::with_capacity(17 + 32);
-        message.extend_from_slice(b"mcp:commitment:v1");
-        message.extend_from_slice(shred.commitment.as_ref());
-
-        // Verify signature using Ed25519
+        // Verify signature over just the commitment per spec §7.2
         let signature = solana_signature::Signature::from(shred.proposer_signature);
-        if !signature.verify(proposer_pubkey.as_ref(), &message) {
+        if !signature.verify(proposer_pubkey.as_ref(), shred.commitment.as_ref()) {
             return Err(RelayError::SignatureVerificationFailed);
         }
 
@@ -434,12 +428,10 @@ impl RelayOperations {
 }
 
 /// Helper to build the proposer signature message for verification.
-/// Per spec §5.2: proposer_sig_msg = "mcp:commitment:v1" || commitment32
+/// Per spec §7.2: "The proposer_signature is computed by the proposer
+/// over the 32-byte commitment."
 pub fn build_proposer_sig_message(commitment: &Hash) -> Vec<u8> {
-    let mut message = Vec::with_capacity(17 + 32);
-    message.extend_from_slice(b"mcp:commitment:v1");
-    message.extend_from_slice(commitment.as_ref());
-    message
+    commitment.as_ref().to_vec()
 }
 
 #[cfg(test)]
@@ -658,9 +650,8 @@ mod tests {
 
         let message = build_proposer_sig_message(&commitment);
 
-        // Verify structure per spec §5.2: domain || commitment only
-        assert_eq!(&message[0..17], b"mcp:commitment:v1");
-        assert_eq!(&message[17..49], commitment.as_ref());
-        assert_eq!(message.len(), 17 + 32);
+        // Verify structure per spec §7.2: just the 32-byte commitment
+        assert_eq!(message.as_slice(), commitment.as_ref());
+        assert_eq!(message.len(), 32);
     }
 }

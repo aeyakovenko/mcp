@@ -7,8 +7,7 @@ use {
         completed_data_sets_service::CompletedDataSetsSender,
         mcp_relay_attestation::{
             ReceivedShredInfo, RelayAttestationConfig, RelayAttestationService,
-            // TODO: Wire in for actual attestation submission
-            // get_attestation_leader_addr, submit_attestation,
+            get_attestation_leader_addr, submit_attestation,
         },
         mcp_replay_reconstruction::{
             reconstruct_proposer_payload, ProposerShreds, ReconstructionResult,
@@ -267,6 +266,9 @@ fn run_insert<F>(
     mcp_reconstruction_sender: Option<&McpReconstructionSender>,
     relay_attestation_service: &mut RelayAttestationService,
     relay_keypair: Option<&Arc<Keypair>>,
+    cluster_info: &ClusterInfo,
+    bank_forks: &RwLock<BankForks>,
+    attestation_socket: Option<&UdpSocket>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -351,7 +353,7 @@ where
             proposers.len()
         );
 
-        // Create and send attestation if we have a keypair
+        // Create and send attestation if we have a keypair and socket
         if let Some(keypair) = relay_keypair {
             let attestation = relay_attestation_service.create_attestation(
                 slot,
@@ -364,9 +366,26 @@ where
                 attestation.relay_index,
                 attestation.entries.len()
             );
-            // TODO: Send attestation to leader via UDP
-            // let leader_addr = get_attestation_leader_addr(leader_schedule_cache, slot);
-            // submit_attestation(&attestation, leader_addr, socket);
+
+            // Send attestation to leader via UDP
+            if let Some(socket) = attestation_socket {
+                if let Some(leader_addr) = get_attestation_leader_addr(
+                    slot,
+                    leader_schedule_cache,
+                    cluster_info,
+                    bank_forks,
+                ) {
+                    if let Err(e) = submit_attestation(&attestation, leader_addr, socket) {
+                        debug!("MCP: Failed to send attestation for slot {}: {:?}", slot, e);
+                    } else {
+                        info!("MCP: Sent attestation to leader at {} for slot {}", leader_addr, slot);
+                    }
+                } else {
+                    debug!("MCP: No leader address found for slot {}", slot);
+                }
+            } else {
+                debug!("MCP: No attestation socket available for slot {}", slot);
+            }
         }
     }
 
@@ -581,7 +600,9 @@ impl WindowService {
         migration_status: Arc<MigrationStatus>,
     ) -> WindowService {
         let cluster_info = repair_info.cluster_info.clone();
+        let cluster_info_for_insert = repair_info.cluster_info.clone();
         let bank_forks = repair_info.bank_forks.clone();
+        let bank_forks_for_insert = repair_info.bank_forks.clone();
 
         // In wen_restart, we discard all shreds from Turbine and keep only those from repair to
         // avoid new shreds make validator OOM before wen_restart is over.
@@ -631,6 +652,8 @@ impl WindowService {
             accept_repairs_only,
             mcp_reconstruction_sender,
             relay_keypair,
+            cluster_info_for_insert,
+            bank_forks_for_insert,
         );
 
         WindowService {
@@ -684,6 +707,8 @@ impl WindowService {
         accept_repairs_only: bool,
         mcp_reconstruction_sender: Option<McpReconstructionSender>,
         relay_keypair: Option<Arc<Keypair>>,
+        cluster_info: Arc<ClusterInfo>,
+        bank_forks: Arc<RwLock<BankForks>>,
     ) -> JoinHandle<()> {
         let handle_error = || {
             inc_new_counter_error!("solana-window-insert-error", 1, 1);
@@ -712,6 +737,8 @@ impl WindowService {
                 let mut relay_attestation_service = RelayAttestationService::new(
                     RelayAttestationConfig::default()
                 );
+                // Create UDP socket for sending attestations to leader
+                let attestation_socket = UdpSocket::bind("0.0.0.0:0").ok();
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
@@ -730,6 +757,9 @@ impl WindowService {
                         mcp_reconstruction_sender.as_ref(),
                         &mut relay_attestation_service,
                         relay_keypair.as_ref(),
+                        &cluster_info,
+                        &bank_forks,
+                        attestation_socket.as_ref(),
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {

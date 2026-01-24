@@ -705,21 +705,18 @@ impl StandardBroadcastRun {
             return Ok(false);
         }
 
-        // Step 1: Serialize transactions into payload per spec §5
-        // payload_len (4) + tx_count (4) + tx_len[] (4 each) + tx_data[]
+        // Step 1: Serialize transactions into payload per spec §3.1
+        // Format: u32 count followed by (u32 len, tx_bytes) pairs
         let payload_bytes = {
-            let tx_lengths: Vec<usize> = self.mcp_pending_transactions.iter().map(|t| t.len()).collect();
-            let total_tx_data: usize = tx_lengths.iter().sum();
-            let header_size = 4 + 4 + (tx_lengths.len() * 4);
-            let payload_len = header_size + total_tx_data - 4;
+            let total_tx_data: usize = self.mcp_pending_transactions.iter().map(|t| t.len()).sum();
+            let header_size = 4 + (self.mcp_pending_transactions.len() * 4); // count + len per tx
 
             let mut bytes = Vec::with_capacity(header_size + total_tx_data);
-            bytes.extend_from_slice(&(payload_len as u32).to_le_bytes());
+            // u32 count
             bytes.extend_from_slice(&(tx_count as u32).to_le_bytes());
-            for len in &tx_lengths {
-                bytes.extend_from_slice(&(*len as u32).to_le_bytes());
-            }
+            // (u32 len, tx_bytes) pairs
             for tx_bytes in self.mcp_pending_transactions.drain(..) {
+                bytes.extend_from_slice(&(tx_bytes.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(&tx_bytes);
             }
             bytes
@@ -751,11 +748,9 @@ impl StandardBroadcastRun {
         let merkle_tree = McpMerkleTree::from_payloads(&shard_refs);
         let commitment = merkle_tree.commitment();
 
-        // Step 4: Sign the commitment per spec §5.2
-        let mut sig_msg = Vec::with_capacity(17 + 32);
-        sig_msg.extend_from_slice(b"mcp:commitment:v1");
-        sig_msg.extend_from_slice(commitment.as_ref());
-        let proposer_signature = keypair.sign_message(&sig_msg);
+        // Step 4: Sign the commitment per spec §7.2
+        // "The proposer_signature is computed by the proposer over the 32-byte commitment."
+        let proposer_signature = keypair.sign_message(commitment.as_ref());
 
         // Step 5: Create and send McpShredV1 for each shard
         let mut sent_count = 0usize;
@@ -837,7 +832,7 @@ impl StandardBroadcastRun {
             return Ok(false);
         }
 
-        // Step 1: Extract payloads and pad to MCP_SHRED_PAYLOAD_BYTES (952 bytes)
+        // Step 1: Extract payloads and pad to MCP_SHRED_PAYLOAD_BYTES (1024 bytes per SHRED_DATA_BYTES)
         let mut payloads: Vec<[u8; MCP_SHRED_PAYLOAD_BYTES]> = Vec::with_capacity(shreds.len());
         for shred in shreds {
             let raw_payload = shred.payload();
@@ -852,11 +847,8 @@ impl StandardBroadcastRun {
         let merkle_tree = McpMerkleTree::from_payloads(&payload_refs);
         let commitment = merkle_tree.commitment();
 
-        // Step 3: Sign the commitment
-        let mut sig_msg = Vec::with_capacity(17 + 32);
-        sig_msg.extend_from_slice(b"mcp:commitment:v1");
-        sig_msg.extend_from_slice(commitment.as_ref());
-        let proposer_signature = keypair.sign_message(&sig_msg);
+        // Step 3: Sign the commitment per spec §7.2 (sign just the 32-byte commitment)
+        let proposer_signature = keypair.sign_message(commitment.as_ref());
 
         // Step 4: Create McpShredV1 for each shred and send
         for (i, (shred, payload)) in shreds.iter().zip(payloads.iter()).enumerate() {

@@ -21,6 +21,7 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
         mcp_attestation::{RelayAttestation, RelayAttestationBuilder},
     },
+    solana_pubkey::Pubkey,
     solana_runtime::bank_forks::BankForks,
     solana_signer::Signer,
     std::{
@@ -35,8 +36,12 @@ use {
     },
 };
 
-/// Minimum number of shreds needed from a proposer to attest (per spec: 40 data shreds)
-pub const MIN_SHREDS_FOR_ATTESTATION: usize = 40;
+/// Per spec §3.3: Relays attest to valid shreds. The old threshold requirement
+/// has been removed - a relay attests to any valid shred it receives.
+/// This constant is kept for backward compatibility but no longer used.
+#[deprecated(note = "Per spec §3.3, relays attest to any valid shred")]
+#[allow(dead_code)]
+pub const MIN_SHREDS_FOR_ATTESTATION: usize = 1;
 
 /// Timeout for waiting for shreds before creating attestation
 pub const ATTESTATION_TIMEOUT: Duration = Duration::from_millis(400);
@@ -62,17 +67,28 @@ pub struct ProposerShredTracker {
     pub received_indices: Vec<u32>,
     /// When the first shred was received
     pub first_received: Option<Instant>,
+    /// Whether conflicting commitments were detected (equivocation)
+    pub has_equivocation: bool,
 }
 
 impl ProposerShredTracker {
     /// Record a received shred.
+    ///
+    /// Per spec §3.3: "If a relay receives multiple valid shreds that imply
+    /// different commitments for the same proposer and slot, it SHOULD NOT
+    /// attest to any of them."
     pub fn record_shred(
         &mut self,
         shred_index: u32,
         commitment: Hash,
         proposer_signature: solana_signature::Signature,
     ) {
-        if self.commitment.is_none() {
+        if let Some(existing_commitment) = self.commitment {
+            // Check for equivocation (conflicting commitment)
+            if existing_commitment != commitment {
+                self.has_equivocation = true;
+            }
+        } else {
             self.commitment = Some(commitment);
             self.proposer_signature = Some(proposer_signature);
             self.first_received = Some(Instant::now());
@@ -82,14 +98,23 @@ impl ProposerShredTracker {
         }
     }
 
-    /// Check if we have enough shreds to attest.
+    /// Check if we can attest to this proposer.
+    ///
+    /// Per spec §3.3: Attest to any valid shred, unless conflicting
+    /// commitments were detected (equivocation).
     pub fn can_attest(&self) -> bool {
-        self.received_indices.len() >= MIN_SHREDS_FOR_ATTESTATION
+        // Must have at least one shred and no equivocation
+        !self.received_indices.is_empty() && !self.has_equivocation && self.commitment.is_some()
     }
 
     /// Get the number of received shreds.
     pub fn shred_count(&self) -> usize {
         self.received_indices.len()
+    }
+
+    /// Check if equivocation was detected.
+    pub fn detected_equivocation(&self) -> bool {
+        self.has_equivocation
     }
 }
 
@@ -417,6 +442,9 @@ impl AttestationAggregator {
 
     /// Add an attestation.
     /// Returns true if the attestation was new and added.
+    ///
+    /// Note: This method does NOT verify signatures. Use `add_attestation_with_verification`
+    /// for spec-compliant signature verification per §3.4.
     pub fn add_attestation(&mut self, attestation: RelayAttestation) -> bool {
         let slot = attestation.slot;
 
@@ -431,6 +459,60 @@ impl AttestationAggregator {
             .entry(slot)
             .or_default()
             .add_attestation(attestation)
+    }
+
+    /// Add an attestation with signature verification per spec §3.4.
+    ///
+    /// Per spec: "For each relay message, the leader verifies the relay_signature
+    /// and then checks each proposer entry's proposer_signature."
+    ///
+    /// Returns Ok(true) if attestation was added, Ok(false) if it was a duplicate,
+    /// or Err if signature verification failed.
+    pub fn add_attestation_with_verification(
+        &mut self,
+        attestation: RelayAttestation,
+        relay_pubkeys: &[Pubkey],
+        proposer_pubkeys: &[Pubkey],
+    ) -> Result<bool, &'static str> {
+        let slot = attestation.slot;
+
+        // Verify relay signature
+        let relay_index = attestation.relay_index as usize;
+        if relay_index >= relay_pubkeys.len() {
+            return Err("Invalid relay index");
+        }
+        if attestation
+            .verify_signature(&relay_pubkeys[relay_index])
+            .is_err()
+        {
+            return Err("Invalid relay signature");
+        }
+
+        // Verify each proposer entry's signature
+        for entry in &attestation.entries {
+            let proposer_index = entry.proposer_index as usize;
+            if proposer_index >= proposer_pubkeys.len() {
+                return Err("Invalid proposer index in entry");
+            }
+            if !entry.verify_proposer_signature(&proposer_pubkeys[proposer_index]) {
+                return Err("Invalid proposer signature in entry");
+            }
+        }
+
+        // Update current slot
+        if slot > self.current_slot {
+            self.current_slot = slot;
+            self.cleanup_old_slots();
+        }
+
+        // Add to slot tracking
+        let added = self
+            .slot_attestations
+            .entry(slot)
+            .or_default()
+            .add_attestation(attestation);
+
+        Ok(added)
     }
 
     /// Check if a slot has enough attestations for block finalization.

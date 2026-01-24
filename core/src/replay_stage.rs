@@ -20,7 +20,7 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
-        mcp_consensus_block::{McpBlockV1, MIN_RELAYS_IN_BLOCK, BANKHASH_DELAY_SLOTS},
+        mcp_consensus_block::{AggregateAttestation, ConsensusBlock, MIN_RELAYS_IN_BLOCK, BANKHASH_DELAY_SLOTS},
         mcp_relay_attestation::{AttestationAggregator, MIN_RELAYS_FOR_BLOCK},
         mcp_fee_mechanics::TwoPhaseProcessor,
         mcp_replay_reconstruction::{
@@ -51,6 +51,7 @@ use {
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
     solana_keypair::Keypair,
+    solana_sha256_hasher::hashv,
     solana_ledger::{
         block_error::BlockError,
         blockstore::Blockstore,
@@ -61,7 +62,7 @@ use {
         },
         entry_notifier_service::EntryNotifierSender,
         leader_schedule_cache::LeaderScheduleCache,
-        leader_schedule_utils::first_of_consecutive_leader_slots,
+        leader_schedule_utils::{first_of_consecutive_leader_slots, leader_slot_index},
         mcp_attestation::RelayAttestation,
         shred::mcp_shred::McpShredV1,
     },
@@ -336,7 +337,7 @@ pub struct ReplaySenders {
     pub votor_event_sender: VotorEventSender,
     pub own_vote_sender: Sender<ConsensusMessage>,
     pub optimistic_parent_sender: Sender<LeaderWindowInfo>,
-    /// MCP block broadcast sender (for consensus leader to distribute McpBlockV1)
+    /// MCP block broadcast sender (for consensus leader to distribute ConsensusBlock)
     pub mcp_block_sender: Option<Sender<McpBlockBroadcast>>,
 }
 
@@ -2745,28 +2746,28 @@ impl ReplayStage {
 
                     let implied_proposers: Vec<(u32, Hash)> = match blockstore.get_mcp_consensus_payload(slot, bank.parent_block_id().unwrap_or_default()) {
                         Ok(Some(block_bytes)) => {
-                            // Parse MCP block and use compute_implied_blocks_with_verification()
-                            match McpBlockV1::deserialize(&mut block_bytes.as_slice()) {
-                                Ok(mcp_block) => {
-                                    if mcp_block.relay_entries.len() >= MIN_RELAYS_IN_BLOCK {
+                            // Parse ConsensusBlock and use compute_implied_blocks_with_verification()
+                            match ConsensusBlock::deserialize(&mut block_bytes.as_slice()) {
+                                Ok(consensus_block) => {
+                                    if consensus_block.aggregate.relay_entries.len() >= MIN_RELAYS_IN_BLOCK {
                                         // Use the block's implied proposers algorithm with signature verification
                                         // per spec §11.2 and §5.2
                                         let implied = if !proposer_pubkeys.is_empty() {
-                                            mcp_block.compute_implied_blocks_with_verification(&proposer_pubkeys)
+                                            consensus_block.compute_implied_blocks_with_verification(&proposer_pubkeys)
                                         } else {
                                             // Fallback without verification if pubkeys unavailable
                                             warn!("MCP slot {} no proposer pubkeys available, skipping signature verification", slot);
-                                            mcp_block.compute_implied_blocks()
+                                            consensus_block.compute_implied_blocks()
                                         };
                                         info!(
                                             "MCP slot {} using consensus block with {} relays, {} implied proposers (verified={})",
-                                            slot, mcp_block.relay_entries.len(), implied.len(), !proposer_pubkeys.is_empty()
+                                            slot, consensus_block.aggregate.relay_entries.len(), implied.len(), !proposer_pubkeys.is_empty()
                                         );
                                         implied
                                     } else {
                                         warn!(
                                             "MCP slot {} has block with only {} relays (need {}), falling back to shred commitments",
-                                            slot, mcp_block.relay_entries.len(), MIN_RELAYS_IN_BLOCK
+                                            slot, consensus_block.aggregate.relay_entries.len(), MIN_RELAYS_IN_BLOCK
                                         );
                                         Self::extract_implied_proposers_from_shreds(&mcp_shreds)
                                     }
@@ -2786,12 +2787,15 @@ impl ReplayStage {
                     };
 
                     // 3. Add all shreds to reconstruction state
+                    // Per spec §12.1: Use actual shred_index from the shred, not enumeration index
                     for (proposer_id, proposer_shreds) in mcp_shreds {
-                        for (idx, (_shred_idx, shred_bytes)) in proposer_shreds.iter().enumerate() {
+                        for (_stored_idx, shred_bytes) in proposer_shreds.iter() {
                             if let Ok(mcp_shred) = McpShredV1::from_bytes(shred_bytes) {
+                                // Use the actual shred_index from the parsed shred
+                                let actual_index = mcp_shred.shred_index;
                                 let shred_data = ShredData {
-                                    index: idx as u16,
-                                    is_data: idx < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
+                                    index: actual_index as u16,
+                                    is_data: (actual_index as usize) < solana_ledger::mcp::fec::MCP_DATA_SHREDS_PER_FEC_BLOCK,
                                     data: mcp_shred.shred_data.to_vec(),
                                     merkle_proof: mcp_shred.witness.to_vec(),
                                 };
@@ -2947,22 +2951,33 @@ impl ReplayStage {
             })
             .collect();
 
-        // Create the unsigned block
-        let mut mcp_block = McpBlockV1::new_unsigned(
+        // Create aggregate attestation per spec §7.4
+        // leader_index is the slot's position within the leader's consecutive slots
+        let leader_index = leader_slot_index(slot) as u32;
+        let aggregate = AggregateAttestation::new(slot, leader_index, relay_entries);
+
+        // consensus_meta carries the block_id per spec; for now use empty until ledger integration
+        let consensus_meta: Vec<u8> = Vec::new();
+
+        // Create the ConsensusBlock per spec §7.5
+        let mut consensus_block = ConsensusBlock::new_unsigned(
             slot,
-            0, // leader_index - would come from schedule
+            leader_index,
+            aggregate,
+            consensus_meta.clone(),
             delayed_bankhash,
-            relay_entries,
         );
 
         // Sign the block
-        mcp_block.sign(identity_keypair);
+        consensus_block.sign(identity_keypair);
 
         // Serialize and store in blockstore
         let mut block_bytes = Vec::new();
-        if mcp_block.serialize(&mut block_bytes).is_ok() {
-            let block_hash = mcp_block.compute_block_hash();
-            if let Err(e) = blockstore.put_mcp_consensus_payload(slot, block_hash, &block_bytes) {
+        if consensus_block.serialize(&mut block_bytes).is_ok() {
+            // Per spec §7.5, block_id comes from consensus_meta.
+            // Until ledger integration, use hash of serialized block as placeholder.
+            let block_id = hashv(&[&block_bytes]);
+            if let Err(e) = blockstore.put_mcp_consensus_payload(slot, block_id, &block_bytes) {
                 error!("MCP: Failed to store block for slot {}: {:?}", slot, e);
             } else {
                 info!(

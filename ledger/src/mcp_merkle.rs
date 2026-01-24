@@ -1,12 +1,14 @@
 //! MCP Merkle Tree Implementation
 //!
 //! This module implements the MCP Merkle commitment scheme as defined in spec §6:
-//! - Fixed-depth tree with NUM_RELAYS leaves (200, padded to 256)
+//! - Tree with NUM_RELAYS leaves (200) using odd-node self-pairing
 //! - Full 32-byte hash entries in witness proofs
-//! - Domain-separated leaf and node hashing
 //!
-//! Per spec §6: "The witness is the ordered list of sibling hashes from leaf to root."
-//! Each witness entry is a full 32-byte hash.
+//! Per spec §6:
+//! - Leaf hash: SHA-256(0x00 || slot || proposer_index || i || shred_data)
+//! - Node hash: SHA-256(0x01 || left || right)
+//! - When a level has an odd number of nodes, the last node is paired with itself
+//! - The witness is the ordered list of sibling hashes from leaf to root
 
 use {
     solana_hash::Hash,
@@ -14,22 +16,19 @@ use {
     std::io::{self, Read, Write},
 };
 
-/// Domain separation prefix for leaf hashes
+/// Domain separation prefix for leaf hashes (spec §6)
 pub const LEAF_PREFIX: u8 = 0x00;
 
-/// Domain separation prefix for node hashes
+/// Domain separation prefix for node hashes (spec §6)
 pub const NODE_PREFIX: u8 = 0x01;
 
-/// Domain string for leaf hashes (spec §4.4.1)
-pub const LEAF_DOMAIN: &[u8] = b"SOLANA_MERKLE_SHREDS_LEAF";
+/// Number of relays (and leaves) per spec §5
+pub const NUM_RELAYS: usize = 200;
 
-/// Domain string for node hashes (spec §4.4.1)
-pub const NODE_DOMAIN: &[u8] = b"SOLANA_MERKLE_SHREDS_NODE";
+/// Number of leaves in the tree (equals NUM_RELAYS)
+pub const NUM_LEAVES: usize = NUM_RELAYS;
 
-/// Number of leaves in the fixed-depth tree (2^8 = 256)
-pub const NUM_LEAVES: usize = 256;
-
-/// Tree depth (log2 of NUM_LEAVES)
+/// Tree depth: ceil(log2(NUM_RELAYS)) = ceil(log2(200)) = 8
 pub const TREE_DEPTH: usize = 8;
 
 /// Size of a hash (32 bytes)
@@ -91,12 +90,23 @@ impl MerkleProof {
         Ok(siblings)
     }
 
-    /// Verify this proof against a commitment and leaf data
+    /// Verify this proof against a commitment and leaf data with context
     ///
-    /// Per spec §6: Uses full 32-byte hashes throughout the tree.
-    pub fn verify(&self, commitment: &Hash, leaf_data: &[u8]) -> bool {
-        // Compute leaf hash
-        let leaf_hash = compute_leaf_hash(leaf_data);
+    /// Per spec §6: leaf_hash = SHA-256(0x00 || slot || proposer_index || shred_index || shred_data)
+    pub fn verify_with_context(
+        &self,
+        commitment: &Hash,
+        slot: u64,
+        proposer_index: u32,
+        shred_data: &[u8],
+    ) -> bool {
+        // Compute leaf hash with context per spec §6
+        let leaf_hash = compute_leaf_hash_with_context(
+            slot,
+            proposer_index,
+            self.leaf_index as u32,
+            shred_data,
+        );
         let mut current = hash_to_witness(&leaf_hash);
 
         // Walk up the tree
@@ -117,26 +127,44 @@ impl MerkleProof {
         // Compare root against commitment
         current == commitment.as_ref()
     }
+
+    /// Legacy verify without context (for backward compatibility)
+    /// NOTE: This is NOT spec-compliant and should be replaced with verify_with_context
+    pub fn verify(&self, commitment: &Hash, leaf_data: &[u8]) -> bool {
+        self.verify_with_context(commitment, 0, 0, leaf_data)
+    }
 }
 
-/// Compute the leaf hash with domain separation
+/// Compute the leaf hash per spec §6
 ///
-/// leaf_hash = SHA256(LEAF_PREFIX || LEAF_DOMAIN || leaf_bytes)
-pub fn compute_leaf_hash(leaf_data: &[u8]) -> Hash {
+/// leaf_hash = SHA256(0x00 || slot || proposer_index || shred_index || shred_data)
+pub fn compute_leaf_hash_with_context(
+    slot: u64,
+    proposer_index: u32,
+    shred_index: u32,
+    shred_data: &[u8],
+) -> Hash {
     let mut hasher = Hasher::default();
     hasher.hash(&[LEAF_PREFIX]);
-    hasher.hash(LEAF_DOMAIN);
-    hasher.hash(leaf_data);
+    hasher.hash(&slot.to_le_bytes());
+    hasher.hash(&proposer_index.to_le_bytes());
+    hasher.hash(&shred_index.to_le_bytes());
+    hasher.hash(shred_data);
     Hash::new_from_array(hasher.result().to_bytes())
 }
 
-/// Compute the node hash from two child hashes with domain separation
+/// Legacy compute_leaf_hash without context (for backward compatibility)
+/// NOTE: This is NOT spec-compliant and should be replaced with compute_leaf_hash_with_context
+pub fn compute_leaf_hash(leaf_data: &[u8]) -> Hash {
+    compute_leaf_hash_with_context(0, 0, 0, leaf_data)
+}
+
+/// Compute the node hash from two child hashes per spec §6
 ///
-/// node_hash = SHA256(NODE_PREFIX || NODE_DOMAIN || left || right)
+/// node_hash = SHA256(0x01 || left || right)
 pub fn compute_node_hash(left: &WitnessHash, right: &WitnessHash) -> Hash {
     let mut hasher = Hasher::default();
     hasher.hash(&[NODE_PREFIX]);
-    hasher.hash(NODE_DOMAIN);
     hasher.hash(left);
     hasher.hash(right);
     Hash::new_from_array(hasher.result().to_bytes())
@@ -152,6 +180,7 @@ pub fn hash_to_witness(hash: &Hash) -> WitnessHash {
 /// MCP Merkle tree builder
 ///
 /// Builds a fixed-depth Merkle tree from shred payloads and generates proofs.
+/// Per spec §6, leaf hashes include slot, proposer_index, and shred_index.
 #[allow(dead_code)]
 pub struct McpMerkleTree {
     /// Leaf hashes (full 32-byte hashes per spec §6)
@@ -164,39 +193,67 @@ pub struct McpMerkleTree {
 }
 
 impl McpMerkleTree {
-    /// Build a Merkle tree from shred payloads
+    /// Build a Merkle tree from shred payloads with context
     ///
+    /// Per spec §6: leaf_hash = SHA-256(0x00 || slot || proposer_index || i || shred_data)
     /// Payloads must be exactly LEAF_PAYLOAD_SIZE bytes each.
-    /// Missing payloads (up to NUM_LEAVES) are padded with zeros.
-    pub fn from_payloads(payloads: &[&[u8]]) -> Self {
+    /// Per spec §6: When a level has an odd number of nodes, the last node is paired with itself.
+    ///
+    /// NOTE: For spec compliance, proposers output exactly NUM_RELAYS shreds.
+    /// When fewer payloads are provided, missing leaves are padded with zero-payload hashes.
+    pub fn from_payloads_with_context(
+        slot: u64,
+        proposer_index: u32,
+        payloads: &[&[u8]],
+    ) -> Self {
         assert!(payloads.len() <= NUM_LEAVES, "Too many payloads");
+        assert!(!payloads.is_empty(), "Must have at least one payload");
 
-        // Compute leaf hashes
+        // Compute leaf hashes with context per spec §6
         let mut leaf_hashes = Vec::with_capacity(NUM_LEAVES);
-        for payload in payloads {
+        for (shred_index, payload) in payloads.iter().enumerate() {
             assert_eq!(payload.len(), LEAF_PAYLOAD_SIZE, "Invalid payload size");
-            let hash = compute_leaf_hash(payload);
+            let hash = compute_leaf_hash_with_context(
+                slot,
+                proposer_index,
+                shred_index as u32,
+                payload,
+            );
             leaf_hashes.push(hash_to_witness(&hash));
         }
 
-        // Pad with zero-payload leaves if needed
+        // Pad with zero-payload leaves if needed (for non-spec-compliant usage)
         let zero_payload = [0u8; LEAF_PAYLOAD_SIZE];
-        let zero_leaf_hash = hash_to_witness(&compute_leaf_hash(&zero_payload));
         while leaf_hashes.len() < NUM_LEAVES {
+            let shred_index = leaf_hashes.len() as u32;
+            let zero_leaf_hash = hash_to_witness(&compute_leaf_hash_with_context(
+                slot,
+                proposer_index,
+                shred_index,
+                &zero_payload,
+            ));
             leaf_hashes.push(zero_leaf_hash);
         }
 
-        // Build the tree levels from bottom up
+        // Build the tree levels from bottom up using odd-node self-pairing
+        // Per spec §6: when a level has an odd number of nodes, the last node is paired with itself
         let mut levels = Vec::with_capacity(TREE_DEPTH);
         let mut current_level = leaf_hashes.clone();
 
-        for _ in 0..TREE_DEPTH {
-            let mut next_level = Vec::with_capacity(current_level.len() / 2);
-            for i in (0..current_level.len()).step_by(2) {
+        while current_level.len() > 1 {
+            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut i = 0;
+            while i < current_level.len() {
                 let left = &current_level[i];
-                let right = &current_level[i + 1];
+                // Per spec §6: odd node pairs with itself
+                let right = if i + 1 < current_level.len() {
+                    &current_level[i + 1]
+                } else {
+                    left // Last odd node pairs with itself
+                };
                 let node_hash = compute_node_hash(left, right);
                 next_level.push(hash_to_witness(&node_hash));
+                i += 2;
             }
             levels.push(current_level);
             current_level = next_level;
@@ -204,16 +261,19 @@ impl McpMerkleTree {
 
         // The root is the final hash
         assert_eq!(current_level.len(), 1);
-
-        // Compute full 32-byte commitment from the last level's two children
-        let last_level = levels.last().unwrap();
-        let root_hash = compute_node_hash(&last_level[0], &last_level[1]);
+        let commitment = Hash::from(current_level[0]);
 
         Self {
             leaf_hashes,
             levels,
-            commitment: root_hash,
+            commitment,
         }
+    }
+
+    /// Legacy from_payloads without context (for backward compatibility)
+    /// NOTE: This is NOT spec-compliant and should be replaced with from_payloads_with_context
+    pub fn from_payloads(payloads: &[&[u8]]) -> Self {
+        Self::from_payloads_with_context(0, 0, payloads)
     }
 
     /// Get the 32-byte commitment (root hash)
@@ -236,7 +296,13 @@ impl McpMerkleTree {
         for (depth, level) in self.levels.iter().enumerate() {
             // The sibling is at index ^ 1 (flip the last bit)
             let sibling_index = index ^ 1;
-            siblings[depth] = level[sibling_index];
+            // Per spec §6: when odd node count, last node pairs with itself
+            // If sibling_index is out of bounds, sibling is the node itself
+            siblings[depth] = if sibling_index < level.len() {
+                level[sibling_index]
+            } else {
+                level[index] // Self-pairing case
+            };
             index /= 2;
         }
 
@@ -386,15 +452,15 @@ mod tests {
 
     #[test]
     fn test_merkle_tree_full() {
-        // Build a full tree with all 256 leaves
+        // Build a full tree with all NUM_RELAYS (200) leaves
         let payloads: Vec<Vec<u8>> = (0..NUM_LEAVES).map(|i| make_test_payload(i as u8)).collect();
         let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
         let tree = McpMerkleTree::from_payloads(&payload_refs);
 
         let commitment = tree.commitment();
 
-        // Spot check some proofs
-        for i in [0usize, 1, 127, 128, 255] {
+        // Spot check some proofs including boundaries
+        for i in [0usize, 1, 99, 100, 199] {
             let proof = tree.get_proof(i as u8);
             assert!(proof.verify(&commitment, &payloads[i]), "Proof failed for index {}", i);
         }
