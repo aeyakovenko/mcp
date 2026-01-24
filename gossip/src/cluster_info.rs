@@ -2406,6 +2406,8 @@ pub struct Sockets {
     pub rpc_sts_client: UdpSocket,
     pub vortexor_receivers: Option<Vec<UdpSocket>>,
     pub alpenglow: UdpSocket,
+    /// Socket for receiving MCP relay attestations (for consensus leader)
+    pub mcp_attestation: UdpSocket,
 }
 
 pub struct NodeConfig {

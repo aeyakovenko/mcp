@@ -72,9 +72,14 @@ use {
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
-        sync::{atomic::AtomicBool, Arc, RwLock},
-        thread::{self, JoinHandle},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, RwLock,
+        },
+        thread::{self, Builder, JoinHandle},
+        time::Duration,
     },
+    log::debug,
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
@@ -102,6 +107,7 @@ pub struct Tvu {
     duplicate_shred_listener: DuplicateShredListener,
     alpenglow_sigverify_service: BLSSigverifyService,
     alpenglow_quic_t: thread::JoinHandle<()>,
+    mcp_attestation_thread: JoinHandle<()>,
 }
 
 // The maximum number of alpenglow packets that can be processed in a single batch
@@ -113,6 +119,7 @@ pub struct TvuSockets {
     pub retransmit: Vec<UdpSocket>,
     pub ancestor_hashes_requests: UdpSocket,
     pub alpenglow_quic: UdpSocket,
+    pub mcp_attestation: UdpSocket,
 }
 
 pub struct TvuConfig {
@@ -232,10 +239,40 @@ impl Tvu {
             retransmit: retransmit_sockets,
             ancestor_hashes_requests: ancestor_hashes_socket,
             alpenglow_quic: alpenglow_quic_socket,
+            mcp_attestation: mcp_attestation_socket,
         } = sockets;
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let (bls_packet_sender, bls_packet_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
+
+        // MCP attestation receiver channel and thread
+        let (mcp_attestation_sender, mcp_attestation_receiver) = unbounded();
+        let mcp_attestation_socket = Arc::new(mcp_attestation_socket);
+        let mcp_attestation_exit = exit.clone();
+        let mcp_attestation_thread = {
+            let socket = mcp_attestation_socket.clone();
+            let sender = mcp_attestation_sender;
+            let exit = mcp_attestation_exit;
+            Builder::new()
+                .name("solMcpAttest".to_string())
+                .spawn(move || {
+                    use solana_ledger::mcp_attestation::RelayAttestation;
+                    let mut buf = vec![0u8; 2048];
+                    socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
+                    while !exit.load(Ordering::Relaxed) {
+                        match socket.recv(&mut buf) {
+                            Ok(size) => {
+                                if let Ok(attestation) = RelayAttestation::deserialize(&mut &buf[..size]) {
+                                    let _ = sender.send(attestation);
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => debug!("MCP attestation recv error: {}", e),
+                        }
+                    }
+                })
+                .expect("Failed to spawn MCP attestation receiver thread")
+        };
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);
@@ -430,7 +467,7 @@ impl Tvu {
             popular_pruned_forks_receiver,
             consensus_message_receiver,
             votor_event_receiver,
-            mcp_attestation_receiver: None, // TODO: Wire attestation receiving socket
+            mcp_attestation_receiver: Some(mcp_attestation_receiver),
         };
 
         let replay_stage_config = ReplayStageConfig {
@@ -542,6 +579,7 @@ impl Tvu {
             duplicate_shred_listener,
             alpenglow_sigverify_service,
             alpenglow_quic_t,
+            mcp_attestation_thread,
         })
     }
 
@@ -567,6 +605,7 @@ impl Tvu {
         self.duplicate_shred_listener.join()?;
         self.alpenglow_sigverify_service.join()?;
         self.alpenglow_quic_t.join()?;
+        self.mcp_attestation_thread.join()?;
         Ok(())
     }
 }
