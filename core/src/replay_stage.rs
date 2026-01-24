@@ -980,6 +980,7 @@ impl ReplayStage {
                                         &bank_forks,
                                         &identity_keypair,
                                         &mcp_block_sender,
+                                        &cluster_info,
                                     );
                                     mcp_blocks_built.insert(slot);
                                 }
@@ -2914,6 +2915,7 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         identity_keypair: &Keypair,
         mcp_block_sender: &Option<Sender<McpBlockBroadcast>>,
+        cluster_info: &Arc<ClusterInfo>,
     ) {
         use crate::mcp_consensus_block::RelayEntryV1;
 
@@ -2994,6 +2996,25 @@ impl ReplayStage {
                         info!("MCP: Broadcast block for slot {} to network", slot);
                     }
                 }
+
+                // Push consensus block summary to gossip for fast metadata propagation
+                // This allows validators to quickly learn which proposers are included
+                let included_proposers_vec: Vec<u32> = included_proposers
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect();
+                cluster_info.push_mcp_consensus_block_summary(
+                    slot,
+                    leader_index,
+                    included_proposers_vec,
+                    block_id,
+                    consensus_block.leader_signature,
+                );
+                info!(
+                    "MCP: Pushed consensus block summary to gossip for slot {} ({} proposers)",
+                    slot,
+                    included_proposers.len()
+                );
             }
         }
     }

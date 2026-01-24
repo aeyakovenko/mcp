@@ -20,7 +20,7 @@
 
 ## Wiring / Integration Gaps (Agave)
 - ~~**Attestation receiving not wired**~~: **FIXED** - MCP attestation socket is now bound and wired through TVU to ReplayStage (`gossip/src/contact_info.rs`, `gossip/src/node.rs`, `core/src/tvu.rs`, `core/src/validator.rs`).
-- **ConsensusBlock broadcast is not implemented**: retransmit stage logs MCP blocks but does not send them to validators (`turbine/src/retransmit_stage.rs:686-693`).
+- ~~**ConsensusBlock broadcast is not implemented**~~: **FIXED** - Gossip-based distribution via McpConsensusBlockSummary (`gossip/src/crds_data.rs`, `gossip/src/cluster_info.rs`, `core/src/replay_stage.rs`). Turbine retransmit is supplementary.
 - **Relay index wiring is hardcoded**: window service initializes relay attestation with default relay_index (0), not the scheduled relay index (`core/src/window_service.rs:735-738`).
 - **Consensus block storage key does not align with consensus**: replay stores MCP consensus payloads under a locally hashed block_id placeholder, not the consensus block_id (`core/src/replay_stage.rs:2975-2980`).
 
