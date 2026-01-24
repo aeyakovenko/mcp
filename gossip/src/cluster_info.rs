@@ -18,7 +18,10 @@ use {
         cluster_info_metrics::{Counter, GossipStats, ScopedTimer, TimedGuard},
         contact_info::{self, ContactInfo, ContactInfoQuery, Error as ContactInfoError},
         crds::{Crds, Cursor, GossipRoute},
-        crds_data::{self, CrdsData, EpochSlotsIndex, LowestSlot, SnapshotHashes, Vote, MAX_VOTES},
+        crds_data::{
+            self, CrdsData, EpochSlotsIndex, LowestSlot, McpConsensusBlockSummary, SnapshotHashes,
+            Vote, MAX_VOTES,
+        },
         crds_filter::{should_retain_crds_value, GossipFilterDirection},
         crds_gossip::CrdsGossip,
         crds_gossip_error::CrdsGossipError,
@@ -761,6 +764,32 @@ impl ClusterInfo {
         };
         self.push_message(CrdsValue::new(
             CrdsData::RestartHeaviestFork(restart_heaviest_fork),
+            &self.keypair(),
+        ));
+    }
+
+    /// Push an MCP Consensus Block Summary to gossip for fast propagation.
+    ///
+    /// This allows validators to quickly learn which proposers are included
+    /// in a consensus block before receiving all the actual shred data.
+    pub fn push_mcp_consensus_block_summary(
+        &self,
+        slot: Slot,
+        leader_index: u32,
+        included_proposers: Vec<u32>,
+        block_hash: Hash,
+        leader_signature: [u8; 64],
+    ) {
+        let summary = McpConsensusBlockSummary::new(
+            self.id(),
+            slot,
+            leader_index,
+            included_proposers,
+            block_hash,
+            leader_signature,
+        );
+        self.push_message(CrdsValue::new(
+            CrdsData::McpConsensusBlockSummary(summary),
             &self.keypair(),
         ));
     }

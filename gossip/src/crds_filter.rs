@@ -45,7 +45,8 @@ pub(crate) fn should_retain_crds_value(
         CrdsData::DuplicateShred(_, _)
         | CrdsData::LowestSlot(0, _)
         | CrdsData::RestartHeaviestFork(_)
-        | CrdsData::RestartLastVotedForkSlots(_) => retain_if_staked(),
+        | CrdsData::RestartLastVotedForkSlots(_)
+        | CrdsData::McpConsensusBlockSummary(_) => retain_if_staked(),
         // Unstaked nodes can technically send EpochSlots, but we do not want them
         // eating gossip bandwidth
         CrdsData::EpochSlots(_, _) => match direction {

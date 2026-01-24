@@ -9,6 +9,7 @@ use {
     },
     rand::Rng,
     serde::de::{Deserialize, Deserializer},
+    serde_big_array::BigArray,
     solana_clock::Slot,
     solana_hash::Hash,
     solana_pubkey::{self, Pubkey},
@@ -62,6 +63,8 @@ pub enum CrdsData {
     ContactInfo(ContactInfo),
     RestartLastVotedForkSlots(RestartLastVotedForkSlots),
     RestartHeaviestFork(RestartHeaviestFork),
+    /// MCP Consensus Block Summary for fast propagation of block metadata
+    McpConsensusBlockSummary(McpConsensusBlockSummary),
 }
 
 impl Sanitize for CrdsData {
@@ -102,6 +105,7 @@ impl Sanitize for CrdsData {
             CrdsData::ContactInfo(node) => node.sanitize(),
             CrdsData::RestartLastVotedForkSlots(slots) => slots.sanitize(),
             CrdsData::RestartHeaviestFork(fork) => fork.sanitize(),
+            CrdsData::McpConsensusBlockSummary(summary) => summary.sanitize(),
         }
     }
 }
@@ -153,6 +157,7 @@ impl CrdsData {
             CrdsData::ContactInfo(node) => node.wallclock(),
             CrdsData::RestartLastVotedForkSlots(slots) => slots.wallclock,
             CrdsData::RestartHeaviestFork(fork) => fork.wallclock,
+            CrdsData::McpConsensusBlockSummary(summary) => summary.wallclock,
         }
     }
 
@@ -172,6 +177,7 @@ impl CrdsData {
             CrdsData::ContactInfo(node) => *node.pubkey(),
             CrdsData::RestartLastVotedForkSlots(slots) => slots.from,
             CrdsData::RestartHeaviestFork(fork) => fork.from,
+            CrdsData::McpConsensusBlockSummary(summary) => summary.from,
         }
     }
 
@@ -194,6 +200,7 @@ impl CrdsData {
             Self::ContactInfo(_) => false,
             Self::RestartLastVotedForkSlots(_) => false,
             Self::RestartHeaviestFork(_) => false,
+            Self::McpConsensusBlockSummary(_) => false,
         }
     }
 }
@@ -493,6 +500,62 @@ pub(crate) fn sanitize_wallclock(wallclock: u64) -> Result<(), SanitizeError> {
         Err(SanitizeError::ValueOutOfBounds)
     } else {
         Ok(())
+    }
+}
+
+/// MCP Consensus Block Summary for gossip propagation
+///
+/// This provides fast delivery of consensus block metadata (which proposers
+/// are included) while the actual shred data is distributed via turbine.
+/// Small enough (~200 bytes) to fit in a single gossip message.
+#[cfg_attr(feature = "frozen-abi", derive(AbiExample))]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct McpConsensusBlockSummary {
+    /// Leader who created this consensus block
+    pub from: Pubkey,
+    /// Timestamp when this was created
+    pub wallclock: u64,
+    /// Slot number
+    pub slot: Slot,
+    /// Leader index within the slot
+    pub leader_index: u32,
+    /// Which proposers are included in this consensus block
+    pub included_proposers: Vec<u32>,
+    /// Hash of the full consensus block for verification
+    pub block_hash: Hash,
+    /// Leader's signature over the consensus block
+    #[serde(with = "BigArray")]
+    pub leader_signature: [u8; 64],
+}
+
+impl McpConsensusBlockSummary {
+    pub fn new(
+        from: Pubkey,
+        slot: Slot,
+        leader_index: u32,
+        included_proposers: Vec<u32>,
+        block_hash: Hash,
+        leader_signature: [u8; 64],
+    ) -> Self {
+        Self {
+            from,
+            wallclock: timestamp(),
+            slot,
+            leader_index,
+            included_proposers,
+            block_hash,
+            leader_signature,
+        }
+    }
+}
+
+impl Sanitize for McpConsensusBlockSummary {
+    fn sanitize(&self) -> Result<(), SanitizeError> {
+        sanitize_wallclock(self.wallclock)?;
+        if self.slot >= MAX_SLOT {
+            return Err(SanitizeError::ValueOutOfBounds);
+        }
+        self.from.sanitize()
     }
 }
 

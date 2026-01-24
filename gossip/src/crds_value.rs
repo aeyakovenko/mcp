@@ -77,6 +77,7 @@ pub enum CrdsValueLabel {
     ContactInfo(Pubkey),
     RestartLastVotedForkSlots(Pubkey),
     RestartHeaviestFork(Pubkey),
+    McpConsensusBlockSummary(Pubkey),
 }
 
 impl CrdsValueLabel {
@@ -96,6 +97,7 @@ impl CrdsValueLabel {
             CrdsValueLabel::ContactInfo(pubkey) => *pubkey,
             CrdsValueLabel::RestartLastVotedForkSlots(p) => *p,
             CrdsValueLabel::RestartHeaviestFork(p) => *p,
+            CrdsValueLabel::McpConsensusBlockSummary(p) => *p,
         }
     }
 }
@@ -184,6 +186,9 @@ impl CrdsValue {
                 CrdsValueLabel::RestartLastVotedForkSlots(pubkey)
             }
             CrdsData::RestartHeaviestFork(_) => CrdsValueLabel::RestartHeaviestFork(pubkey),
+            CrdsData::McpConsensusBlockSummary(_) => {
+                CrdsValueLabel::McpConsensusBlockSummary(pubkey)
+            }
         }
     }
 
