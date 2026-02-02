@@ -17,7 +17,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 | Schedule generation algo | `stake_weighted_slot_leaders()` | YES | `leader_schedule.rs:72` — same ChaChaRng/WeightedIndex pattern, different seed |
 | Schedule cache pattern | `LeaderScheduleCache` | YES | `leader_schedule_cache.rs:30` — add parallel caches for proposer/relay |
 | Column trait | `Column` trait | YES | `column.rs:308` — 3-tuple index supported (`AlternateShredData` at `column.rs:742`) |
-| Blockstore struct pattern | `Blockstore` | YES | `blockstore.rs:252` — add `LedgerColumn` fields; register in `cf_descriptors()` at `blockstore_db.rs:176` |
+| Blockstore struct pattern | `Blockstore` | YES | `blockstore.rs:252` — add `LedgerColumn` fields; register in `cf_descriptors()` at `blockstore_db.rs:171` |
 | Window service `run_insert()` | `run_insert()` | YES | `window_service.rs:190` — partition MCP before Agave deserialization at line 220 |
 | Replay main loop | `ReplayStage` | YES | `replay_stage.rs:823` — add `mcp_attestation_receiver` to `ReplayReceivers` at line 330 |
 | confirm_slot pipeline | `confirm_slot()` | PARTIAL | `blockstore_processor.rs:1485` — reuse `process_entries()` for Phase B with fee bypass |
@@ -97,6 +97,7 @@ pub type McpMerkleProofEntry = [u8; 32];
 pub fn mcp_leaf_hash(slot: u64, proposer_index: u32, shred_index: u32, shred_data: &[u8]) -> Hash
 pub fn mcp_node_hash(left: &[u8; 32], right: &[u8; 32]) -> Hash
 pub fn mcp_merkle_tree(leaves: &[Hash]) -> Vec<Hash>   // returns flat array, root is last element
+// When a level has an odd number of nodes, the last node is paired with itself (spec section 6).
 pub fn mcp_merkle_proof(tree: &[Hash], num_leaves: usize, leaf_index: usize) -> Vec<McpMerkleProofEntry>
 pub fn mcp_verify_proof(leaf: Hash, index: usize, proof: &[McpMerkleProofEntry], expected_root: &Hash) -> bool
 ```
@@ -120,6 +121,8 @@ Functions:
 - `McpShred::to_bytes(&self) -> Vec<u8>` — serialize.
 - `McpShred::verify_signature(&self, proposer_pubkey) -> bool` — verify proposer_sig over commitment.
 - `McpShred::verify_witness(&self) -> bool` — compute leaf hash via `mcp_leaf_hash()` from `mcp_merkle.rs`, walk witness via `mcp_verify_proof()`, compare with commitment. Uses MCP-specific 32-byte proof entries and 1-byte prefixes (NOT Agave's `MERKLE_HASH_PREFIX_*`).
+
+All wire types MUST reject messages with unknown `version` values (spec section 7). Parsers check version == 1 at deserialization time.
 
 ### 1.5 Tests
 
@@ -193,7 +196,7 @@ Query methods mirroring `slot_leader_at()` at line 95:
 Follow the `AlternateShredData` pattern (`column.rs:742`) for 3-tuple index implementation.
 
 Additionally, register CFs in:
-- `blockstore_db.rs` `cf_descriptors()` at line 176: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
+- `blockstore_db.rs` `cf_descriptors()` at line 171: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
 - `blockstore_db.rs` `columns()` const array at line 252: add both CF names to the array and increment the array size.
 - `blockstore_purge.rs` `purge_range()` and `purge_files_in_range()`: add both CFs to the purge enumeration. **Missing this causes permanent data leaks** — old slots never cleaned from MCP CFs.
 
@@ -206,7 +209,7 @@ mcp_data_shred_cf: LedgerColumn<cf::McpShredData>,
 mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
 ```
 
-Initialize in `do_open()` method (around line 462) via `db.column()`, add to struct constructor.
+Initialize in `do_open()` method (around line 430) via `db.column()`, add to struct constructor.
 
 Add methods:
 - `put_mcp_data_shred(slot, proposer_index, shred_index, data) -> Result<()>`
@@ -233,7 +236,7 @@ Add methods:
    - Parse via `McpShred::from_bytes()`.
    - Look up proposer pubkey via `leader_schedule_cache.proposers_at_slot(slot)[proposer_index]` (requires Pass 2 schedule cache).
    - Verify `proposer_signature` (Ed25519 over commitment).
-   - Verify `witness` (Merkle proof via `mcp_verify_proof()` from `mcp_merkle.rs`).
+   - Verify `witness` (Merkle proof via `mcp_verify_proof()` using `shred_index` from the packet header as the leaf position, proving the shred belongs at that index in the committed Merkle tree).
    - Discard on any failure.
 4. Send both Agave-verified and MCP-verified packets into the same `verified_sender` channel.
 
@@ -271,6 +274,7 @@ MCP handling path:
 Add attestation state to `run_insert()` or a small helper struct:
 
 Per-slot `HashMap<u8, (Hash, Signature)>`: `proposer_index -> (commitment, proposer_sig)`.
+- **Relay self-check (spec section 3.3):** When this node is a relay, only accept shreds where `shred_index` matches this node's relay index (`relay_index_at_slot(slot, &my_pubkey)`). The spec requires "the witness verifies against the commitment for the relay's own index." Non-relay validators accept any valid shred_index.
 - If a proposer sends conflicting commitments -> mark equivocation, do not attest (spec section 3.3).
 - At most one entry per proposer per slot.
 
@@ -319,6 +323,7 @@ Fix: After a relay receives and verifies MCP shreds from a proposer:
 - MCP shreds stored via window_service path (partition before deserialization).
 - Relay attests to valid single-commitment proposers.
 - Relay does not attest to equivocating proposer.
+- Relay only attests to shreds where shred_index matches own relay index.
 - One attestation per slot enforced.
 - Attestation serialized size fits QUIC (no PACKET_DATA_SIZE limit).
 - Retransmit path sends to all validators.
@@ -451,7 +456,7 @@ Validators that see a gossip summary but lack the full ConsensusBlock send a req
 
 1. Verify leader_signature, leader_index matches Leader[s].
 2. Verify delayed_bankhash against local bank hash.
-3. Verify every relay_signature and proposer_signature in aggregate.
+3. Verify every relay_signature and proposer_signature in aggregate. **Per spec section 3.5:** ignore individual relay entries that fail signature verification — do not reject the entire block. Keep valid relay entries and discard invalid ones, then proceed with the valid set.
 4. Compute implied proposers:
    - 2+ distinct commitments -> equivocating -> exclude.
    - 1 commitment with >=80 relay attestations (INCLUSION_THRESHOLD) -> include.
@@ -472,9 +477,9 @@ For each included proposer:
 2. Two-phase execution via new `confirm_slot_mcp()` in `ledger/src/blockstore_processor.rs`:
 
 **Phase A (fees):** Pre-process fee deduction directly on the Bank, BEFORE entering the standard execution pipeline. For each transaction in order:
-- Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8).
+- Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8). For nonce transactions, payer must cover `fee * NUM_PROPOSERS + minimum_rent` per spec section 8.
 - Directly debit fee payer accounts on the Bank via `bank.withdraw()` or equivalent.
-- Track per-slot cumulative per-payer fees to prevent over-commitment.
+- Track per-slot cumulative per-payer fees to prevent over-commitment across proposer batches.
 - Collect the list of fee-valid transactions for Phase B.
 
 This avoids threading a flag through 12 layers of execution (process_entries -> process_batches -> ... -> validate_fee_payer).
@@ -494,9 +499,7 @@ This requires 3 changes:
 
 ### 7.4 Vote
 
-```
-tower.record_vote(slot, block_id)   // existing path at consensus.rs:717 — unchanged
-```
+Existing consensus voting path — unchanged. MCP does not modify vote wire format or voting logic. The spec section 7.6 Vote format defines `block_hash = block_id` from the ConsensusBlock; the underlying consensus protocol (Alpenglow/Tower) handles the vote mechanism.
 
 ### 7.5 Empty slot
 
