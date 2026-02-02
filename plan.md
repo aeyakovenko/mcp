@@ -19,7 +19,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 | Column trait | `Column` trait | YES | `column.rs:308` — 3-tuple index supported (`AlternateShredData` at `column.rs:742`) |
 | Blockstore struct pattern | `Blockstore` | YES | `blockstore.rs:252` — add `LedgerColumn` fields; register in `cf_descriptors()` at `blockstore_db.rs:171` |
 | Window service `run_insert()` | `run_insert()` | YES | `window_service.rs:190` — partition MCP before Agave deserialization at line 220 |
-| Replay main loop | `ReplayStage` | YES | `replay_stage.rs:823` — add `mcp_attestation_receiver` to `ReplayReceivers` at line 330 |
+| Replay main loop | `ReplayStage` | YES | `replay_stage.rs:823` — add `mcp_attestation_receiver` + `mcp_consensus_block_receiver` to `ReplayReceivers` at line 330 |
 | confirm_slot pipeline | `confirm_slot()` | PARTIAL | `blockstore_processor.rs:1485` — reuse `process_entries()` for Phase B with fee bypass |
 | validate_fee_payer | `validate_fee_payer()` | PARTIAL | `account_loader.rs:370` — receives pre-calculated `fee: u64`; bypass by zeroing fee at calculation layer |
 | Voting path | `Tower::record_vote()` | YES | `consensus.rs:717` — unchanged |
@@ -70,6 +70,9 @@ INCLUSION_THRESHOLD    = 0.40  -> ceil =  80 relays
 RECONSTRUCTION_THRESHOLD = 0.20 -> ceil = 40 relays (= DATA_SHREDS)
 MAX_PROPOSER_PAYLOAD = DATA_SHREDS * SHRED_DATA_BYTES  // 40 * 863 = 34,520 bytes per proposer
                                                         // only data shreds carry payload; coding shreds are parity
+// NOTE: Spec section 3.2 states "MUST NOT exceed NUM_RELAYS * SHRED_DATA_BYTES" (172,600).
+// That bound is a loose upper bound; with RS(40,160), only 40 data shreds carry payload.
+// The actual capacity is 34,520. The spec bound is always satisfied. Spec clarification filed.
 ```
 
 Types (all with serialize/deserialize/sign/verify):
@@ -190,8 +193,8 @@ Query methods mirroring `slot_leader_at()` at line 95:
 
 `ledger/src/blockstore/column.rs` — add new column types after existing definitions:
 
-- `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`.
-- `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`.
+- `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`. Wire format uses `u32` for `proposer_index`; `McpShred::from_bytes()` MUST validate `proposer_index < NUM_PROPOSERS` (16) before casting to `u8` for storage. Reject shreds with out-of-range values.
+- `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`. Wire format uses `u32` for `relay_index`; MUST validate `relay_index < NUM_RELAYS` (200) before casting to `u16` for storage.
 
 Follow the `AlternateShredData` pattern (`column.rs:742`) for 3-tuple index implementation.
 
@@ -294,19 +297,21 @@ At relay deadline for slot s:
 Fix: Use QUIC for attestation transport. Reuse the existing `alpenglow_quic` socket infrastructure (`tvu.rs:110-116`, QUIC server spawned at lines 260-273 via `spawn_server()` for BLS traffic).
 
 `gossip/src/contact_info.rs` — add new socket tag:
-- Define `SOCKET_TAG_MCP_ATTESTATION: u8 = 14` after `SOCKET_TAG_ALPENGLOW = 13` at line 47.
-- Update `SOCKET_CACHE_SIZE` from 14 to 15.
+- Define `SOCKET_TAG_MCP_ATTESTATION: u8 = 14` and `SOCKET_TAG_MCP_CONSENSUS: u8 = 15` after `SOCKET_TAG_ALPENGLOW = 13` at line 47.
+- Update `SOCKET_CACHE_SIZE` from 14 to 16.
 - Add getter/setter/remover macros (follow `alpenglow()` pattern at lines 273-317).
 - Update `test_round_trip()` assertions.
 
-`gossip/src/node.rs` — bind the MCP attestation socket:
-- Bind in port range (follow alpenglow pattern at line 256-258).
-- Publish in ContactInfo via setter.
+`gossip/src/node.rs` — bind the MCP attestation and consensus sockets:
+- Bind both sockets in port range (follow alpenglow pattern at line 256-258).
+- Publish in ContactInfo via setters.
 - Add to `Sockets` struct in `gossip/src/cluster_info.rs` (lines 2371-2409).
 
-`core/src/tvu.rs` — add MCP attestation QUIC endpoint alongside existing alpenglow_quic setup:
-- Spawn a "solMcpAttest" receiver thread that accepts QUIC connections, deserializes `RelayAttestation` messages, and sends them to replay_stage via a new channel.
+`core/src/tvu.rs` — add MCP QUIC endpoints alongside existing alpenglow_quic setup:
+- Spawn a "solMcpAttest" receiver thread that accepts QUIC connections, deserializes `RelayAttestation` messages, and sends them to replay_stage via `mcp_attestation_receiver` channel.
+- Spawn a "solMcpConsensus" receiver thread that accepts QUIC connections, deserializes `ConsensusBlock` messages, and sends them to replay_stage via `mcp_consensus_block_receiver` channel.
 - Attestation sender (relay side in 4.2) connects to Leader[s]'s MCP attestation QUIC endpoint to send `RelayAttestation`.
+- ConsensusBlock sender (leader side in 6.4) connects to each validator's MCP consensus QUIC endpoint to send `ConsensusBlock`.
 
 ### 4.4 MCP shred retransmit
 
@@ -399,7 +404,9 @@ No bank, no PoH — this is bankless per spec section 9.
 
 ### 6.1 Receive attestations
 
-MCP attestation packets arrive via the "solMcpAttest" QUIC thread from Pass 4.3. Add `mcp_attestation_receiver` to `ReplayReceivers` at `replay_stage.rs:330`.
+MCP attestation packets arrive via the "solMcpAttest" QUIC thread from Pass 4.3. MCP consensus blocks arrive via the "solMcpConsensus" QUIC thread from Pass 4.3. Add both to `ReplayReceivers` at `replay_stage.rs:330`:
+- `mcp_attestation_receiver: Receiver<RelayAttestation>`
+- `mcp_consensus_block_receiver: Receiver<ConsensusBlock>`
 
 ### 6.2 Verify and aggregate
 
@@ -421,7 +428,7 @@ When this node is Leader[s] and aggregation deadline is reached:
 ### 6.4 ConsensusBlock distribution
 
 **Primary mechanism: direct broadcast via QUIC.**
-Leader broadcasts the full `ConsensusBlock` to all validators via their TVU QUIC endpoints. ConsensusBlocks can be large (aggregate with 120+ relay entries), so QUIC is required to avoid UDP size limits.
+Leader broadcasts the full `ConsensusBlock` to all validators via the "solMcpConsensus" QUIC endpoint (set up in Pass 4.3). Validators receive it through `mcp_consensus_block_receiver` in `ReplayReceivers`. ConsensusBlocks can be large (aggregate with 120+ relay entries), so QUIC is required to avoid UDP size limits.
 
 **Fallback: gossip summary.**
 Add `McpConsensusBlockSummary` to gossip. This requires changes across the gossip stack:
@@ -540,20 +547,21 @@ Consensus outputs empty result -> freeze bank with no transactions.
 | `core/src/window_service.rs` | Partition at raw Payload bytes (line 213 handle_shred closure) BEFORE Agave deserialization at line 220; MCP storage + tracking; Rayon-safe attestation collection |
 | `core/src/ed25519_sigverifier.rs` | Add `mcp_proposer_sender` to `TransactionSigVerifier`; clone in `send_packets()` at line 56 |
 | `core/src/forwarding_stage.rs` | Route transactions to proposers instead of leader when MCP active; add `LeaderScheduleCache` access for `proposers_at_slot()` |
-| `gossip/src/contact_info.rs` | `SOCKET_TAG_MCP_ATTESTATION = 14`, bump cache size to 15, getter/setter/remover macros |
-| `gossip/src/node.rs` | Bind MCP attestation socket, publish in ContactInfo, add to Sockets |
-| `gossip/src/cluster_info.rs` | Add MCP attestation socket to `Sockets` struct |
+| `gossip/src/contact_info.rs` | `SOCKET_TAG_MCP_ATTESTATION = 14`, `SOCKET_TAG_MCP_CONSENSUS = 15`, bump cache size to 16, getter/setter/remover macros |
+| `gossip/src/node.rs` | Bind MCP attestation + consensus sockets, publish in ContactInfo, add to Sockets |
+| `gossip/src/cluster_info.rs` | Add MCP attestation + consensus sockets to `Sockets` struct |
 | `gossip/src/crds_data.rs` | `McpConsensusBlockSummary` variant + Sanitize/wallclock/pubkey/is_deprecated |
 | `gossip/src/crds_value.rs` | `CrdsValueLabel` variant + pubkey/label match arms |
 | `gossip/src/crds.rs` | Ordinal tracking, increment `CrdsCountsArray` |
 | `gossip/src/crds_filter.rs` | Retention policy for MCP summary |
-| `core/src/tvu.rs` | MCP attestation QUIC endpoint + "solMcpAttest" thread + channel to replay |
+| `core/src/tvu.rs` | MCP QUIC endpoints: "solMcpAttest" thread (attestations) + "solMcpConsensus" thread (ConsensusBlocks) + channels to replay |
 | `core/src/tpu.rs` | MCP proposer channel creation + proposer loop thread |
 | `core/src/banking_stage/qos_service.rs` | CU limits / NUM_PROPOSERS |
-| `core/src/replay_stage.rs` | Attestation aggregation, ConsensusBlock building, direct QUIC broadcast, vote gate, reconstruction dispatch |
+| `core/src/replay_stage.rs` | `mcp_attestation_receiver` + `mcp_consensus_block_receiver` in ReplayReceivers; attestation aggregation, ConsensusBlock building, direct QUIC broadcast, vote gate, reconstruction dispatch |
 | `ledger/src/blockstore_processor.rs` | `confirm_slot_mcp()` with two-phase fee execution (Phase A direct debit + Phase B with zero_fees_for_test) |
 | `runtime/src/bank/check_transactions.rs` | Check `skip_fee_deduction` flag, pass `zero_fees_for_test: true` to `calculate_fee_details()` |
 | `svm/src/transaction_processor.rs` | Add `skip_fee_deduction: bool` to `TransactionProcessingEnvironment` |
+| `validator/src/commands/run/execute.rs` | Wire MCP attestation + consensus sockets from `Node` through to `TvuSockets` / `Tvu::new()` |
 
 ## Dependency Graph
 
