@@ -1,71 +1,103 @@
-MCP plan.md review (Pass 3, Principal Engineer)
+MCP plan.md review (Source‑of‑Truth)
 
-Correction to prior reviews
-- The user clarified: **there should be no MCP source files yet**. Any references to existing MCP modules (e.g., `core/src/mcp_*.rs`, `ledger/src/mcp_*.rs`, `ledger/src/shred/mcp_shred.rs`, MCP column families, MCP sockets) are invalid for this repo state and must be removed from the plan.
+Scope
+- Re‑reviewed /home/anatoly/mcp/plan.md against the current tree.
+- Current repo has **no MCP source files**. This review defines the correct, minimal, in‑place MCP implementation plan.
 
-Required plan.md reset (ground truth for ICs)
-- Treat MCP as **not implemented**. The plan must describe **new in‑place changes** to existing Agave pipelines with **minimal new code**, and it must be consistent with the constraint “no MCP source files yet.”
-- The plan must not reference or depend on MCP modules or MCP column families that don’t exist.
+Top‑level verdict
+- plan.md is **not** a correct source of truth for this repo state. It assumes MCP files and infrastructure that do not exist and omits the required minimal, in‑place integration path.
+- The corrected plan below is the authoritative, unambiguous implementation path for ICs.
 
-Minimum‑change, in‑place implementation plan (no existing MCP code assumed)
+Corrected MCP implementation plan (minimal change, in‑place)
 
-A) Feature gate + constants (smallest new surface)
-- Add MCP feature gate in `feature-set/src/lib.rs`.
-- Introduce a single new file `ledger/src/mcp.rs` to hold:
-  - constants (NUM_PROPOSERS, NUM_RELAYS, thresholds, SHRED_DATA_BYTES)
-  - MCP wire types (RelayAttestation, AggregateAttestation, ConsensusBlock)
-  - MCP payload serialization helpers
-  - MCP reconstruction helpers (RS decode + commitment verify)
+0) Non‑negotiable constraints
+- Reuse existing TPU/TVU pipelines, sigverify, window_service, blockstore, replay_stage, and execution paths.
+- No new stages; only add small, targeted modules where no equivalent exists.
+- All MCP paths must be gated by `feature_set::mcp_protocol_v1::id()`.
 
-B) MCP shred wire format (new file, not ShredVariant)
-- Add `ledger/src/shred/mcp_shred.rs` implementing MCP shred wire format per spec §7.2.
-- Do **not** modify existing `ShredVariant` or repurpose `ShredCommonHeader` fields.
-- Keep MCP shreds as a parallel wire format to avoid breaking existing shred logic.
+1) Feature gate (single source)
+- `feature-set/src/lib.rs`:
+  - Add `pub mod mcp_protocol_v1 { declare_id!("..."); }`.
+  - Add to `FEATURE_NAMES` map.
 
-C) Sigverify integration (in‑place)
-- Extend `turbine/src/sigverify_shreds.rs` to:
-  - detect MCP shreds by size or header
-  - validate proposer signature and Merkle witness
-  - discard invalid MCP shreds using the existing packet pipeline
+2) MCP constants + wire types (new, minimal)
+- Add `ledger/src/mcp.rs` containing:
+  - Constants: NUM_PROPOSERS, NUM_RELAYS, thresholds, SHRED_DATA_BYTES.
+  - `McpPayload` serialization (§3.1).
+  - `RelayAttestation`, `AggregateAttestation`, `ConsensusBlock` wire types (§7.3–§7.5).
+  - Reconstruction helper (RS decode + commitment verify) (§3.6).
 
-D) Window service + storage (in‑place)
-- Add MCP handling to `core/src/window_service.rs::run_insert()`:
-  - parse MCP shreds
-  - store MCP shreds in MCP‑specific column families
-  - track per‑slot/proposer availability
-  - trigger relay attestations at relay deadline
-- Add MCP column families in `ledger/src/blockstore/column.rs` and `ledger/src/blockstore.rs`:
-  - MCP shreds keyed by (slot, proposer_index, shred_index)
-  - Relay attestations keyed by (slot, relay_index)
-  - Consensus payload keyed by (slot, block_hash)
-  - Execution output keyed by (slot, block_hash)
+3) MCP shred wire format (new, minimal)
+- Add `ledger/src/shred/mcp_shred.rs`:
+  - Implements MCP shred bytes as per §7.2.
+  - Parse/serialize, verify signature and Merkle witness.
+- Do **not** modify existing `ShredVariant` or `ShredCommonHeader`.
 
-E) Schedules (in‑place)
-- Extend leader schedule generation for domain‑separated proposer/relay schedules in `ledger/src/leader_schedule.rs`.
-- Add proposer/relay schedule getters in `ledger/src/leader_schedule_cache.rs` and `ledger/src/leader_schedule_utils.rs`.
+4) Sigverify integration (in‑place)
+- Extend `turbine/src/sigverify_shreds.rs` to detect MCP shreds by size/header:
+  - If MCP shred: verify proposer signature and Merkle witness; discard on failure.
+  - Keep existing shred pipeline intact.
 
-F) Proposer pipeline (TPU‑side, bankless)
-- Tap sig‑verified packets in `core/src/ed25519_sigverifier.rs`.
-- In `core/src/tpu.rs`, for proposer slots:
-  - order txs by ordering_fee
-  - build MCP payload
-  - RS encode + merkle commit
-  - unicast one shred per relay to existing TVU sockets
+5) Storage (in‑place, MCP CFs)
+- `ledger/src/blockstore/column.rs`:
+  - Add MCP column families:
+    - MCP shreds keyed by (slot, proposer_index, shred_index).
+    - Relay attestations keyed by (slot, relay_index).
+    - Consensus payload keyed by (slot, block_hash).
+    - Execution output keyed by (slot, block_hash).
+- `ledger/src/blockstore.rs`:
+  - Add put/get APIs for MCP columns.
 
-G) Relay attestations + leader aggregation (replay stage)
-- Add relay attestation builder (new small module or inline in window_service).
-- Add attestation aggregation + ConsensusBlock building in `core/src/replay_stage.rs`.
-- Reuse existing TVU sockets; add MCP attestation socket only if absolutely required.
+6) Window service (in‑place)
+- `core/src/window_service.rs::run_insert()`:
+  - Parse MCP shreds.
+  - Store them in MCP CFs.
+  - Track per‑slot/proposer availability.
+  - Record for relay attestation when valid.
 
-H) Vote gate + reconstruction + execution
-- In `core/src/replay_stage.rs`, gate votes on MCP availability and thresholds.
-- Add MCP reconstruction → ordered tx list in `ledger/src/blockstore_processor.rs` before `confirm_slot_entries()`.
-- Implement two‑phase fee processing in existing execution path (Phase A fees, Phase B execute without re‑charging).
+7) Schedules (in‑place)
+- `ledger/src/leader_schedule.rs`:
+  - Add domain‑separated schedule generation for proposers and relays.
+- `ledger/src/leader_schedule_cache.rs` + `ledger/src/leader_schedule_utils.rs`:
+  - Add proposer/relay schedule getters and index lookup.
 
-Unambiguous missing work (IC checklist)
-- Add MCP wire type file(s): `ledger/src/mcp.rs` and `ledger/src/shred/mcp_shred.rs`.
-- Extend sigverify, window_service, blockstore, leader schedule cache, replay stage, and execution path with MCP logic as described.
-- Keep changes in‑place and minimal; avoid new stages and new protocols.
+8) Proposer pipeline (TPU‑side, bankless)
+- `core/src/ed25519_sigverifier.rs`:
+  - Add optional MCP clone sender from sig‑verified packets if node is proposer for slot.
+- `core/src/tpu.rs`:
+  - Consume MCP packets, sort by ordering_fee, build `McpPayload`, RS encode, compute Merkle commitment.
+  - Unicast one shred per relay via existing TVU sockets.
 
-Net assessment
-- plan.md must be rewritten to remove references to non‑existent MCP source files and reflect the minimal in‑place integration described above.
+9) Relay attestations + leader aggregation (replay_stage)
+- Add a small relay attestation helper (new module or inline in window_service) to:
+  - Track proposer commitments per slot.
+  - Enforce equivocation rule (if conflicting commitments, do not attest).
+  - Produce exactly one RelayAttestation per slot.
+- `core/src/replay_stage.rs`:
+  - Collect relay attestations, validate signatures, aggregate into AggregateAttestation.
+  - Enforce relay threshold (ATTESTATION_THRESHOLD * NUM_RELAYS).
+  - Build ConsensusBlock and broadcast through existing paths.
+
+10) Voting gate + reconstruction + execution (in‑place)
+- `core/src/replay_stage.rs`:
+  - Gate votes on: leader signature, delayed_bankhash, relay/proposer sigs, inclusion thresholds, and local reconstruction availability.
+- `ledger/src/blockstore_processor.rs`:
+  - Add an MCP execution path before `confirm_slot_entries()` that accepts ordered txs from MCP reconstruction.
+  - Ensure deterministic ordering: proposer_index order, then ordering_fee desc, tie by position.
+- Two‑phase fees:
+  - Phase A: deduct fees for all valid txs (even if execution fails).
+  - Phase B: execute without re‑charging fees.
+  - Implement as a flag in existing execution path, not a new pipeline.
+
+11) Tests (minimum necessary)
+- MCP shred parsing/verification unit tests.
+- MCP RS reconstruction correctness test.
+- End‑to‑end: proposer→relay→leader→vote gating on a small local cluster.
+
+Why plan.md is not correct
+- It assumes MCP files/infrastructure exist when they do not.
+- It proposes reuse of base shred CFs, which is incorrect because MCP shreds must be keyed by proposer.
+- It routes proposer logic via block creation (banked path) rather than TPU (bankless requirement).
+
+Final note
+- If you want plan.md to be the authoritative source, it must be rewritten to match this corrected plan verbatim.
