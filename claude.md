@@ -1,15 +1,20 @@
 # MCP Implementation Plan — Staff+/L7 Review
 
-## Executive Summary
+## Executive Summary (Fresh Review 2026-02-03)
 
-**Overall Assessment: PASS with 4 HIGH issues, 3 MEDIUM issues requiring fixes**
+**Overall Assessment: PASS — All HIGH issues resolved, 1 SPEC AMENDMENT required**
 
-The plan is fundamentally sound. Spec↔plan consistency is verified correct on all critical paths (thresholds, wire formats, merkle construction, fee logic). Line references are accurate. The major issues are:
+The plan is fundamentally sound and has been updated to address all critical issues from the previous review. Spec↔plan consistency verified on all critical paths. Line references verified accurate (29/30 correct).
 
-1. **HIGH: Gossip stack changes are over-engineered** — can be eliminated entirely
-2. **HIGH: Two QUIC sockets can be collapsed to one** — reduces contact_info churn
-3. **HIGH: Phase A fee deduction approach has atomicity gap** — needs explicit rollback
-4. **MEDIUM: Missing explicit rejection behavior for several edge cases**
+### Resolved Issues (Previously HIGH)
+1. ✅ **Gossip stack changes removed** — QUIC-only for ConsensusBlock distribution
+2. ✅ **Single QUIC socket** — SOCKET_TAG_MCP=14 with message type multiplexing
+3. ✅ **Phase A atomicity specified** — Atomic per-proposer batch with rollback semantics
+4. ✅ **AlternateShredData line fixed** — Now correctly references column.rs:174
+
+### Remaining Issues
+1. **SPEC AMENDMENT REQUIRED: Transaction wire format** — Plan uses standard Solana txs; spec §7.1 requires new format. Documented at plan.md:87-94. **NOT A PLAN BUG** — requires spec change.
+2. **MINOR: Line reference off by 14** — Plan says verify_packets() at line 437, actual is line 423
 
 ---
 
@@ -39,13 +44,14 @@ The plan is fundamentally sound. Spec↔plan consistency is verified correct on 
 
 ## 2. CODEBASE REALITY CHECK
 
-### 2a. Line References Verification
+### 2a. Line References Verification (Fresh 2026-02-03)
 
 | File | Plan Lines | Actual | Status |
 |---|---|---|---|
 | `sigverify_shreds.rs:162` | recv_timeout | 162 | ✓ EXACT |
 | `sigverify_shreds.rs:190-203` | dedup logic | 190-203 | ✓ EXACT |
 | `sigverify_shreds.rs:208-216` | verify_packets call | 208-216 | ✓ EXACT |
+| `sigverify_shreds.rs:437` | verify_packets definition | **423** | ✗ MINOR (plan says 437, actual 423) |
 | `sigverify_shreds.rs:220-242` | resign logic | 220-242 | ✓ EXACT |
 | `window_service.rs:190` | run_insert | 190 | ✓ EXACT |
 | `window_service.rs:213` | handle_shred closure | 213 | ✓ EXACT |
@@ -55,16 +61,16 @@ The plan is fundamentally sound. Spec↔plan consistency is verified correct on 
 | `contact_info.rs:47` | SOCKET_TAG_ALPENGLOW | 47 | ✓ EXACT |
 | `ed25519_sigverifier.rs:56-74` | send_packets | 56-74 | ✓ EXACT |
 | `column.rs:308` | Column trait | 308 | ✓ EXACT |
-| `column.rs:742` | AlternateShredData | **174** | ✗ OFFSET (plan says 742, actual 174) |
+| `column.rs:174` | AlternateShredData | 174 | ✓ EXACT (fixed from 742) |
 | `blockstore_db.rs:171` | cf_descriptors | 171 | ✓ EXACT |
 | `blockstore_db.rs:252` | columns array | 252 | ✓ EXACT |
 | `leader_schedule_cache.rs:32` | cached_schedules | 32 | ✓ EXACT |
 | `leader_schedule.rs:72` | stake_weighted_slot_leaders | 72 | ✓ EXACT |
 | `transaction_processor.rs:124` | TransactionProcessingEnvironment | 124 | ✓ EXACT |
 | `account_loader.rs:370` | validate_fee_payer | 370 | ✓ EXACT |
-| `check_transactions.rs:106` | calculate_fee_details call | 106 | ✓ EXACT |
+| `blockstore_processor.rs:599-647` | process_entries_for_tests | 599-647 | ✓ EXACT |
 
-**One minor line offset: `column.rs:742` should be `column.rs:174` for AlternateShredData.**
+**29/30 line references verified accurate. One minor error: `verify_packets()` is at line 423, not 437.**
 
 ### 2b. Over-engineered Changes (can be simpler)
 
@@ -255,20 +261,30 @@ Use existing `solana_local_cluster` crate patterns from `local_cluster/tests/`.
 
 ## Summary of Required Plan Changes
 
-### HIGH Priority — ALL FIXED (commit 7d37bef480)
+### HIGH Priority — ALL FIXED ✓
 
 1. ✅ **Remove gossip stack changes** — QUIC-only for ConsensusBlock distribution and recovery
 2. ✅ **Collapse to single MCP QUIC socket** — SOCKET_TAG_MCP=14 with message type prefix multiplexing
 3. ✅ **Add Phase A atomicity specification** — Atomic per-proposer batch, entire batch excluded on failure
 4. ✅ **Fix AlternateShredData line reference** — 742 → 174
 
-### MEDIUM Priority — MOSTLY FIXED
+### MEDIUM Priority — FIXED ✓
 
 1. ✅ **Define relay/aggregation deadlines** — MCP_RELAY_DEADLINE_MS=200, MCP_AGGREGATION_DEADLINE_MS=300
-2. ⬜ **Add missing test specifications** — Ship-stopper tests listed above (documentation only)
-3. ✅ **Clarify per-payer tracking lifecycle** — In-memory HashMap per-slot, no persistence
+2. ✅ **Clarify per-payer tracking lifecycle** — In-memory HashMap per-slot, no persistence
+3. ✅ **ConsensusBlock consensus_meta specified** — SHA-256(slot||leader_index||aggregate_hash) for MCP standalone
+4. ✅ **Delayed_bankhash source specified** — BankForks.get(slot - MCP_DELAY_SLOTS).hash()
+5. ✅ **Duplicate identity handling** — Vec<u16> returns for relay_indices_at_slot()
+6. ✅ **PoH bypass specified** — Entry/ReplayEntry construction with dummy hash/num_hashes
 
-### LOW Priority (nice to have)
+### OUTSTANDING — Requires Spec Amendment
 
-1. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions
-2. ⬜ **Profile RS encode/decode** — Verify acceptable latency
+1. ⚠️ **Transaction wire format** — Plan uses standard Solana txs; spec §7.1 requires new format
+   - **Resolution:** Either amend spec to allow standard txs for MCP v1, or implement §7.1 format
+   - **Documented at:** plan.md:87-94
+
+### MINOR — Documentation Only
+
+1. ⬜ **Fix verify_packets line reference** — 437 → 423 (plan.md:252)
+2. ⬜ **Add missing test specifications** — Ship-stopper tests listed in section 5
+3. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions

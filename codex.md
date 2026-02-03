@@ -1,52 +1,37 @@
-MCP plan review — Pass 10 (after Staff+/L7 review fixes)
+MCP plan review — executive summary with evidence (fresh read 2026-02-03)
 
-## All HIGH/CRITICAL Issues: ADDRESSED
+## Status: 3/4 Critical Issues RESOLVED
 
-### From claude.md:
+### Issue 1: Transaction wire format mismatch — SPEC AMENDMENT REQUIRED
+- **Status:** DOCUMENTED, requires spec amendment (NOT a plan bug)
+- Plan explicitly uses standard Solana transactions inside McpPayload and documents this at `plan.md:87-94`.
+- Spec requires McpPayload to carry the MCP Transaction message defined in 7.1 (`docs/src/proposals/mcp-protocol-spec.md:280-303`).
+- **Resolution:** Plan correctly documents this as "SPEC AMENDMENT REQUIREMENT" with three options: (a) spec allows standard txs for v1, (b) implement 7.1 format, (c) version negotiation.
 
-**H1: Gossip stack changes over-engineered** — FIXED
-- Removed McpConsensusBlockSummary from CrdsData (4 gossip files no longer modified)
-- Using QUIC peer-to-peer request/response for missed block recovery
-- Modified Files section updated to remove crds_data.rs, crds_value.rs, crds.rs, crds_filter.rs
+### Issue 2: ConsensusBlock contents not implementable — RESOLVED ✓
+- **Status:** FIXED in plan.md:458-461
+- Plan now defines:
+  - `consensus_meta`: "contains a single 32-byte block_id computed as SHA-256(slot || leader_index || aggregate_hash)"
+  - `delayed_bankhash`: "MCP_DELAY_SLOTS: u64 = 32... leader fetches frozen bank hash for slot - MCP_DELAY_SLOTS via BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())"
+  - Warmup handling: "If the delayed slot is not yet frozen, use Hash::default() and validators accept it during warmup period"
 
-**H2: Two QUIC sockets collapsed to one** — FIXED
-- Changed from SOCKET_TAG_MCP_ATTESTATION + SOCKET_TAG_MCP_CONSENSUS to single SOCKET_TAG_MCP = 14
-- Added message type multiplexing with 1-byte prefix (0x01-0x04)
-- SOCKET_CACHE_SIZE bump from 14 to 15 (not 16)
+### Issue 3: Duplicate identity handling incomplete — RESOLVED ✓
+- **Status:** FIXED in plan.md:189-193 and 300-301
+- Plan now explicitly handles:
+  - `relay_indices_at_slot()` returns `Vec<u16>` for ALL indices where pubkey appears
+  - "A validator appearing N times in Relays[s] acts as N separate relays, each with its own index"
+  - Relay self-check: "For each relay index I own, only accept shreds with shred_index == I"
 
-**H3: Phase A fee atomicity gap** — FIXED
-- Added explicit atomicity specification: "atomically per-proposer batch using write-batch"
-- Added failure handling: "entire proposer's batch is excluded" on any fee deduction failure
-- Added per-payer tracking lifecycle: "in-memory HashMap<Pubkey, u64> for slot duration only"
+### Issue 4: Replay/PoH integration underspecified — RESOLVED ✓
+- **Status:** FIXED in plan.md:519-545
+- Plan now specifies exact call path:
+  - Entry construction: `Entry { num_hashes: 0, hash: Hash::default(), transactions: txs }`
+  - ReplayEntry construction: `entry::verify_transactions(&entries, skip_verification=false, ...)`
+  - PoH bypass: "PoH verification is skipped by NOT calling entries.start_verify() or verify_ticks()"
+  - Signature verification preserved via `skip_verification=false`
 
-**H4: AlternateShredData line reference** — FIXED
-- Changed column.rs:742 to column.rs:174 (two locations)
+## Line Reference Verification (2026-02-03)
 
-### From codex.md (prior Critical issues):
-
-**1. Transaction wire format** — Already addressed with SPEC AMENDMENT REQUIREMENT
-
-**2. ConsensusBlock fields** — Already addressed with MCP_DELAY_SLOTS=32 and concrete consensus_meta definition
-
-**3. Duplicate identity handling** — Already addressed (relay_indices_at_slot returns Vec<u16>, downstream code handles multiple indices)
-
-**4. Replay/PoH integration under-specified** — FIXED
-- Added explicit Entry construction code snippet
-- Added ReplayEntry construction explanation
-- Added execution path code snippet
-- Clarified that entry::verify_transactions() does signature verification independent of PoH
-
-### MEDIUM issues also fixed:
-
-**Relay/aggregation deadlines** — FIXED
-- Added MCP_RELAY_DEADLINE_MS = 200
-- Added MCP_AGGREGATION_DEADLINE_MS = 300
-- Referenced in both §4.2 and §6.3
-
----
-
-## Summary
-
-Modified files reduced from 28 to 24 (gossip stack untouched).
-All HIGH/CRITICAL issues from both review documents addressed.
-Plan ready for implementation pending spec amendment for transaction wire format.
+All critical line references verified against current Agave codebase:
+- 29/30 exact matches
+- 1 minor offset: `verify_packets()` at line 423, not 437 (plan.md:252)

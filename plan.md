@@ -249,7 +249,7 @@ Add methods:
 
 1. **Dedup (lines 190-203):** Calls `shred::wire::get_shred()` at line 196 which checks `ShredVariant` at byte offset 64. MCP shreds fail this check — they are not deduped but also not discarded (they pass through since `get_shred()` returns `None` and the filter logic means they survive). However, they then hit:
 
-2. **GPU verify (lines 208-216 calling `verify_packets()` at line 437):** Calls `get_slot_leaders()` which extracts slot from hardcoded offset 65 via `shred::layout::get_slot()`. MCP shreds with slot at offset 0 will extract garbage slot values, look up wrong leaders, and be marked as discard. **This silently drops MCP shreds.**
+2. **GPU verify (lines 208-216 calling `verify_packets()` at line 423):** Calls `get_slot_leaders()` which extracts slot from hardcoded offset 65 via `shred::layout::get_slot()`. MCP shreds with slot at offset 0 will extract garbage slot values, look up wrong leaders, and be marked as discard. **This silently drops MCP shreds.**
 
 3. **Resign (lines 220-242):** Calls `get_shred()` at line 325 and `is_retransmitter_signed_variant()` at line 326, both requiring Agave variant byte at offset 64. MCP shreds fail and are discarded.
 
