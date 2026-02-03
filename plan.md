@@ -6,7 +6,14 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 - Reuse existing TPU/TVU pipelines, sigverify, window_service, blockstore, replay_stage, and execution paths.
 - No new stages. Only add small, targeted modules where no equivalent exists.
-- All MCP paths gated by `feature_set::mcp_protocol_v1::id()`.
+- All MCP paths gated by `feature_set::mcp_protocol_v1::id()`. Concrete gate locations:
+  - `sigverify_shreds.rs`: check before MCP partition at line 162
+  - `window_service.rs`: check in handle_shred closure before MCP branch
+  - `tvu.rs`: conditionally spawn MCP QUIC threads
+  - `tpu.rs`: conditionally create MCP proposer channel and thread
+  - `forwarding_stage.rs`: check before routing to proposers
+  - `replay_stage.rs`: check before MCP attestation/consensus processing
+  - `qos_service.rs`: check before dividing CU limits
 - Do NOT modify `ShredVariant`, `ShredCommonHeader`, or existing shred pipeline types.
 - MCP shreds use their own wire format and dedicated column families, separate from Agave shreds.
 
@@ -76,7 +83,7 @@ MAX_PROPOSER_PAYLOAD = DATA_SHREDS * SHRED_DATA_BYTES  // 40 * 863 = 34,520 byte
 ```
 
 Types (all with serialize/deserialize/sign/verify):
-- `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). Each `tx_bytes` is a **standard Solana wire-format transaction** (not the MCP spec section 7.1 format; see section 5.3 note). Trailing zero padding ignored.
+- `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). Each `tx_bytes` is a **standard Solana wire-format transaction** (not the MCP spec section 7.1 format). **Spec deviation note:** Spec section 7.1 defines a new Transaction format with TransactionConfigMask. This plan implements MCP v1 with standard Solana transactions for backward compatibility — no client SDK changes required. The spec's Transaction format (ordering_fee, inclusion_fee, target_proposer fields) is deferred to MCP v2. This deviation is acceptable because: (a) ordering_fee is derived from compute_unit_price, (b) inclusion_fee and target_proposer are optional optimizations, (c) all consensus-critical behavior is preserved. Trailing zero padding ignored.
 - `RelayAttestation` — version:1 + slot:8 + relay_index:4 + entries_len:1 + entries[proposer_index:4 + commitment:32 + proposer_sig:64] + relay_sig:64 (section 7.3).
 - `AggregateAttestation` — version:1 + slot:8 + leader_index:4 + relays_len:2 + relay_entries sorted by relay_index (section 7.4).
 - `ConsensusBlock` — version:1 + slot:8 + leader_index:4 + aggregate_len:4 + aggregate + consensus_meta_len:4 + consensus_meta + delayed_bankhash:32 + leader_sig:64 (section 7.5).
@@ -153,6 +160,8 @@ fn stake_weighted_slot_schedule(keyed_stakes, epoch, len, domain: &[u8]) -> Vec<
 
 Same algorithm (sort, WeightedIndex, ChaChaRng) but seed = `SHA-256(domain || epoch.to_le_bytes())`, `repeat = 1`. Domains: `b"mcp:proposer"`, `b"mcp:relay"` (spec section 5).
 
+**Vote-keyed vs identity-keyed stake selection:** MCP schedules MUST use the same feature-gated stake selection as leader schedules (`leader_schedule_utils.rs:12-33`). When `enable_vote_address_leader_schedule` feature is active, use `bank.epoch_vote_accounts(epoch)` (vote-keyed). Otherwise, use `bank.epoch_staked_nodes(epoch)` (identity-keyed). The `mcp_proposer_schedule()` and `mcp_relay_schedule()` functions must check `bank.should_use_vote_keyed_leader_schedule(epoch)` and branch accordingly, passing the appropriate `keyed_stakes` to `stake_weighted_slot_schedule()`.
+
 Per spec section 5: `Proposers[s]` = sliding window of 16 entries at slot index within epoch with wrap. `Relays[s]` = sliding window of 200 entries with wrap.
 
 ### 2.2 Schedule cache
@@ -167,8 +176,10 @@ cached_relay_schedules:    RwLock<(HashMap<Epoch, Arc<Vec<Pubkey>>>, VecDeque<Ep
 Query methods mirroring `slot_leader_at()` at line 95:
 - `proposers_at_slot(slot, bank) -> Option<Vec<Pubkey>>` — returns 16-element window.
 - `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` — returns 200-element window.
-- `proposer_index_at_slot(slot, pubkey, bank) -> Option<u8>` — lookup by identity.
-- `relay_index_at_slot(slot, pubkey, bank) -> Option<u16>` — lookup by identity.
+- `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u8>` — lookup by identity. Returns ALL indices where this pubkey appears (spec section 5 allows duplicates). Empty vec if not a proposer.
+- `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u16>` — lookup by identity. Returns ALL indices where this pubkey appears. Empty vec if not a relay.
+
+**Duplicate identity handling (spec section 5):** "Proposers[s] and Relays[s] MAY contain duplicate identities." A validator appearing N times in Relays[s] acts as N separate relays, each with its own index. Each index receives one shred from proposers, stores it, and attests independently. The `relay_indices_at_slot()` function returns all such indices.
 
 ### 2.3 Schedule utils
 
@@ -422,7 +433,9 @@ When this node is Leader[s] and aggregation deadline is reached:
 
 1. If relay count < 120 (ATTESTATION_THRESHOLD) -> submit empty result (spec section 3.4).
 2. Build AggregateAttestation with relay entries sorted by relay_index.
-3. Construct ConsensusBlock with aggregate + consensus_meta + delayed_bankhash.
+3. Construct ConsensusBlock with aggregate + consensus_meta + delayed_bankhash:
+   - **`consensus_meta`**: Opaque payload defined by Alpenglow (spec section 7.5: "opaque payload defined by the consensus protocol"). MCP passes this through from Alpenglow without interpretation. Contains `block_id` per underlying ledger rules.
+   - **`delayed_bankhash`**: Bank hash for the "delayed slot" defined by Alpenglow (spec section 3.5). The leader fetches the frozen bank hash for `slot - DELAY_SLOTS` (where `DELAY_SLOTS` is an Alpenglow consensus parameter) via `bank_hash_cache`. Validators verify this matches their local bank hash for the same delayed slot.
 4. Sign the ConsensusBlock.
 
 ### 6.4 ConsensusBlock distribution
@@ -440,7 +453,11 @@ Add `McpConsensusBlockSummary` to gossip. This requires changes across the gossi
 The summary contains: slot, leader_index, block_hash, relay_count (compact, fits gossip). Validators that miss the direct broadcast can detect via gossip that a ConsensusBlock exists.
 
 **Missed block recovery:**
-Validators that see a gossip summary but lack the full ConsensusBlock send a request to the leader (or any peer that has it) via the existing repair socket infrastructure. The response is the serialized ConsensusBlock sent via QUIC.
+Validators that see a gossip summary but lack the full ConsensusBlock request it via the "solMcpConsensus" QUIC endpoint:
+- Add new message type `McpConsensusBlockRequest { slot: u64 }` to the MCP wire protocol (section 1.2).
+- The "solMcpConsensus" thread handles both `ConsensusBlock` messages (unsolicited broadcasts) and `McpConsensusBlockRequest` messages (solicited requests).
+- On receiving a request, respond with the cached `ConsensusBlock` for that slot if available, or an empty response if not.
+- Validators retry requests to multiple peers (via ClusterInfo) if the leader doesn't respond.
 
 ### 6.5 Tests
 
@@ -481,7 +498,15 @@ For each included proposer:
 ### 7.3 Order and execute
 
 1. `order_transactions()` from `ledger/src/mcp.rs` — concat by proposer_index ascending, sort by ordering_fee desc (where ordering_fee = compute_unit_price), ties by position.
-2. Two-phase execution via new `confirm_slot_mcp()` in `ledger/src/blockstore_processor.rs`:
+2. Two-phase execution via new `confirm_slot_mcp()` in `ledger/src/blockstore_processor.rs`.
+
+**PoH bypass:** MCP has no PoH chain. The production `confirm_slot_entries` path verifies PoH via `entries.start_verify()` and tick counts via `verify_ticks()`. MCP cannot use this path. Instead, `confirm_slot_mcp()` follows the `process_entries_for_tests` pattern (`blockstore_processor.rs:599-647`):
+- Call `entry::verify_transactions()` directly to verify transaction signatures and produce `ReplayEntry` objects with `EntryType::Transactions`.
+- Skip PoH hash verification entirely (no `entries.start_verify()` call).
+- Skip tick verification (no `verify_ticks()` call, MCP has no ticks).
+- Pass the resulting `ReplayEntry` vec directly to `process_entries()`.
+
+This requires `confirm_slot_mcp()` to construct synthetic Entry objects with dummy `hash` and `num_hashes` fields (these are ignored since PoH verification is skipped). The only verification performed is transaction signature verification.
 
 **Phase A (fees):** Pre-process fee deduction directly on the Bank, BEFORE entering the standard execution pipeline. For each transaction in order:
 - Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8). For nonce transactions, payer must cover `fee * NUM_PROPOSERS + minimum_rent` per spec section 8.
