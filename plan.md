@@ -77,13 +77,23 @@ INCLUSION_THRESHOLD    = 0.40  -> ceil =  80 relays
 RECONSTRUCTION_THRESHOLD = 0.20 -> ceil = 40 relays (= DATA_SHREDS)
 MAX_PROPOSER_PAYLOAD = DATA_SHREDS * SHRED_DATA_BYTES  // 40 * 863 = 34,520 bytes per proposer
                                                         // only data shreds carry payload; coding shreds are parity
+MCP_DELAY_SLOTS = 32      // consensus parameter for delayed_bankhash verification
+                          // matches typical optimistic confirmation latency (~12.8 seconds)
 // NOTE: Spec section 3.2 states "MUST NOT exceed NUM_RELAYS * SHRED_DATA_BYTES" (172,600).
 // That bound is a loose upper bound; with RS(40,160), only 40 data shreds carry payload.
 // The actual capacity is 34,520. The spec bound is always satisfied. Spec clarification filed.
 ```
 
+**SPEC AMENDMENT REQUIREMENT — Transaction Wire Format:**
+Spec section 3.1 requires "each transaction bytes value is a Transaction message as defined in Section 7.1." Section 7.1 defines a NEW format: VersionByte + LegacyHeader + TransactionConfigMask(u32) + LifetimeSpecifier([u8;32]) + ... with explicit ordering_fee/inclusion_fee/target_proposer fields in ConfigValues. This is NOT the standard Solana wire format. Implementing section 7.1 requires:
+- New SDK transaction builder APIs
+- Client wallet changes to produce section 7.1 format
+- Backward-incompatible wire format change
+
+**This plan uses standard Solana transactions pending a formal spec amendment.** The spec must be amended to either: (a) allow standard Solana transactions for MCP v1 bootstrapping with section 7.1 deferred to MCP v2, or (b) define a version negotiation mechanism. Until the amendment is approved, this implementation is spec-non-compliant on transaction format.
+
 Types (all with serialize/deserialize/sign/verify):
-- `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). Each `tx_bytes` is a **standard Solana wire-format transaction** (not the MCP spec section 7.1 format). **Spec deviation note:** Spec section 7.1 defines a new Transaction format with TransactionConfigMask. This plan implements MCP v1 with standard Solana transactions for backward compatibility — no client SDK changes required. The spec's Transaction format (ordering_fee, inclusion_fee, target_proposer fields) is deferred to MCP v2. This deviation is acceptable because: (a) ordering_fee is derived from compute_unit_price, (b) inclusion_fee and target_proposer are optional optimizations, (c) all consensus-critical behavior is preserved. Trailing zero padding ignored.
+- `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). **PENDING SPEC AMENDMENT:** Each `tx_bytes` is a standard Solana wire-format transaction. See SPEC AMENDMENT REQUIREMENT above. ordering_fee is derived from compute_unit_price. Trailing zero padding ignored.
 - `RelayAttestation` — version:1 + slot:8 + relay_index:4 + entries_len:1 + entries[proposer_index:4 + commitment:32 + proposer_sig:64] + relay_sig:64 (section 7.3).
 - `AggregateAttestation` — version:1 + slot:8 + leader_index:4 + relays_len:2 + relay_entries sorted by relay_index (section 7.4).
 - `ConsensusBlock` — version:1 + slot:8 + leader_index:4 + aggregate_len:4 + aggregate + consensus_meta_len:4 + consensus_meta + delayed_bankhash:32 + leader_sig:64 (section 7.5).
@@ -378,7 +388,7 @@ When `mcp_protocol_v1` active and `leader_schedule_cache.proposers_at_slot(slot)
 1. Receive cloned packets from 5.2.
 2. Deserialize each transaction and extract ordering_fee via `process_compute_budget_instructions()` from `compute-budget-instruction/src/instructions_processor.rs:13`. This reuses the same extraction logic as BankingStage's `ImmutableDeserializedPacket` (`core/src/banking_stage/immutable_deserialized_packet.rs:61-96`).
 
-   **MCP transaction format note:** Spec section 7.1 defines a new Transaction wire format with `TransactionConfigMask` and explicit `ordering_fee` field. For initial implementation, McpPayload carries **standard Solana wire-format transactions** (not spec section 7.1 format). The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`. The spec section 7.1 MCP transaction format is a future extension requiring client SDK changes and is not required for protocol correctness — `ordering_fee` only affects transaction ordering, not consensus safety.
+   **MCP transaction format note (PENDING SPEC AMENDMENT):** See SPEC AMENDMENT REQUIREMENT in section 1.2. McpPayload carries standard Solana wire-format transactions. The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`.
 
 3. Sort by ordering_fee descending, ties by position.
 4. Serialize to `McpPayload` (max `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes). Only 40 data shreds carry payload; the remaining 160 are RS parity.
@@ -434,8 +444,8 @@ When this node is Leader[s] and aggregation deadline is reached:
 1. If relay count < 120 (ATTESTATION_THRESHOLD) -> submit empty result (spec section 3.4).
 2. Build AggregateAttestation with relay entries sorted by relay_index.
 3. Construct ConsensusBlock with aggregate + consensus_meta + delayed_bankhash:
-   - **`consensus_meta`**: Opaque payload defined by Alpenglow (spec section 7.5: "opaque payload defined by the consensus protocol"). MCP passes this through from Alpenglow without interpretation. Contains `block_id` per underlying ledger rules.
-   - **`delayed_bankhash`**: Bank hash for the "delayed slot" defined by Alpenglow (spec section 3.5). The leader fetches the frozen bank hash for `slot - DELAY_SLOTS` (where `DELAY_SLOTS` is an Alpenglow consensus parameter) via `bank_hash_cache`. Validators verify this matches their local bank hash for the same delayed slot.
+   - **`consensus_meta`**: Per spec section 3.4: "The leader MUST compute the block commitment used as block_id according to the underlying ledger rules, and MUST include that commitment in consensus_meta." For MCP standalone (before Alpenglow integration): consensus_meta contains a single 32-byte `block_id` computed as `SHA-256(slot || leader_index || aggregate_hash)` where aggregate_hash is the hash of the serialized AggregateAttestation. After Alpenglow integration, consensus_meta becomes opaque pass-through from Alpenglow containing additional consensus metadata.
+   - **`delayed_bankhash`**: Per spec section 3.5: "verify delayed_bankhash against the local bank hash for the delayed slot defined by the consensus protocol." Define constant `MCP_DELAY_SLOTS: u64 = 32` (consistent with typical optimistic confirmation latency). The leader fetches the frozen bank hash for `slot - MCP_DELAY_SLOTS` via `Bank::hash()` on the frozen bank at that slot (accessible via `BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())`). Validators verify this matches their locally computed bank hash for the same delayed slot. If the delayed slot is not yet frozen (e.g., at genesis or after restart), use Hash::default() and validators accept it during the warmup period.
 4. Sign the ConsensusBlock.
 
 ### 6.4 ConsensusBlock distribution
@@ -479,7 +489,7 @@ Validators that see a gossip summary but lack the full ConsensusBlock request it
 `core/src/replay_stage.rs` — on receiving ConsensusBlock for slot s (spec section 3.5):
 
 1. Verify leader_signature, leader_index matches Leader[s].
-2. Verify delayed_bankhash against local bank hash.
+2. Verify delayed_bankhash against local bank hash for `slot - MCP_DELAY_SLOTS` via `BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())`. Accept Hash::default() during warmup period (first MCP_DELAY_SLOTS slots after genesis or restart).
 3. Verify every relay_signature and proposer_signature in aggregate. **Per spec section 3.5:** ignore individual relay entries that fail signature verification — do not reject the entire block. Keep valid relay entries and discard invalid ones, then proceed with the valid set.
 4. Compute implied proposers:
    - 2+ distinct commitments -> equivocating -> exclude.
@@ -493,7 +503,7 @@ For each included proposer:
 
 1. Gather >=40 MCP shreds from blockstore via `get_mcp_data_shreds_for_proposer()`.
 2. `reconstruct_batch()` from `ledger/src/mcp.rs` — RS decode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` (NOT `ReedSolomonCache` — it is `pub(crate)`). Re-encode, recompute commitment via `mcp_merkle_tree()`. Discard if mismatch (spec section 3.6).
-3. Parse `McpPayload` -> transactions (standard Solana wire-format).
+3. Parse `McpPayload` -> transactions (standard Solana wire-format, see SPEC AMENDMENT REQUIREMENT in section 1.2).
 
 ### 7.3 Order and execute
 
