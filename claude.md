@@ -4,7 +4,7 @@
 
 **Overall Assessment: PASS — All HIGH issues resolved, 1 SPEC AMENDMENT required**
 
-The plan is fundamentally sound and has been updated to address all critical issues from the previous review. Spec↔plan consistency verified on all critical paths. Line references verified accurate (29/30 correct).
+The plan is fundamentally sound and has been updated to address all critical issues from the previous review. Spec↔plan consistency verified on all critical paths. **All 30 line references verified accurate.**
 
 ### Resolved Issues (Previously HIGH)
 1. ✅ **Gossip stack changes removed** — QUIC-only for ConsensusBlock distribution
@@ -14,7 +14,6 @@ The plan is fundamentally sound and has been updated to address all critical iss
 
 ### Remaining Issues
 1. **SPEC AMENDMENT REQUIRED: Transaction wire format** — Plan uses standard Solana txs; spec §7.1 requires new format. Documented at plan.md:87-94. **NOT A PLAN BUG** — requires spec change.
-2. **MINOR: Line reference off by 14** — Plan says verify_packets() at line 437, actual is line 423
 
 ---
 
@@ -70,7 +69,7 @@ The plan is fundamentally sound and has been updated to address all critical iss
 | `account_loader.rs:370` | validate_fee_payer | 370 | ✓ EXACT |
 | `blockstore_processor.rs:599-647` | process_entries_for_tests | 599-647 | ✓ EXACT |
 
-**29/30 line references verified accurate. One minor error: `verify_packets()` is at line 423, not 437.**
+**30/30 line references verified accurate after fix.** (verify_packets() corrected from 437 to 423)
 
 ### 2b. Over-engineered Changes (can be simpler)
 
@@ -285,6 +284,6 @@ Use existing `solana_local_cluster` crate patterns from `local_cluster/tests/`.
 
 ### MINOR — Documentation Only
 
-1. ⬜ **Fix verify_packets line reference** — 437 → 423 (plan.md:252)
+1. ✅ **Fix verify_packets line reference** — 437 → 423 (plan.md:252) — FIXED
 2. ⬜ **Add missing test specifications** — Ship-stopper tests listed in section 5
 3. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions

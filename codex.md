@@ -33,5 +33,5 @@ MCP plan review — executive summary with evidence (fresh read 2026-02-03)
 ## Line Reference Verification (2026-02-03)
 
 All critical line references verified against current Agave codebase:
-- 29/30 exact matches
-- 1 minor offset: `verify_packets()` at line 423, not 437 (plan.md:252)
+- **30/30 exact matches** after fix
+- ✅ `verify_packets()` line reference corrected from 437 to 423 (plan.md:252)
