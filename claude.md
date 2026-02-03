@@ -14,6 +14,7 @@ The plan is fundamentally sound and has been updated to address all critical iss
 
 ### Remaining Issues
 1. **SPEC AMENDMENT REQUIRED: Transaction wire format** — Plan uses standard Solana txs; spec §7.1 requires new format. Documented at plan.md:87-94. **NOT A PLAN BUG** — requires spec change.
+2. **SPEC CLARIFICATION: MCP_DELAY_SLOTS** — Plan defines `MCP_DELAY_SLOTS = 32` (plan.md:80-81); spec says "defined by the consensus protocol" (spec:187-190). MCP is part of consensus, so this is valid but spec wording is ambiguous. **LOW PRIORITY** — clarify in spec.
 
 ---
 
