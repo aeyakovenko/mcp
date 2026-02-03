@@ -1,24 +1,30 @@
-MCP plan review — evidence-backed deltas (fresh read)
+MCP plan review — Pass 9 (final verification)
 
-Critical mismatches (plan ↔ spec) with evidence — **ALL ADDRESSED**
+## Critical/High Issues: NONE REMAINING
 
-1) Transaction wire format — **ADDRESSED (requires spec amendment)**
-- Issue: Spec section 3.1 requires section 7.1 Transaction format (TransactionConfigMask, ordering_fee, etc.)
-- Fix: Plan now contains explicit "SPEC AMENDMENT REQUIREMENT" section (plan.md:85-95) documenting that standard Solana transactions are used pending a formal spec amendment. The plan no longer claims this deviation is "acceptable" — it clearly states the implementation is spec-non-compliant until the spec is amended.
-- Status: Implementation proceeds with standard Solana txs, but spec amendment is tracked as blocking for full compliance.
+All issues from prior passes have been addressed:
 
-2) ConsensusBlock contents (consensus_meta + delayed_bankhash) — **ADDRESSED**
-- Issue: consensus_meta and delayed_bankhash had no concrete implementation, just vague "passed through from Alpenglow."
-- Fix:
-  - consensus_meta now defined (plan.md:448-449): For MCP standalone, contains 32-byte block_id = SHA-256(slot || leader_index || aggregate_hash). After Alpenglow integration, becomes opaque pass-through.
-  - delayed_bankhash now defined (plan.md:450-451): MCP_DELAY_SLOTS = 32 constant added (plan.md:79-80). Leader fetches via BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash()). Hash::default() accepted during warmup period.
-- Status: Concrete, implementable definitions provided.
+### Pass 8 fixes (commit e0ae74e91b):
+1. Transaction wire format: Added explicit "SPEC AMENDMENT REQUIREMENT" section
+2. ConsensusBlock contents: Defined MCP_DELAY_SLOTS=32, concrete consensus_meta and delayed_bankhash implementations
+3. Removed "spec deviation acceptable" language
 
-3) Plan no longer claims spec deviation is acceptable — **ADDRESSED**
-- Issue: Plan said "deviation is acceptable because..." which is not the plan's authority to decide.
-- Fix: Language changed to "SPEC AMENDMENT REQUIREMENT" (plan.md:85-95) and "PENDING SPEC AMENDMENT" annotations throughout. The plan clearly documents that spec amendment is needed, not that the deviation is acceptable.
-- Status: Proper framing — spec amendment required, not plan author's judgment call.
+### Pass 9 fixes (commit fd7f8b8400):
+1. Fixed relay_indices_at_slot naming inconsistency (singular vs plural)
+2. Clarified column family patterns for McpShredData (3-tuple) vs McpRelayAttestation (2-tuple)
 
----
+## Verified Non-Issues (raised in Pass 9 but determined to be false positives):
 
-No remaining Critical or High issues. Medium/Low items from prior passes remain documented in git history.
+- **Relay/Proposer index storage types**: Plan correctly documents validation before narrowing cast (u32->u16, u32->u8). These ranges fit (NUM_RELAYS=200, NUM_PROPOSERS=16).
+- **Merkle tree odd-level handling**: Already documented at line 110.
+- **Merkle truncation**: Already documented that Agave truncates to 20 bytes, MCP uses 32-byte entries.
+- **skip_fee_deduction field**: Plan explicitly documents adding this to TransactionProcessingEnvironment; that's the intended modification.
+- **Leader index verification**: Already documented at line 490 ("Verify leader_signature, leader_index matches Leader[s]").
+
+## Outstanding Spec Amendment Requirement:
+
+The plan uses standard Solana wire-format transactions instead of spec section 7.1 format. This is documented as "SPEC AMENDMENT REQUIREMENT" and is pending formal spec amendment approval. Until amended, the implementation is spec-non-compliant on transaction format only.
+
+## Conclusion:
+
+No remaining Critical or High issues. Plan is ready for implementation pending spec amendment for transaction wire format.
