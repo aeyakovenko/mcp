@@ -1,37 +1,21 @@
-MCP plan review — executive summary with evidence (fresh read 2026-02-03)
+MCP plan review — executive summary with evidence (fresh read)
 
-## Status: 3/4 Critical Issues RESOLVED
+Critical issues that must change (with evidence)
 
-### Issue 1: Transaction wire format mismatch — SPEC AMENDMENT REQUIRED
-- **Status:** DOCUMENTED, requires spec amendment (NOT a plan bug)
-- Plan explicitly uses standard Solana transactions inside McpPayload and documents this at `plan.md:87-94`.
-- Spec requires McpPayload to carry the MCP Transaction message defined in 7.1 (`docs/src/proposals/mcp-protocol-spec.md:280-303`).
-- **Resolution:** Plan correctly documents this as "SPEC AMENDMENT REQUIREMENT" with three options: (a) spec allows standard txs for v1, (b) implement 7.1 format, (c) version negotiation.
+1) Transaction wire format mismatch (spec non‑compliance)
+- Plan acknowledges it uses standard Solana txs and requires a spec amendment for MCP v1 (`plan.md:85-99`).
+- Spec mandates that McpPayload carries the MCP Transaction message defined in 7.1 (`docs/src/proposals/mcp-protocol-spec.md:123-128`, `docs/src/proposals/mcp-protocol-spec.md:280-303`).
+- Correction: either implement spec 7.1 now or update the spec to allow standard Solana txs for MCP v1 (and gate consensus acceptance accordingly).
 
-### Issue 2: ConsensusBlock contents not implementable — RESOLVED ✓
-- **Status:** FIXED in plan.md:458-461
-- Plan now defines:
-  - `consensus_meta`: "contains a single 32-byte block_id computed as SHA-256(slot || leader_index || aggregate_hash)"
-  - `delayed_bankhash`: "MCP_DELAY_SLOTS: u64 = 32... leader fetches frozen bank hash for slot - MCP_DELAY_SLOTS via BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())"
-  - Warmup handling: "If the delayed slot is not yet frozen, use Hash::default() and validators accept it during warmup period"
+2) Delayed bankhash parameterization conflicts with spec
+- Plan introduces `MCP_DELAY_SLOTS = 32` as an MCP constant (`plan.md:67-83`).
+- Spec says the delayed slot is defined by the consensus protocol, not by MCP parameters (`docs/src/proposals/mcp-protocol-spec.md:187-190`).
+- Code reality: there is no `DELAY_SLOTS` constant in the repo (`rg "DELAY_SLOTS" -S .` only hits `plan.md`).
+- Correction: derive delayed slot via existing consensus config (or define a consensus‑layer constant), do not introduce a new MCP parameter without spec change.
 
-### Issue 3: Duplicate identity handling incomplete — RESOLVED ✓
-- **Status:** FIXED in plan.md:189-193 and 300-301
-- Plan now explicitly handles:
-  - `relay_indices_at_slot()` returns `Vec<u16>` for ALL indices where pubkey appears
-  - "A validator appearing N times in Relays[s] acts as N separate relays, each with its own index"
-  - Relay self-check: "For each relay index I own, only accept shreds with shred_index == I"
+High issues that must change (with evidence)
 
-### Issue 4: Replay/PoH integration underspecified — RESOLVED ✓
-- **Status:** FIXED in plan.md:519-545
-- Plan now specifies exact call path:
-  - Entry construction: `Entry { num_hashes: 0, hash: Hash::default(), transactions: txs }`
-  - ReplayEntry construction: `entry::verify_transactions(&entries, skip_verification=false, ...)`
-  - PoH bypass: "PoH verification is skipped by NOT calling entries.start_verify() or verify_ticks()"
-  - Signature verification preserved via `skip_verification=false`
-
-## Line Reference Verification (2026-02-03)
-
-All critical line references verified against current Agave codebase:
-- **30/30 exact matches** after fix
-- ✅ `verify_packets()` line reference corrected from 437 to 423 (plan.md:252)
+3) Line references are incorrect in plan (causes mis-implementation)
+- Plan cites `AlternateShredData` at `column.rs:174` (`plan.md:33`).
+- Actual location is around `ledger/src/blockstore/column.rs:742` (`ledger/src/blockstore/column.rs:742-772`).
+- Correction: update plan line references to current code locations to avoid mis-wiring.

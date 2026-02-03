@@ -1,10 +1,10 @@
 # MCP Implementation Plan — Staff+/L7 Review
 
-## Executive Summary (Fresh Review 2026-02-03)
+## Executive Summary (Fresh Review 2026-02-03, Updated)
 
 **Overall Assessment: PASS — All HIGH issues resolved, 1 SPEC AMENDMENT required**
 
-The plan is fundamentally sound and has been updated to address all critical issues from the previous review. Spec↔plan consistency verified on all critical paths. **All 30 line references verified accurate.**
+The plan is fundamentally sound and has been updated to address all critical issues from the previous review. Spec↔plan consistency verified on all critical paths. **All 31 line references now verified accurate** after fixing SlotColumn 318→353.
 
 ### Resolved Issues (Previously HIGH)
 1. ✅ **Gossip stack changes removed** — QUIC-only for ConsensusBlock distribution
@@ -60,6 +60,7 @@ The plan is fundamentally sound and has been updated to address all critical iss
 | `contact_info.rs:47` | SOCKET_TAG_ALPENGLOW | 47 | ✓ EXACT |
 | `ed25519_sigverifier.rs:56-74` | send_packets | 56-74 | ✓ EXACT |
 | `column.rs:308` | Column trait | 308 | ✓ EXACT |
+| `column.rs:353` | SlotColumn trait | 353 | ✓ EXACT (fixed from 318) |
 | `column.rs:174` | AlternateShredData | 174 | ✓ EXACT (fixed from 742) |
 | `blockstore_db.rs:171` | cf_descriptors | 171 | ✓ EXACT |
 | `blockstore_db.rs:252` | columns array | 252 | ✓ EXACT |
@@ -69,7 +70,7 @@ The plan is fundamentally sound and has been updated to address all critical iss
 | `account_loader.rs:370` | validate_fee_payer | 370 | ✓ EXACT |
 | `blockstore_processor.rs:599-647` | process_entries_for_tests | 599-647 | ✓ EXACT |
 
-**30/30 line references verified accurate after fix.** (verify_packets() corrected from 437 to 423)
+**31/31 line references verified accurate after fixes.** (verify_packets() 437→423, SlotColumn 318→353)
 
 ### 2b. Over-engineered Changes (can be simpler)
 
@@ -285,5 +286,6 @@ Use existing `solana_local_cluster` crate patterns from `local_cluster/tests/`.
 ### MINOR — Documentation Only
 
 1. ✅ **Fix verify_packets line reference** — 437 → 423 (plan.md:252) — FIXED
-2. ⬜ **Add missing test specifications** — Ship-stopper tests listed in section 5
-3. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions
+2. ✅ **Fix SlotColumn line reference** — 318 → 353 (plan.md:220) — FIXED
+3. ⬜ **Add missing test specifications** — Ship-stopper tests listed in section 5
+4. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions
