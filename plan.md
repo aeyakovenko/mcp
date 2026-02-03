@@ -217,7 +217,7 @@ Query methods mirroring `slot_leader_at()` at line 95:
 - `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`. Wire format uses `u32` for `proposer_index`; `McpShred::from_bytes()` MUST validate `proposer_index < NUM_PROPOSERS` (16) before casting to `u8` for storage. Reject shreds with out-of-range values.
 - `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`. Wire format uses `u32` for `relay_index`; MUST validate `relay_index < NUM_RELAYS` (200) before casting to `u16` for storage.
 
-For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:174`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:318`).
+For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:174`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:353`).
 
 Additionally, register CFs in:
 - `blockstore_db.rs` `cf_descriptors()` at line 171: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
