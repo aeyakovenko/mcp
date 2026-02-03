@@ -23,7 +23,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 |---|---|---|---|
 | Schedule generation algo | `stake_weighted_slot_leaders()` | YES | `leader_schedule.rs:72` — same ChaChaRng/WeightedIndex pattern, different seed |
 | Schedule cache pattern | `LeaderScheduleCache` | YES | `leader_schedule_cache.rs:30` — add parallel caches for proposer/relay |
-| Column trait | `Column` trait | YES | `column.rs:308` — 3-tuple index supported (`AlternateShredData` at `column.rs:742`) |
+| Column trait | `Column` trait | YES | `column.rs:308` — 3-tuple index supported (`AlternateShredData` at `column.rs:174`) |
 | Blockstore struct pattern | `Blockstore` | YES | `blockstore.rs:252` — add `LedgerColumn` fields; register in `cf_descriptors()` at `blockstore_db.rs:171` |
 | Window service `run_insert()` | `run_insert()` | YES | `window_service.rs:190` — partition MCP before Agave deserialization at line 220 |
 | Replay main loop | `ReplayStage` | YES | `replay_stage.rs:823` — add `mcp_attestation_receiver` + `mcp_consensus_block_receiver` to `ReplayReceivers` at line 330 |
@@ -217,7 +217,7 @@ Query methods mirroring `slot_leader_at()` at line 95:
 - `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`. Wire format uses `u32` for `proposer_index`; `McpShred::from_bytes()` MUST validate `proposer_index < NUM_PROPOSERS` (16) before casting to `u8` for storage. Reject shreds with out-of-range values.
 - `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`. Wire format uses `u32` for `relay_index`; MUST validate `relay_index < NUM_RELAYS` (200) before casting to `u16` for storage.
 
-For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:742`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:318`).
+For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:174`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:318`).
 
 Additionally, register CFs in:
 - `blockstore_db.rs` `cf_descriptors()` at line 171: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
@@ -304,35 +304,47 @@ Per-slot `HashMap<u8, (Hash, Signature)>`: `proposer_index -> (commitment, propo
 
 **Rayon note:** Existing `run_insert()` processes shreds in a Rayon parallel loop (lines 224-233). Per-slot attestation state must be collected OUTSIDE the parallel loop, or use `Mutex`/atomic state inside the loop. Recommended: collect MCP shred metadata into a `Vec` inside the parallel loop (lock-free), then process attestation state sequentially after the loop completes.
 
-At relay deadline for slot s:
+**Timing parameters (implementation-defined, configurable):**
+- `MCP_RELAY_DEADLINE_MS: u64 = 200` — relay deadline offset from slot start
+- `MCP_AGGREGATION_DEADLINE_MS: u64 = 300` — leader aggregation deadline offset from slot start
+
+At relay deadline for slot s (slot_start + MCP_RELAY_DEADLINE_MS):
 1. Look up `relay_indices_at_slot(slot, &my_pubkey)` -> Vec<u16>.
 2. If this node is a relay: collect non-equivocating entries sorted by proposer_index.
 3. Build + sign `RelayAttestation` (from `ledger/src/mcp.rs`).
 4. Send to Leader[s] via QUIC (see 4.3).
 5. At most one attestation per slot.
 
-### 4.3 MCP attestation transport via QUIC
+### 4.3 MCP transport via single QUIC socket
 
 **Critical:** A `RelayAttestation` with 16 proposer entries is 1+8+4+1+16*(4+32+64)+64 = 1,678 bytes. This exceeds `PACKET_DATA_SIZE` (1,232 bytes) and UDP MTU (1,280 bytes). UDP transport will silently drop these packets.
 
-Fix: Use QUIC for attestation transport. Reuse the existing `alpenglow_quic` socket infrastructure (`tvu.rs:110-116`, QUIC server spawned at lines 260-273 via `spawn_server()` for BLS traffic).
+Fix: Use QUIC for all MCP transport. Use a **single multiplexed socket** (not two separate sockets) to minimize contact_info churn.
 
-`gossip/src/contact_info.rs` — add new socket tag:
-- Define `SOCKET_TAG_MCP_ATTESTATION: u8 = 14` and `SOCKET_TAG_MCP_CONSENSUS: u8 = 15` after `SOCKET_TAG_ALPENGLOW = 13` at line 47.
-- Update `SOCKET_CACHE_SIZE` from 14 to 16.
+`gossip/src/contact_info.rs` — add ONE new socket tag:
+- Define `SOCKET_TAG_MCP: u8 = 14` after `SOCKET_TAG_ALPENGLOW = 13` at line 47.
+- Update `SOCKET_CACHE_SIZE` from 14 to 15.
 - Add getter/setter/remover macros (follow `alpenglow()` pattern at lines 273-317).
 - Update `test_round_trip()` assertions.
 
-`gossip/src/node.rs` — bind the MCP attestation and consensus sockets:
-- Bind both sockets in port range (follow alpenglow pattern at line 256-258).
-- Publish in ContactInfo via setters.
+`gossip/src/node.rs` — bind the MCP socket:
+- Bind socket in port range (follow alpenglow pattern at line 256-258).
+- Publish in ContactInfo via setter.
 - Add to `Sockets` struct in `gossip/src/cluster_info.rs` (lines 2371-2409).
 
-`core/src/tvu.rs` — add MCP QUIC endpoints alongside existing alpenglow_quic setup:
-- Spawn a "solMcpAttest" receiver thread that accepts QUIC connections, deserializes `RelayAttestation` messages, and sends them to replay_stage via `mcp_attestation_receiver` channel.
-- Spawn a "solMcpConsensus" receiver thread that accepts QUIC connections, deserializes `ConsensusBlock` messages, and sends them to replay_stage via `mcp_consensus_block_receiver` channel.
-- Attestation sender (relay side in 4.2) connects to Leader[s]'s MCP attestation QUIC endpoint to send `RelayAttestation`.
-- ConsensusBlock sender (leader side in 6.4) connects to each validator's MCP consensus QUIC endpoint to send `ConsensusBlock`.
+**Message type multiplexing:** All MCP QUIC messages start with a 1-byte type prefix:
+- `0x01` = RelayAttestation (relay → leader)
+- `0x02` = ConsensusBlock (leader → validators)
+- `0x03` = ConsensusBlockRequest { slot: u64 } (validator → peer)
+- `0x04` = ConsensusBlockResponse (peer → validator, contains ConsensusBlock or empty)
+
+`core/src/tvu.rs` — spawn single "solMcp" QUIC endpoint:
+- Accept QUIC connections, read message type prefix, dispatch to appropriate handler.
+- RelayAttestation messages → send to replay_stage via `mcp_attestation_receiver` channel.
+- ConsensusBlock messages → send to replay_stage via `mcp_consensus_block_receiver` channel.
+- ConsensusBlockRequest messages → respond with cached ConsensusBlock for that slot if available.
+- Attestation sender (relay side in 4.2) connects to Leader[s]'s MCP QUIC endpoint to send `RelayAttestation`.
+- ConsensusBlock sender (leader side in 6.4) connects to each validator's MCP QUIC endpoint to send `ConsensusBlock`.
 
 ### 4.4 MCP shred retransmit
 
@@ -439,7 +451,7 @@ MCP attestation packets arrive via the "solMcpAttest" QUIC thread from Pass 4.3.
 
 ### 6.3 Build ConsensusBlock
 
-When this node is Leader[s] and aggregation deadline is reached:
+When this node is Leader[s] and aggregation deadline is reached (slot_start + MCP_AGGREGATION_DEADLINE_MS):
 
 1. If relay count < 120 (ATTESTATION_THRESHOLD) -> submit empty result (spec section 3.4).
 2. Build AggregateAttestation with relay entries sorted by relay_index.
@@ -451,23 +463,17 @@ When this node is Leader[s] and aggregation deadline is reached:
 ### 6.4 ConsensusBlock distribution
 
 **Primary mechanism: direct broadcast via QUIC.**
-Leader broadcasts the full `ConsensusBlock` to all validators via the "solMcpConsensus" QUIC endpoint (set up in Pass 4.3). Validators receive it through `mcp_consensus_block_receiver` in `ReplayReceivers`. ConsensusBlocks can be large (aggregate with 120+ relay entries), so QUIC is required to avoid UDP size limits.
+Leader broadcasts the full `ConsensusBlock` to all validators via the "solMcp" QUIC endpoint (set up in Pass 4.3, message type `0x02`). Validators receive it through `mcp_consensus_block_receiver` in `ReplayReceivers`. ConsensusBlocks can be large (aggregate with 120+ relay entries), so QUIC is required to avoid UDP size limits.
 
-**Fallback: gossip summary.**
-Add `McpConsensusBlockSummary` to gossip. This requires changes across the gossip stack:
-- `gossip/src/crds_data.rs`: add variant to `CrdsData` enum + `Sanitize` + `wallclock()` + `pubkey()` + `is_deprecated()` match arms.
-- `gossip/src/crds_value.rs`: add corresponding `CrdsValueLabel` variant + `pubkey()` + `label()` match arms.
-- `gossip/src/crds.rs`: add ordinal tracking, increment `CrdsCountsArray` size.
-- `gossip/src/crds_filter.rs`: add retention policy in `should_retain_crds_value()`.
+**Missed block recovery (QUIC peer-to-peer, NO gossip changes):**
+Validators that miss the direct broadcast request ConsensusBlocks from ANY peer via the "solMcp" QUIC endpoint:
+- Send `ConsensusBlockRequest { slot: u64 }` (message type `0x03`) to multiple peers via ClusterInfo.
+- Peers respond with `ConsensusBlockResponse` (message type `0x04`) containing the cached `ConsensusBlock` for that slot, or empty if not available.
+- ConsensusBlocks are leader-signed, so any peer can serve them — no trust required beyond signature verification.
+- Peers cache recent ConsensusBlocks (last 32 slots) for serving requests.
+- Retry with exponential backoff to different peers if no response.
 
-The summary contains: slot, leader_index, block_hash, relay_count (compact, fits gossip). Validators that miss the direct broadcast can detect via gossip that a ConsensusBlock exists.
-
-**Missed block recovery:**
-Validators that see a gossip summary but lack the full ConsensusBlock request it via the "solMcpConsensus" QUIC endpoint:
-- Add new message type `McpConsensusBlockRequest { slot: u64 }` to the MCP wire protocol (section 1.2).
-- The "solMcpConsensus" thread handles both `ConsensusBlock` messages (unsolicited broadcasts) and `McpConsensusBlockRequest` messages (solicited requests).
-- On receiving a request, respond with the cached `ConsensusBlock` for that slot if available, or an empty response if not.
-- Validators retry requests to multiple peers (via ClusterInfo) if the leader doesn't respond.
+**Rationale for no gossip:** Gossip is unnecessary because (a) the spec does not mandate gossip discovery, (b) peer-to-peer QUIC request/response is sufficient for recovery, (c) ConsensusBlocks are leader-signed so any peer can serve them, and (d) avoiding gossip stack changes (CrdsData, CrdsValue, CrdsCountsArray) reduces diff by 4 files.
 
 ### 6.5 Tests
 
@@ -511,17 +517,46 @@ For each included proposer:
 2. Two-phase execution via new `confirm_slot_mcp()` in `ledger/src/blockstore_processor.rs`.
 
 **PoH bypass:** MCP has no PoH chain. The production `confirm_slot_entries` path verifies PoH via `entries.start_verify()` and tick counts via `verify_ticks()`. MCP cannot use this path. Instead, `confirm_slot_mcp()` follows the `process_entries_for_tests` pattern (`blockstore_processor.rs:599-647`):
-- Call `entry::verify_transactions()` directly to verify transaction signatures and produce `ReplayEntry` objects with `EntryType::Transactions`.
-- Skip PoH hash verification entirely (no `entries.start_verify()` call).
-- Skip tick verification (no `verify_ticks()` call, MCP has no ticks).
-- Pass the resulting `ReplayEntry` vec directly to `process_entries()`.
 
-This requires `confirm_slot_mcp()` to construct synthetic Entry objects with dummy `hash` and `num_hashes` fields (these are ignored since PoH verification is skipped). The only verification performed is transaction signature verification.
+**Entry construction:**
+```rust
+// For each batch of transactions from ordered proposer batches:
+let entries: Vec<Entry> = transaction_batches.iter().map(|txs| Entry {
+    num_hashes: 0,        // Dummy - ignored since PoH verification skipped
+    hash: Hash::default(), // Dummy - ignored since PoH verification skipped
+    transactions: txs.clone(),
+}).collect();
+```
 
-**Phase A (fees):** Pre-process fee deduction directly on the Bank, BEFORE entering the standard execution pipeline. For each transaction in order:
+**ReplayEntry construction:**
+- Call `entry::verify_transactions(&entries, skip_verification=false, ...)` to verify transaction signatures. This returns `Vec<ReplayEntry>` with `EntryType::Transactions(verified_txs)`.
+- The `skip_verification` parameter controls SIGNATURE verification, not PoH. We want signature verification, so pass `false`.
+- PoH verification is skipped by NOT calling `entries.start_verify()` or `verify_ticks()`.
+
+**Execution path:**
+```rust
+// In confirm_slot_mcp():
+let replay_entries = entry::verify_transactions(&entries, /*skip_verification=*/false, ...)?;
+// replay_entries now contains signature-verified transactions
+// Pass directly to process_entries() with skip_fee_deduction=true environment
+process_entries(bank, replay_entries, processing_environment, ...)?;
+```
+
+The key insight: `entry::verify_transactions()` does signature verification independent of PoH. The dummy `hash` and `num_hashes` fields are never checked because we skip the PoH verification path.
+
+**Phase A (fees):** Pre-process fee deduction directly on the Bank, BEFORE entering the standard execution pipeline.
+
+**Atomicity and failure handling:**
+- Fee deductions are applied **atomically per-proposer batch** using a RocksDB write-batch or equivalent transactional mechanism.
+- If ANY fee deduction within a proposer batch fails (insufficient funds after cumulative tracking), the **entire proposer's batch is excluded** from execution — not just the failing transaction. This prevents partial state from an excluded proposer.
+- Per-payer cumulative tracking uses an **in-memory `HashMap<Pubkey, u64>`** for the slot duration only. No persistence needed since replay is deterministic from ConsensusBlock.
+- The HashMap is cleared at slot boundary.
+
+**Per-transaction processing:**
 - Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8). For nonce transactions, payer must cover `fee * NUM_PROPOSERS + minimum_rent` per spec section 8.
+- Check `cumulative_fees[payer] + fee * NUM_PROPOSERS <= payer_balance`. If not, exclude this proposer's batch.
+- Update `cumulative_fees[payer] += fee * NUM_PROPOSERS`.
 - Directly debit fee payer accounts on the Bank via `bank.withdraw()` or equivalent.
-- Track per-slot cumulative per-payer fees to prevent over-commitment across proposer batches.
 - Collect the list of fee-valid transactions for Phase B.
 
 This avoids threading a flag through 12 layers of execution (process_entries -> process_batches -> ... -> validate_fee_payer).
@@ -582,14 +617,10 @@ Consensus outputs empty result -> freeze bank with no transactions.
 | `core/src/window_service.rs` | Partition at raw Payload bytes (line 213 handle_shred closure) BEFORE Agave deserialization at line 220; MCP storage + tracking; Rayon-safe attestation collection |
 | `core/src/ed25519_sigverifier.rs` | Add `mcp_proposer_sender` to `TransactionSigVerifier`; clone in `send_packets()` at line 56 |
 | `core/src/forwarding_stage.rs` | Route transactions to proposers instead of leader when MCP active; add `LeaderScheduleCache` access for `proposers_at_slot()` |
-| `gossip/src/contact_info.rs` | `SOCKET_TAG_MCP_ATTESTATION = 14`, `SOCKET_TAG_MCP_CONSENSUS = 15`, bump cache size to 16, getter/setter/remover macros |
-| `gossip/src/node.rs` | Bind MCP attestation + consensus sockets, publish in ContactInfo, add to Sockets |
-| `gossip/src/cluster_info.rs` | Add MCP attestation + consensus sockets to `Sockets` struct |
-| `gossip/src/crds_data.rs` | `McpConsensusBlockSummary` variant + Sanitize/wallclock/pubkey/is_deprecated |
-| `gossip/src/crds_value.rs` | `CrdsValueLabel` variant + pubkey/label match arms |
-| `gossip/src/crds.rs` | Ordinal tracking, increment `CrdsCountsArray` |
-| `gossip/src/crds_filter.rs` | Retention policy for MCP summary |
-| `core/src/tvu.rs` | MCP QUIC endpoints: "solMcpAttest" thread (attestations) + "solMcpConsensus" thread (ConsensusBlocks) + channels to replay |
+| `gossip/src/contact_info.rs` | `SOCKET_TAG_MCP = 14`, bump cache size to 15, getter/setter/remover macros |
+| `gossip/src/node.rs` | Bind MCP socket, publish in ContactInfo, add to Sockets |
+| `gossip/src/cluster_info.rs` | Add MCP socket to `Sockets` struct |
+| `core/src/tvu.rs` | Single "solMcp" QUIC endpoint with message type multiplexing (attestations, ConsensusBlocks, requests/responses) + channels to replay |
 | `core/src/tpu.rs` | MCP proposer channel creation + proposer loop thread |
 | `core/src/banking_stage/qos_service.rs` | CU limits / NUM_PROPOSERS |
 | `core/src/replay_stage.rs` | `mcp_attestation_receiver` + `mcp_consensus_block_receiver` in ReplayReceivers; attestation aggregation, ConsensusBlock building, direct QUIC broadcast, vote gate, reconstruction dispatch |

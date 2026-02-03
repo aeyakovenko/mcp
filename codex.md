@@ -1,30 +1,52 @@
-MCP plan review — Pass 9 (final verification)
+MCP plan review — Pass 10 (after Staff+/L7 review fixes)
 
-## Critical/High Issues: NONE REMAINING
+## All HIGH/CRITICAL Issues: ADDRESSED
 
-All issues from prior passes have been addressed:
+### From claude.md:
 
-### Pass 8 fixes (commit e0ae74e91b):
-1. Transaction wire format: Added explicit "SPEC AMENDMENT REQUIREMENT" section
-2. ConsensusBlock contents: Defined MCP_DELAY_SLOTS=32, concrete consensus_meta and delayed_bankhash implementations
-3. Removed "spec deviation acceptable" language
+**H1: Gossip stack changes over-engineered** — FIXED
+- Removed McpConsensusBlockSummary from CrdsData (4 gossip files no longer modified)
+- Using QUIC peer-to-peer request/response for missed block recovery
+- Modified Files section updated to remove crds_data.rs, crds_value.rs, crds.rs, crds_filter.rs
 
-### Pass 9 fixes (commit fd7f8b8400):
-1. Fixed relay_indices_at_slot naming inconsistency (singular vs plural)
-2. Clarified column family patterns for McpShredData (3-tuple) vs McpRelayAttestation (2-tuple)
+**H2: Two QUIC sockets collapsed to one** — FIXED
+- Changed from SOCKET_TAG_MCP_ATTESTATION + SOCKET_TAG_MCP_CONSENSUS to single SOCKET_TAG_MCP = 14
+- Added message type multiplexing with 1-byte prefix (0x01-0x04)
+- SOCKET_CACHE_SIZE bump from 14 to 15 (not 16)
 
-## Verified Non-Issues (raised in Pass 9 but determined to be false positives):
+**H3: Phase A fee atomicity gap** — FIXED
+- Added explicit atomicity specification: "atomically per-proposer batch using write-batch"
+- Added failure handling: "entire proposer's batch is excluded" on any fee deduction failure
+- Added per-payer tracking lifecycle: "in-memory HashMap<Pubkey, u64> for slot duration only"
 
-- **Relay/Proposer index storage types**: Plan correctly documents validation before narrowing cast (u32->u16, u32->u8). These ranges fit (NUM_RELAYS=200, NUM_PROPOSERS=16).
-- **Merkle tree odd-level handling**: Already documented at line 110.
-- **Merkle truncation**: Already documented that Agave truncates to 20 bytes, MCP uses 32-byte entries.
-- **skip_fee_deduction field**: Plan explicitly documents adding this to TransactionProcessingEnvironment; that's the intended modification.
-- **Leader index verification**: Already documented at line 490 ("Verify leader_signature, leader_index matches Leader[s]").
+**H4: AlternateShredData line reference** — FIXED
+- Changed column.rs:742 to column.rs:174 (two locations)
 
-## Outstanding Spec Amendment Requirement:
+### From codex.md (prior Critical issues):
 
-The plan uses standard Solana wire-format transactions instead of spec section 7.1 format. This is documented as "SPEC AMENDMENT REQUIREMENT" and is pending formal spec amendment approval. Until amended, the implementation is spec-non-compliant on transaction format only.
+**1. Transaction wire format** — Already addressed with SPEC AMENDMENT REQUIREMENT
 
-## Conclusion:
+**2. ConsensusBlock fields** — Already addressed with MCP_DELAY_SLOTS=32 and concrete consensus_meta definition
 
-No remaining Critical or High issues. Plan is ready for implementation pending spec amendment for transaction wire format.
+**3. Duplicate identity handling** — Already addressed (relay_indices_at_slot returns Vec<u16>, downstream code handles multiple indices)
+
+**4. Replay/PoH integration under-specified** — FIXED
+- Added explicit Entry construction code snippet
+- Added ReplayEntry construction explanation
+- Added execution path code snippet
+- Clarified that entry::verify_transactions() does signature verification independent of PoH
+
+### MEDIUM issues also fixed:
+
+**Relay/aggregation deadlines** — FIXED
+- Added MCP_RELAY_DEADLINE_MS = 200
+- Added MCP_AGGREGATION_DEADLINE_MS = 300
+- Referenced in both §4.2 and §6.3
+
+---
+
+## Summary
+
+Modified files reduced from 28 to 24 (gossip stack untouched).
+All HIGH/CRITICAL issues from both review documents addressed.
+Plan ready for implementation pending spec amendment for transaction wire format.
