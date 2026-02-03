@@ -217,7 +217,7 @@ Query methods mirroring `slot_leader_at()` at line 95:
 - `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`. Wire format uses `u32` for `proposer_index`; `McpShred::from_bytes()` MUST validate `proposer_index < NUM_PROPOSERS` (16) before casting to `u8` for storage. Reject shreds with out-of-range values.
 - `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`. Wire format uses `u32` for `relay_index`; MUST validate `relay_index < NUM_RELAYS` (200) before casting to `u16` for storage.
 
-Follow the `AlternateShredData` pattern (`column.rs:742`) for 3-tuple index implementation.
+For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:742`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:318`).
 
 Additionally, register CFs in:
 - `blockstore_db.rs` `cf_descriptors()` at line 171: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
@@ -298,14 +298,14 @@ MCP handling path:
 Add attestation state to `run_insert()` or a small helper struct:
 
 Per-slot `HashMap<u8, (Hash, Signature)>`: `proposer_index -> (commitment, proposer_sig)`.
-- **Relay self-check (spec section 3.3):** When this node is a relay, only accept shreds where `shred_index` matches this node's relay index (`relay_index_at_slot(slot, &my_pubkey)`). The spec requires "the witness verifies against the commitment for the relay's own index." Non-relay validators accept any valid shred_index.
+- **Relay self-check (spec section 3.3):** When this node is a relay, only accept shreds where `shred_index` is in this node's relay indices (`relay_indices_at_slot(slot, &my_pubkey)` returns Vec<u16>). For each relay index I own, only accept shreds with `shred_index == I`. The spec requires "the witness verifies against the commitment for the relay's own index." Non-relay validators accept any valid shred_index.
 - If a proposer sends conflicting commitments -> mark equivocation, do not attest (spec section 3.3).
 - At most one entry per proposer per slot.
 
 **Rayon note:** Existing `run_insert()` processes shreds in a Rayon parallel loop (lines 224-233). Per-slot attestation state must be collected OUTSIDE the parallel loop, or use `Mutex`/atomic state inside the loop. Recommended: collect MCP shred metadata into a `Vec` inside the parallel loop (lock-free), then process attestation state sequentially after the loop completes.
 
 At relay deadline for slot s:
-1. Look up `relay_index_at_slot(slot, &my_pubkey)`.
+1. Look up `relay_indices_at_slot(slot, &my_pubkey)` -> Vec<u16>.
 2. If this node is a relay: collect non-equivocating entries sorted by proposer_index.
 3. Build + sign `RelayAttestation` (from `ledger/src/mcp.rs`).
 4. Send to Leader[s] via QUIC (see 4.3).
