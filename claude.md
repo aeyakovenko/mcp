@@ -255,20 +255,20 @@ Use existing `solana_local_cluster` crate patterns from `local_cluster/tests/`.
 
 ## Summary of Required Plan Changes
 
-### HIGH Priority (must fix before implementation)
+### HIGH Priority — ALL FIXED (commit 7d37bef480)
 
-1. **Remove gossip stack changes** — Use QUIC-only for ConsensusBlock distribution and recovery
-2. **Collapse to single MCP QUIC socket** — Multiplex message types by prefix
-3. **Add Phase A atomicity specification** — Write-batch semantics, rollback on partial failure
-4. **Fix AlternateShredData line reference** — 742 → 174
+1. ✅ **Remove gossip stack changes** — QUIC-only for ConsensusBlock distribution and recovery
+2. ✅ **Collapse to single MCP QUIC socket** — SOCKET_TAG_MCP=14 with message type prefix multiplexing
+3. ✅ **Add Phase A atomicity specification** — Atomic per-proposer batch, entire batch excluded on failure
+4. ✅ **Fix AlternateShredData line reference** — 742 → 174
 
-### MEDIUM Priority (should fix)
+### MEDIUM Priority — MOSTLY FIXED
 
-1. **Define relay/aggregation deadlines** — Concrete timing values
-2. **Add missing test specifications** — Ship-stopper tests listed above
-3. **Clarify per-payer tracking lifecycle** — In-memory per-slot, no persistence
+1. ✅ **Define relay/aggregation deadlines** — MCP_RELAY_DEADLINE_MS=200, MCP_AGGREGATION_DEADLINE_MS=300
+2. ⬜ **Add missing test specifications** — Ship-stopper tests listed above (documentation only)
+3. ✅ **Clarify per-payer tracking lifecycle** — In-memory HashMap per-slot, no persistence
 
 ### LOW Priority (nice to have)
 
-1. **Add metrics for MCP shred detection** — Counter for partition decisions
-2. **Profile RS encode/decode** — Verify acceptable latency
+1. ⬜ **Add metrics for MCP shred detection** — Counter for partition decisions
+2. ⬜ **Profile RS encode/decode** — Verify acceptable latency
