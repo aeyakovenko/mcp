@@ -402,13 +402,20 @@ When `mcp_protocol_v1` active and `leader_schedule_cache.proposers_at_slot(slot)
 
    **MCP transaction format note (PENDING SPEC AMENDMENT):** See SPEC AMENDMENT REQUIREMENT in section 1.2. McpPayload carries standard Solana wire-format transactions. The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`.
 
-3. Sort by ordering_fee descending, ties by position.
-4. Serialize to `McpPayload` (max `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes). Only 40 data shreds carry payload; the remaining 160 are RS parity.
-5. RS encode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` directly (NOT `ReedSolomonCache` — it is `pub(crate)` and has no public constructor). Cache the `ReedSolomon` instance locally in the proposer thread since the parameters are fixed.
-6. Compute Merkle commitment per spec section 6 using `mcp_merkle_tree()` from `mcp_merkle.rs`. The tree has 200 leaves (40 data + 160 coding shreds).
-7. Build `McpShred` for each relay index (0..199) with witness from `mcp_merkle_proof()` + proposer_signature.
-8. Look up relay addresses via `relays_at_slot()` + `ClusterInfo::lookup_contact_info()`.
-9. Send one shred per relay to their TVU address.
+3. **Admission control (CU tracking):** For each transaction, compute cost via `CostModel::calculate_cost()` (`cost-model/src/cost_model.rs:37`) and track via a local `CostTracker` (`cost-model/src/cost_tracker.rs:176`) initialized with 1/NUM_PROPOSERS of block-level limits:
+   - `block_cost_limit / 16`
+   - `account_cost_limit / 16`
+   - `loaded_accounts_data_size_limit / 16`
+
+   Call `cost_tracker.try_add(&cost)` and drop transactions that exceed limits. This is **advisory admission control only** — validators will independently verify at replay time. Transactions dropped here may have been valid on the eventual fork (liveness trade-off, not consensus-critical).
+
+4. Sort by ordering_fee descending, ties by position.
+5. Serialize to `McpPayload` (max `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes). Only 40 data shreds carry payload; the remaining 160 are RS parity.
+6. RS encode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` directly (NOT `ReedSolomonCache` — it is `pub(crate)` and has no public constructor). Cache the `ReedSolomon` instance locally in the proposer thread since the parameters are fixed.
+7. Compute Merkle commitment per spec section 6 using `mcp_merkle_tree()` from `mcp_merkle.rs`. The tree has 200 leaves (40 data + 160 coding shreds).
+8. Build `McpShred` for each relay index (0..199) with witness from `mcp_merkle_proof()` + proposer_signature.
+9. Look up relay addresses via `relays_at_slot()` + `ClusterInfo::lookup_contact_info()`.
+10. Send one shred per relay to their TVU address.
 
 No bank, no PoH — this is bankless per spec section 9.
 
