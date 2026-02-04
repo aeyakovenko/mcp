@@ -224,3 +224,51 @@ Coverage requirements mapping
 - Vote gate + partial invalid relay entries: confirm invalid entries dropped, inclusion threshold computed correctly.
 - Two-phase fee correctness: includes nonce edge (fee*NUM_PROPOSERS + min rent), cumulative per payer, and Phase B zero-fee path.
 
+
+---
+
+Addendum — Review of “McpProposerContext” light-bank proposal (2026-02-04)
+
+Decision: PARTIAL ACCEPT with corrections. Good direction for minimal-diff, but current suggestion conflicts with spec and Agave reality in two places and needs tighter scoping to avoid re-implementing Bank logic.
+
+High issues
+1) Fee validation at proposer is NOT required by spec; must not be treated as authoritative
+- Spec: proposer stage only requires batch size bound and per-proposer resource split; fee payer DOS handling is a replay-time validator rule (§3.2, §8). Proposers can include invalid/insufficient-fee txs; validators will filter/charge in Phase A. Early filtering is allowed as local policy but must not change consensus outcomes.
+- Correction: if implemented, this must be “best-effort local admission” only, and MUST NOT affect inclusion guarantees or be assumed by validators.
+
+2) Using AccountsDb load_with_fixed_root risks inconsistency with replay eligibility
+- Proposer may read balances from a parent bank snapshot that diverges from validators’ replay-time view (forks, root changes). This can cause proposer to drop txs that would be valid on the eventual fork, reducing liveness.
+- Correction: treat fee validation as optional admission control with metrics; do not enforce hard rejection at proposer unless explicitly required by network policy. Alternatively, avoid balance checks entirely and only enforce size/QoS.
+
+Codebase reality checks (Agave)
+- “consumer.rs:460-493” reference is likely stale; current fee payer validation path is in `svm/src/account_loader.rs:370` and transaction fee computation in `runtime/src/bank/check_transactions.rs:100-126` (see earlier). If mirroring logic, use these real locations; otherwise mark as UNVERIFIED.
+- `CostTracker` and `CostModel` are in the runtime/banking pipeline; they assume a Bank-scoped config (block cost limits, loaded accounts data size). You can construct a local `CostTracker` with explicit limits, but ensure you import from the same module as `QosService` to avoid duplication.
+
+Minimal-diff recommendation
+- Keep proposer thread bankless; add a tiny “admission control” helper that reuses existing cost model and compute budget parsing but does NOT read accounts or compute fees unless absolutely necessary.
+- If fee checks are desired, do them as soft filters (metrics + optional drop) and guard with `mcp_protocol_v1` feature gate to keep behavior contained.
+
+Concrete corrections to the proposed design
+1) McpProposerContext should be explicit about non-authoritative admission:
+- Add: `mode: AdmissionMode { SizeOnly, SizePlusQoS, SizePlusQoSPlusFeeSoft }`.
+- Default to SizePlusQoS; use fee checks only if product requires it.
+
+2) Fee validation path must be aligned with spec tx format decision
+- If MCP uses §7.1 Transaction format, ordering_fee and fee computation should use that config values. If MCP uses legacy Solana txs, compute_budget_instructions are fine, but this is spec-deviant and must be flagged (see Critical issue #1 above).
+
+3) Use cost_tracker limits derived from per-proposer share
+- Limits must be 1/NUM_PROPOSERS of the same block-level limits used by QoS for Agave banking. Ensure loaded_accounts_data_size limits are also scaled (spec §3.2 requires both CU and loaded accounts data size).
+
+4) Avoid direct AccountsDb load unless policy requires
+- If kept: use a consistent snapshot (rooted bank or fixed root) and do not treat failure as consensus-critical. Record in metrics to assess false negatives.
+
+Updated Plan v2 patch (delta only)
+- Pass 5 proposer loop: add optional “Admission control” subsection
+  - Use compute budget parsing + local CostTracker to enforce per-proposer CU + loaded-accounts-data limits.
+  - Fee payer balance check is OPTIONAL/soft; must not affect consensus correctness.
+  - If implemented, document that validation is advisory only and may drop txs that would be valid on final fork (liveness trade-off).
+
+UNVERIFIED items to explicitly mark in plan
+- Exact source of block-level loaded-accounts-data size limits to divide by NUM_PROPOSERS.
+- Correct module paths for cost model and cost tracker in Agave at time of implementation.
+

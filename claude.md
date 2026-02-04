@@ -208,3 +208,138 @@ The MCP implementation plan is comprehensive and correct. All line references ve
    - Minor: Clarify in spec where this constant should be defined
 
 3. **Optional Documentation:** Add Column impl line reference (742) alongside struct definition (174)
+
+---
+
+## 6. HUMAN REVIEW ANALYSIS
+
+### Review #1: Architecture Questions
+
+#### Q1: Relay vs Retransmit Stage
+**Question:** "Relay operation looks a lot like retransmit, but maybe it should be its own stage or a parameterized version of retransmit"
+
+**Analysis:** Retransmit uses **turbine tree topology** (stake-weighted, hop-limited, seed=hash(slot_leader, shred_id)). MCP relay needs **flat all-validators fanout**. These are fundamentally different patterns.
+
+| Aspect | Retransmit | Relay Broadcast |
+|--------|-----------|-----------------|
+| Topology | Tree (4 hops max) | Flat (all validators) |
+| Seed | hash(slot_leader, shred_id) | N/A |
+| Fanout | ~200 per node | ~200 total |
+| Shred layout | Agave (variant at byte 64) | MCP (slot at byte 0) |
+
+**Verdict:** Plan is CORRECT — retransmit is not reusable. Only `multi_target_send()` socket code could be shared.
+
+#### Q2: Column Trait Reuse
+**Question:** "Column trait - I'm not sure why it's re-using this?"
+
+**Analysis:** The `Column` trait (column.rs:308) supports 1/2/3-tuple indexes. `AlternateShredData` already uses 3-tuple `(Slot, u64, Hash)`. MCP's `McpShredData` needs `(Slot, u8, u32)` — same pattern.
+
+**Verdict:** Column trait reuse is CORRECT and appropriate.
+
+#### Q3: Merkle-Tree Crate
+**Question:** "There is the merkle-tree crate with 32-bit indexes and the same leaf/root hash prefixes"
+
+**Analysis:** Found TWO merkle implementations:
+- `solana-merkle-tree` crate: Uses `0x00`/`0x01` single-byte prefixes (matches MCP spec!)
+- `ledger/shred/merkle_tree.rs`: Uses 28-byte prefixes like `b"\x00SOLANA_MERKLE_SHREDS_LEAF"`
+
+BUT MCP spec requires leaf = `SHA-256(0x00 || slot || proposer_index || i || shred_data)` — the generic crate doesn't handle that domain separation.
+
+**Verdict:** PARTIAL VALID CONCERN. Generic crate prefix matches but leaf hash input format differs. Plan correctly implements MCP-specific merkle in `mcp_merkle.rs`.
+
+#### Q4: LifetimeSpecifier in Spec §7.1
+**Question:** "What is the LifetimeSpecifier?"
+
+**Analysis:** Spec defines `LifetimeSpecifier ([u8; 32])` but doesn't explain semantics. Position suggests it replaces blockhash. Likely a generalized expiry mechanism.
+
+**Verdict:** SPEC GAP — LifetimeSpecifier is undefined. Part of tx format spec amendment discussion.
+
+#### Q5: ShredVariant Reuse
+**Question:** "Could we use a unique ShredVariant (0x00xxxx or 0x11xxxx spaces available)"
+
+**Analysis:** Found available space:
+- `0x50-0x5F` range (unused, MerkleCode family)
+- `0xA0-0xAF` range (unused, MerkleData family)
+
+**Trade-offs:**
+- Pro: Shares dedup, variant detection, some parsing
+- Con: Constrained by 64-byte signature header, may not match MCP spec
+
+**Verdict:** VALID ALTERNATIVE worth evaluating. Would reduce code divergence but requires spec alignment analysis.
+
+#### Q6: Coding Shred Layout
+**Question:** "No indication of a coding shred layout in spec"
+
+**Analysis:** Spec §7.2 defines ONE shred format. Coding shreds use same format — `shred_data` contains RS parity instead of payload. `shred_index` distinguishes them (0-39 = data, 40-199 = coding).
+
+**Verdict:** CORRECT — plan handles this. Could add clarification.
+
+#### Q7: PACKET_DATA_SIZE = 1,232 bytes
+**Question:** "does it now?"
+
+**Verification:** `8+4+4+32+863+1+256+64 = 1,232` ✓
+
+**Verdict:** Math is CORRECT. Plan correctly derives SHRED_DATA_BYTES=863.
+
+---
+
+### Review #2: McpProposerContext Suggestion
+
+**Suggestion:** Create lightweight `McpProposerContext` with `accounts_db` access for fee payer validation.
+
+**Code References Verified:**
+| Reference | Actual | Status |
+|-----------|--------|--------|
+| `consumer.rs:460-493` | `check_fee_payer_unlocked()` | ✓ |
+| `qos_service.rs:103-159` | `select_transactions_per_cost()` | ✓ |
+| `cost_model.rs:37` | `CostModel::calculate_cost()` | ✓ |
+| `cost_tracker.rs:176` | `CostTracker::try_add()` | ✓ |
+| `account_loader.rs:370` | `validate_fee_payer()` | ✓ |
+
+**Analysis:**
+
+The suggestion identifies a REAL GAP: plan §5.3 doesn't specify how proposer:
+1. Validates fee payer balances
+2. Tracks cumulative CU usage per-proposer
+
+However, the proposed solution adds `AccountsDb` dependency which contradicts "bankless" goal (spec §9).
+
+**Recommendation:**
+
+| Component | Recommendation |
+|-----------|----------------|
+| Fee payer validation | SKIP at proposer — defer to replay Phase A |
+| CU/cost tracking | ADD standalone `CostTracker` with 1/16th limits |
+
+**Simplified approach:**
+```rust
+struct McpProposerContext {
+    feature_set: Arc<FeatureSet>,
+    cost_tracker: CostTracker,  // 1/16th limits
+}
+```
+
+Proposer loop:
+1. Deserialize, extract ordering_fee
+2. `CostModel::calculate_cost(&tx, &feature_set)`
+3. `cost_tracker.try_add(&cost)` — reject if exceeds limit
+4. Sort, serialize, RS encode, send
+
+Fee payer check happens at replay Phase A. This keeps proposer truly bankless.
+
+**Verdict:** Suggestion identifies valid gap but solution is OVER-ENGINEERED. Plan §5.3 should add CU tracking without `AccountsDb` dependency.
+
+---
+
+### Summary of Human Review Findings
+
+| Finding | Severity | Action |
+|---------|----------|--------|
+| Relay vs retransmit | N/A | Plan is correct |
+| Column trait reuse | N/A | Plan is correct |
+| Merkle-tree crate | LOW | Document why not using generic crate |
+| LifetimeSpecifier undefined | MEDIUM | Part of tx format spec amendment |
+| ShredVariant reuse possible | MEDIUM | Evaluate as alternative |
+| Coding shred format | LOW | Add clarification |
+| Proposer CU tracking missing | **HIGH** | Add `CostTracker` to plan §5.3 |
+| Fee payer validation | MEDIUM | Defer to Phase A (bankless) |
