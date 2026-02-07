@@ -272,3 +272,23 @@ UNVERIFIED items to explicitly mark in plan
 - Exact source of block-level loaded-accounts-data size limits to divide by NUM_PROPOSERS.
 - Correct module paths for cost model and cost tracker in Agave at time of implementation.
 
+---
+
+L8 Review Fixes Applied (2026-02-07)
+
+Issues fixed in plan.md:
+1) BUG-1 (HIGH): Phase A fee granularity changed from per-proposer-batch to per-transaction. Spec §8 requires "deduct fees for all transactions that pass" — per-tx granularity is consensus-critical.
+2) ARCH-1 (HIGH): Phase A bank mutation changed from bank.withdraw() (doesn't exist) to bank.get_account() + bank.store_account() which properly tracks dirty accounts.
+3) M-1 (HIGH): Added proposer slot source — PohRecorder::slot() (same as BankingStage).
+4) M-2 (MEDIUM): Added FeatureSet source — clone Arc<FeatureSet> from root bank, refresh per epoch.
+5) BUG-3 (MEDIUM): §5.4 now includes loaded_accounts_data_size_limit /= 16.
+6) BUG-4 (MEDIUM): RelayAttestation parse-time validation added — reject unsorted/duplicate proposer_index entries.
+7) ARCH-2 (MEDIUM): MCP replay logic extracted into core/src/mcp_replay.rs. replay_stage diff reduced to ~20 lines.
+8) ARCH-3 (MEDIUM): §5.4 purpose clarified — replay-side QoS enforcement, must agree with proposer-side §5.3 limits.
+9) M-5 (MEDIUM): BankingStage interaction clarified — continues to run normally, MCP proposer loop is independent.
+10) BUG-2 (MEDIUM): ordering_fee sort direction noted as PENDING SPEC AMENDMENT (spec §3.6 is ambiguous).
+
+Remaining UNVERIFIED (unchanged):
+- block_id derivation (requires Alpenglow integration)
+- delayed_bankhash unavailability policy
+- MCP shred detection predicate finalization
