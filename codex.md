@@ -1,294 +1,140 @@
-MCP plan review — spec+code reality check and minimized plan v2 (2026-02-03)
+MCP plan review — all issues found (2026-02-07)
 
 A) Executive summary of high/critical issues (with evidence)
 
 Critical
-1) Transaction wire format mismatch (spec §3.1/§7.1 vs plan uses Solana txs)
-- Evidence: spec requires Transaction message as in §7.1 (custom layout) — docs/src/proposals/mcp-protocol-spec.md:126-127, 280-318.
-- Plan explicitly uses standard Solana wire format — plan.md:87-105 ("PENDING SPEC AMENDMENT"), plan.md:93-95.
-- Impact: Any strict spec implementation will reject MCP payloads; client/tooling changes required. Must either amend spec or implement §7.1 format.
+1) Transaction wire format mismatch (spec §3.1/§7.1 vs plan uses legacy Solana txs).
+Evidence: spec requires each tx bytes value be a Transaction message per §7.1 — `docs/src/proposals/mcp-protocol-spec.md:123-128`, `docs/src/proposals/mcp-protocol-spec.md:280-296`. Plan explicitly uses standard Solana wire-format transactions — `plan.md:96`, `plan.md:405`.
+Required change: implement §7.1 format or amend spec and gate by version.
 
-2) Block_id derivation violates spec requirement
-- Evidence: spec says block_id is the underlying ledger commitment carried in consensus_meta (not hash of aggregate) — docs/src/proposals/mcp-protocol-spec.md:189-198, 383-395.
-- Plan sets consensus_meta=SHA256(slot||leader_index||aggregate_hash) — plan.md:346-354.
-- Impact: Votes will not match ledger rules; may cause consensus divergence. Must align with ledger commitment semantics or explicitly mark as temporary fork-only placeholder (UNVERIFIED).
+2) Consensus block_id derivation violates spec.
+Evidence: spec requires block_id to be the underlying ledger commitment carried in consensus_meta and NOT derived from aggregate hash — `docs/src/proposals/mcp-protocol-spec.md:175-183`, `docs/src/proposals/mcp-protocol-spec.md:426-431`. Plan derives consensus_meta as SHA256(slot||leader_index||aggregate_hash) — `plan.md:475`.
+Required change: define consensus_meta encoding that matches ledger commitment rules (UNVERIFIED until Alpenglow specifies exact bytes).
+
+3) QUIC transport size limit breaks MCP messages.
+Evidence: existing QUIC streamer rejects any stream where accumulated size exceeds PACKET_DATA_SIZE — `streamer/src/nonblocking/quic.rs:1294-1300`. RelayAttestation and ConsensusBlock exceed 1232 bytes — `plan.md:320`.
+Required change: add MCP fragmentation framing or a dedicated QUIC handler with larger max size.
+
+4) Delayed bankhash fallback not allowed by spec.
+Evidence: spec requires delayed_bankhash verification against consensus-defined delayed slot — `docs/src/proposals/mcp-protocol-spec.md:187-190`. Plan allows Hash::default() “warmup” acceptance — `plan.md:476`, `plan.md:514`.
+Required change: no vote unless delayed bankhash is verifiable, unless consensus protocol explicitly defines a fallback.
+
+5) Validator missing global relay-count threshold check.
+Evidence: spec says validators MUST treat any block below ATTESTATION_THRESHOLD*NUM_RELAYS as invalid — `docs/src/proposals/mcp-protocol-spec.md:181-183`. Plan vote gate omits the global <120 relay-entries invalidation — `plan.md:511-520`.
+Required change: add explicit global relay-count threshold check after filtering invalid entries.
 
 High
-3) Ordering_fee source mismatch
-- Evidence: spec defines ordering_fee as explicit TransactionConfigMask bit (config value) — docs/src/proposals/mcp-protocol-spec.md:286-303, 340-347, 208-219.
-- Plan derives ordering_fee from compute_unit_price (Solana compute budget) — plan.md:108-109, 634-637, 740-742.
-- Impact: Ordering may be non-compliant even if tx format is amended; must implement spec field or amend spec.
+6) ordering_fee semantics mismatch.
+Evidence: spec defines ordering_fee as TransactionConfigMask bit1 config value — `docs/src/proposals/mcp-protocol-spec.md:292-296`. Plan derives ordering_fee from compute_unit_price — `plan.md:96`, `plan.md:405`, `plan.md:532`.
+Required change: parse ordering_fee from §7.1 config field or amend spec to map compute_unit_price→ordering_fee.
 
-4) Delayed bankhash warmup behavior not defined in spec
-- Evidence: spec requires delayed_bankhash verified against delayed slot defined by consensus protocol — docs/src/proposals/mcp-protocol-spec.md:189-193, 202-206.
-- Plan allows Hash::default() when delayed slot not frozen — plan.md:356-362, 402-406.
-- Impact: Safety assumption; needs explicit spec/consensus rule or validator must refuse to vote if delayed hash unavailable.
+7) ordering_fee sort direction is unspecified in spec; plan assumes descending.
+Evidence: spec says “order them by ordering_fee” without direction — `docs/src/proposals/mcp-protocol-spec.md:216-219`. Plan uses descending — `plan.md:532`, `plan.md:426`.
+Required change: spec amendment or explicit rule gating.
 
----
+8) Relay/Aggregate ordering and duplicate rules are not enforced in plan.
+Evidence: spec requires entries sorted and no duplicates — `docs/src/proposals/mcp-protocol-spec.md:158-161`, `docs/src/proposals/mcp-protocol-spec.md:356-365`. Plan does not specify validation/enforcement.
+Required change: enforce sorted unique entries at parse/verify; define drop rules for invalid ordering.
 
-1) SPEC ↔ PLAN CONSISTENCY CHECK (table)
+9) witness_len enforcement missing.
+Evidence: spec mandates witness_len == ceil(log2(NUM_RELAYS)) — `docs/src/proposals/mcp-protocol-spec.md:270-273`, `docs/src/proposals/mcp-protocol-spec.md:336-343`. Plan does not enforce.
+Required change: enforce witness_len at deserialization time.
+
+10) dedup stage reasoning is incorrect; MCP shreds are discarded pre-partition.
+Evidence: dedup filter in sigverify marks packets discard when `get_shred()` returns None — `turbine/src/sigverify_shreds.rs:190-203`. Plan claims MCP shreds survive dedup — `plan.md:232-236`.
+Required change: keep partition-before-dedup (correct), but update reasoning to reflect discard behavior.
+
+11) MCP path incompatible with Vortexor remote sigverify.
+Evidence: MCP proposer clone is added in `TransactionSigVerifier::send_packets()` — `core/src/ed25519_sigverifier.rs:56-74`. When Vortexor is enabled, `TransactionSigVerifier` is bypassed — `core/src/tpu.rs:270-294`.
+Required change: extend Vortexor adapter or disable MCP when Vortexor is enabled.
+
+12) Two-phase fee path uses wrong API assumption.
+Evidence: plan states “bank.withdraw() does not exist” — `plan.md:567-571`, but `Bank::withdraw()` exists — `runtime/src/bank.rs:6076`.
+Required change: use `Bank::withdraw()` for Phase A fee debit (handles nonce minimum balance).
+
+13) `entry::verify_transactions()` signature mismatch in plan.
+Evidence: plan calls a skip_verification parameter — `plan.md:553-561`. Actual function signature is `entry::verify_transactions(entries, &thread_pool, verify_transaction)` — `ledger/src/blockstore_processor.rs:615-619`.
+Required change: update plan to match actual API.
+
+14) QosService change is leader-side only; plan claims replay-side QoS enforcement.
+Evidence: QosService is used in banking-stage leader path — `core/src/banking_stage/qos_service.rs:1-120`. Replay uses `process_entries()` with Bank cost tracker — `ledger/src/blockstore_processor.rs:649-658`.
+Required change: clarify that 1/NUM_PROPOSERS enforcement in replay must happen via Bank cost tracker or separate logic, not QosService.
+
+15) Test plan includes gossip propagation for missed blocks but design avoids gossip.
+Evidence: plan test says “Gossip summary propagates for missed blocks” — `plan.md:501`, while design says no gossip changes in Pass 6.4.
+Required change: remove/replace test or add gossip path (not recommended for minimal diff).
+
+16) MCP QUIC socket tag addition is not minimal diff.
+Evidence: plan adds new `SOCKET_TAG_MCP` and contact info plumbing — `plan.md:329-339`. Existing `TvuSockets.alpenglow_quic` already provides QUIC server — `core/src/tvu.rs:258-273`.
+Required change: reuse alpenglow QUIC socket and multiplex by message type to avoid gossip/socket churn (minimal diff).
+
+17) ReedSolomonCache is reusable within ledger crate; plan says not reusable.
+Evidence: `ReedSolomonCache::get()` is `pub(crate)` and available in `ledger` — `ledger/src/shredder.rs:276`. MCP modules live in `ledger` and can use it.
+Required change: reuse cache to reduce CPU churn and diff.
+
+18) ForwardingStage proposer routing needs explicit slot offset and time source.
+Evidence: existing `next_leaders()` uses `FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET` and PoH recorder — `core/src/next_leader.rs:27-55`.
+Required change: define MCP-specific offset rule and source of slot timing; otherwise different nodes forward to different proposers.
+
+19) Relay deadline and aggregation deadline use wallclock in plan but spec is silent.
+Evidence: plan defines `MCP_RELAY_DEADLINE_MS` and `MCP_AGGREGATION_DEADLINE_MS` — `plan.md:286-292`, but no clock source defined.
+Required change: define slot start time source (PoH ticks or bank slot timing) to avoid divergence.
+
+20) Relay index ownership with duplicates needs explicit handling.
+Evidence: spec allows duplicate identities in Relays[s] — `docs/src/proposals/mcp-protocol-spec.md:254-257`. Plan’s relay self-check uses a single index description; duplicates must be treated as distinct indices.
+Required change: explicitly accept all indices returned by `relay_indices_at_slot()` and count by relay_index, not pubkey.
+
+21) Consensus_meta/block_id verification is UNVERIFIED until Alpenglow defines bytes.
+Evidence: spec defers to consensus protocol — `docs/src/proposals/mcp-protocol-spec.md:175-178`, `docs/src/proposals/mcp-protocol-spec.md:426-431`. Plan invents SHA256 placeholder.
+Required change: mark as UNVERIFIED and do not ship without consensus definition.
+
+22) MCP shred detection predicate is unspecified and must avoid false positives.
+Evidence: plan says detect via size/header pattern but does not fix predicate — `plan.md:142-145`.
+Required change: define exact predicate and add tests vs Agave shred layout.
+
+23) Replay availability check must verify witness for the included commitment.
+Evidence: spec requires counting shreds that pass witness verification for that commitment — `docs/src/proposals/mcp-protocol-spec.md:200-203`. Plan says “count locally stored shreds with valid witness” but does not require commitment match at count time.
+Required change: ensure witness verification uses the included commitment and shred_index.
+
+24) ConsensusBlock request/response is extra complexity not required by spec.
+Evidence: spec does not mandate recovery protocol; plan adds request/response and caching — `plan.md:490-507`.
+Required change: optional; remove for minimal diff or keep tiny if needed.
+
+25) Line reference mismatches and ambiguous files in plan.
+Evidence and corrections:
+- `merkle_tree.rs:*` must be `ledger/src/shred/merkle_tree.rs` (not `ledger/src/merkle_tree.rs`).
+- `account_loader.rs:370` is `svm/src/account_loader.rs:370`.
+- `blockstore.rs` and `blockstore_processor.rs` references should point to `ledger/src/blockstore.rs` and `ledger/src/blockstore_processor.rs` (avoid benches/tests).
+- `consensus.rs:717` is `core/src/consensus.rs:717` and is dev-only (`cfg(feature = "dev-context-only-utils")`).
+
+B) Spec ↔ Plan consistency table (mismatches only)
 
 | Plan section | Spec anchor | Correct? | Exact correction if not | Reason |
 |---|---|---|---|---|
-| Pass 1.2 Transaction payload (standard Solana txs) | §3.1, §7.1 | NO | Either implement §7.1 Transaction format or amend spec to permit legacy Solana txs for MCP v1 | Spec mandates §7.1 layout for each tx bytes value; plan uses legacy format |
-| Pass 1.2 ordering_fee derived from compute_unit_price | §3.6, §7.1 | NO | Parse ordering_fee from TransactionConfigMask bit1 value (or amend spec to map compute_unit_price→ordering_fee) | ordering_fee is a distinct field in spec |
-| Pass 1.2 MAX_PROPOSER_PAYLOAD=40*863 | §3.2, §4 | PARTIAL | Keep k*SHRED_DATA_BYTES bound but note spec’s bound is looser; ensure encoder enforces k=DATA_SHREDS_PER_FEC_BLOCK | Spec says batch MUST NOT exceed NUM_RELAYS*SHRED_DATA_BYTES; k=40 implies tighter bound |
-| Pass 1.3 Merkle tree | §6 | YES | — | Correct prefixes, SHA-256, 32-byte witness entries |
-| Pass 1.4 MCP shred wire format | §7.2 | YES (with missing check) | Enforce witness_len == ceil(log2(NUM_RELAYS)) at parse time | Spec requires witness_len match implied Merkle proof length |
-| Pass 2 schedule generation | §5 | YES | — | Domain separation + same stake set + wraparound windows |
-| Pass 3 sigverify partition | §3.3, §7.2 | YES | — | Must reject invalid signature/witness before storage |
-| Pass 4 relay attestation | §3.3, §7.3 | PARTIAL | Enforce entries sorted by proposer_index and no duplicates; reject invalid ordering/dupes on parse | Spec mandates sorted unique entries |
-| Pass 6 leader aggregation | §3.4, §7.4 | PARTIAL | Enforce relay_entries sorted by relay_index; enforce per-relay entries sorted by proposer_index; drop invalid entries | Spec mandates ordering; plan doesn’t specify validation |
-| Pass 6 threshold handling | §3.4 | YES | — | Leader SHOULD submit empty if < threshold; validators MUST treat below threshold invalid |
-| Pass 7 vote gate equivocation | §3.5 | YES | — | Exclude proposer with multiple commitments |
-| Pass 7 vote gate invalid relay entries | §3.5 | YES | — | Ignore invalid entries, keep valid |
-| Pass 7 reconstruct/execute | §3.6, §8 | PARTIAL | Explicitly ensure per-payer cumulative fee tracking is per-slot and deterministic across forks | Spec requires two-pass fee handling and cumulative per payer |
-| Pass 7 consensus_meta/block_id | §3.4, §7.5 | NO | Provide consensus_meta consistent with ledger rules (bank hash/ledger commitment), not aggregate hash | Spec forbids aggregate-hash-derived block_id |
-| Pass 7 delayed_bankhash | §3.5 | NO (assumption) | Either define consensus rule for unavailable delayed slot or reject vote | Spec does not allow Hash::default() exception |
+| Pass 1.2 tx wire format | §3.1, §7.1 | NO | Implement §7.1 or amend spec | Spec mandates §7.1 format |
+| Pass 1.2 ordering_fee source | §3.6, §7.1 | NO | Parse config field or amend spec mapping | ordering_fee is distinct field |
+| Pass 1.2 ordering_fee direction | §3.6 | NO (spec ambiguous) | Specify direction via amendment | Spec says “order by” only |
+| Pass 1.4 witness_len enforcement | §6, §7.2 | NO | Enforce witness_len == ceil(log2(NUM_RELAYS)) | Required by spec |
+| Pass 4.2 RelayAttestation entry ordering | §7.3 | NO | Enforce sorted unique proposer_index | Spec requires ordering |
+| Pass 6.2 AggregateAttestation ordering | §7.4 | NO | Enforce relay_index order and per-relay proposer_index order | Spec requires canonical bytes |
+| Pass 6.3 block_id in consensus_meta | §3.4, §7.5 | NO | Encode ledger commitment in consensus_meta | Spec forbids aggregate-hash block_id |
+| Pass 7.1 delayed_bankhash fallback | §3.5 | NO | No fallback unless consensus defines | Spec mandates verification |
+| Pass 7.1 global relay threshold | §3.4 | NO | Reject if relay entries < ceil(ATTESTATION_THRESHOLD*NUM_RELAYS) | Validators must treat block invalid |
 
----
+C) Codebase reality check — additional mismatches and assumptions
 
-2) CODEBASE REALITY CHECK (Agave)
+Over‑engineered changes (can be simpler / lower diff)
+- New MCP socket tag and ContactInfo plumbing. Reuse existing `alpenglow_quic` socket and multiplex MCP messages by type.
+- ConsensusBlock request/response and caching are optional; can drop for minimal diff.
+- ReedSolomonCache is usable within `ledger` crate; no need for direct `ReedSolomon::new()` everywhere.
 
-2a) Line references that don’t match current code (corrected)
-- plan.md (NOT reusable table) cites `ledger/src/merkle_tree.rs:37/100/108` and `MERKLE_HASH_PREFIX_*` at `merkle_tree.rs:17-18` — file does not exist. Correct file is `ledger/src/shred/merkle_tree.rs` (prefixes at `ledger/src/shred/merkle_tree.rs:17-18`, join_nodes at `ledger/src/shred/merkle_tree.rs:100`, get_merkle_root at `ledger/src/shred/merkle_tree.rs:108`).
-- plan.md references `runtime/src/bank/account_loader.rs:370` for `validate_fee_payer()` — correct file is `svm/src/account_loader.rs:370`.
-
-2b) Over-engineered changes (can be simpler / lower diff)
-1) New MCP socket tag + new QUIC server thread
-- Existing QUIC server `solQuicAlpglw` already bound via `TvuSockets.alpenglow_quic` — core/src/tvu.rs:258-273.
-- Minimal-diff option: multiplex MCP messages on the existing alpenglow QUIC socket and dispatch by 1-byte type prefix, avoiding new ContactInfo socket tag and node/socket plumbing. This is consistent with “single multiplexed socket” goal; change is isolated to server dispatch and handler routing.
-
-2) ConsensusBlock recovery protocol (request/response)
-- Adds new message types and caching logic. If acceptable, recovery can reuse existing repair/cluster slot info by broadcasting multiple times at deadline + N retries (same QUIC broadcast) and rely on gossip for peer discovery. That removes request/response complexity. If reliability required, keep but ensure caching interface is tiny.
-
-2c) Under-specified parts (must clarify to avoid ambiguity)
-- Deadline computation: define clock source and slot start (e.g., PoH tick height to wallclock mapping or bank slot timing). Otherwise relays/leaders will diverge on when to send attestations.
-- Relay index ownership with duplicates: explicitly handle multiple indices per relay identity when validating “relay’s own index” rule; must accept shreds for all owned indices.
-- Parsing rules: reject RelayAttestation/AggregateAttestation with unsorted or duplicate indices (spec required). Define whether leader/validator drops entire message or just invalid entries.
-- Consensus block_id semantics: must be tied to actual ledger commitment. If Alpenglow defines block_id, specify the exact bytes in consensus_meta and how validators verify it.
-- MCP shred detection: `is_mcp_shred_packet()` must be unambiguous and constant-time-ish. Specify exact header/length checks to avoid false positives on Agave shreds or other packet types.
-- Witness length: enforce `witness_len == ceil(log2(NUM_RELAYS))` (8) at parse time to avoid ambiguity and inconsistent verification.
-
----
-
-3) MINIMAL DIFF ARCHITECTURE REWRITE — Plan v2 (shorter, same pass structure)
-
-Pass 1 — Feature gate + types + MCP Merkle + MCP shred (NO behavior change)
-- Gate all MCP paths by `feature_set::mcp_protocol_v1::id()` at the listed locations.
-- Add `ledger/src/mcp.rs` constants + wire types + helper functions:
-  - Constants: NUM_PROPOSERS=16, NUM_RELAYS=200, DATA_SHREDS=40, CODING_SHREDS=160, SHRED_DATA_BYTES=863, thresholds (ceil to 120/80/40).
-  - `McpPayload` = u32 count + (u32 len + tx bytes)... ; ignore trailing zero padding (§3.1).
-  - `RelayAttestation`, `AggregateAttestation`, `ConsensusBlock` serialize exactly per §7.3–§7.5 and reject unknown version.
-  - **Spec deviation (UNVERIFIED)**: If using legacy Solana txs, explicitly document amendment required; otherwise implement §7.1 Transaction format and use ordering_fee from TransactionConfigMask bit1.
-- Add `ledger/src/mcp_merkle.rs` implementing §6 (0x00/0x01 prefixes, 32-byte witness entries, odd node duplication).
-- Add `ledger/src/shred/mcp_shred.rs` implementing §7.2 and validation rules:
-  - Enforce `proposer_index < NUM_PROPOSERS`, `shred_index < NUM_RELAYS`, `witness_len == ceil(log2(NUM_RELAYS))`.
-  - `verify_signature` over commitment and `verify_witness` via MCP Merkle proof.
-  - `is_mcp_shred_packet()` MUST be length==PACKET_DATA_SIZE and fail `shred::wire::get_shred()` signature/variant layout checks (UNVERIFIED: finalize exact predicate).
-
-Pass 2 — Schedules (reuse leader schedule algorithm)
-- Add `stake_weighted_slot_schedule()` with domain-separated seed (SHA-256(domain||epoch)) and same WeightedIndex/ChaChaRng algorithm as leader schedule.
-- Implement `mcp_proposer_schedule()` / `mcp_relay_schedule()` in `leader_schedule_utils.rs` using vote-keyed vs identity-keyed stake selection identical to leader schedule.
-- Extend `LeaderScheduleCache` with proposer/relay caches + accessors:
-  - `proposers_at_slot()`, `relays_at_slot()` return windows of 16/200 with wrap.
-  - `*_indices_at_slot()` returns all indices (supports duplicates).
-
-Pass 3 — Storage + sigverify partition
-- Add MCP CFs: `McpShredData(slot,u8,u32)` and `McpRelayAttestation(slot,u16)`; register in `blockstore_db.rs` and purge logic.
-- Add `Blockstore` helpers: put/get MCP shreds/attestations.
-- In `turbine/src/sigverify_shreds.rs`, partition MCP packets immediately after `recv_timeout()` and BEFORE dedup/GPU/resign.
-  - MCP path: parse + proposer signature verify + witness verify + proposer_index lookup via `LeaderScheduleCache`.
-  - Agave path unchanged.
-  - Verified MCP packets sent to existing `verified_sender`.
-
-Pass 4 — Window service + relay attestations + relay retransmit
-- In `window_service.run_insert()`, detect MCP packets on raw payload (before `Shred::new_from_serialized_shred`).
-- MCP handler:
-  - Parse/validate MCP shred; store in MCP CF; record per-slot proposer commitment; track equivocation.
-  - If node is relay (has relay indices): accept only shreds where `shred_index` matches one of its indices (spec §3.3).
-- Relay attestation deadline handling (define clock source):
-  - Build `RelayAttestation` with entries sorted by proposer_index and NO duplicates; sign; send to leader over QUIC.
-  - Enforce “at most one attestation per slot”.
-- Retransmit: relay broadcasts verified MCP shreds to all validators via TVU fetch UDP sockets (spec §3.3). No changes to turbine retransmit (Agave shred layout incompatible).
-
-Pass 5 — Proposer pipeline + forwarding
-- Forwarding: when MCP active, resolve proposer TPU-forward addresses (via `LeaderScheduleCache`) instead of leader; forward to 16 proposers.
-- Sigverify split: add optional `mcp_proposer_sender` in `TransactionSigVerifier` and clone packets to proposer thread when this node is a proposer for the slot.
-- Proposer thread:
-  - Deserialize txs, extract ordering_fee (spec §7.1) OR map from compute_unit_price if spec amendment is accepted.
-  - Sort by ordering_fee desc, tie by concatenation order (by proposer_index).
-  - Serialize `McpPayload` (must fit DATA_SHREDS*SHRED_DATA_BYTES); encode RS(40,160).
-  - Compute MCP Merkle root; build 200 MCP shreds with witness + proposer signature; send one shred to each relay (relay_index = shred_index).
-- QoS: divide block-level compute and loaded-accounts-data limits by NUM_PROPOSERS (§3.2).
-
-Pass 6 — Leader aggregation + ConsensusBlock
-- ReplayStage receives RelayAttestations via QUIC handler.
-- Leader aggregation:
-  - Drop relay message if relay_signature invalid.
-  - Drop invalid proposer entries; keep remaining entries.
-  - Build AggregateAttestation sorted by relay_index; per-relay entries sorted by proposer_index.
-- ConsensusBlock creation:
-  - If relay entries < ceil(ATTESTATION_THRESHOLD*NUM_RELAYS): submit empty.
-  - consensus_meta MUST carry ledger block_id (UNVERIFIED until Alpenglow integration defines exact bytes).
-  - delayed_bankhash MUST match consensus-defined delayed slot; if unavailable, validator must refuse to vote (unless consensus protocol explicitly allows a default).
-- Broadcast ConsensusBlock via QUIC to all validators; optional peer request/response if needed (keep minimal).
-
-Pass 7 — Vote gate + reconstruct + replay
-- On ConsensusBlock receipt:
-  - Verify leader_signature + leader_index + delayed_bankhash (no default unless consensus allows).
-  - Verify relay + proposer signatures; drop invalid entries only.
-  - Compute implied proposers: exclude equivocations; include commitment if >= ceil(INCLUSION_THRESHOLD*NUM_RELAYS) distinct relay indices.
-  - Check local availability: for each included proposer, need >= ceil(RECONSTRUCTION_THRESHOLD*NUM_RELAYS) valid shreds for commitment; otherwise do not vote.
-- Reconstruction:
-  - RS decode ≥40 shreds; re-encode and verify commitment.
-  - Parse `McpPayload` txs.
-- Execution:
-  - Two-phase fees per §8: Phase A pre-deduct fees with per-payer cumulative tracking (slot-scoped). Phase B executes with fee-deduction disabled (`zero_fees_for_test` path).
-  - No PoH verification; use `entry::verify_transactions()` then `process_entries()`.
-
-UNVERIFIED (explicit)
-- Block_id encoding in consensus_meta (requires Alpenglow/ledger commitment definition).
-- Delayed slot source and policy if delayed bank not frozen.
-- Exact MCP shred packet detection predicate.
-
----
-
-4) RISK & ATTACK REVIEW (pragmatic)
-
-Correctness risks (top 10) + minimal mitigation
-1) Tx wire format mismatch → reject on other nodes
-- Mitigation: implement §7.1 or finalize spec amendment; add compatibility flag with explicit version.
-2) Block_id mismatch to ledger rules → consensus divergence
-- Mitigation: define consensus_meta encoding (bank hash or ledger commitment) and enforce verification.
-3) Delayed bankhash unavailable → inconsistent voting
-- Mitigation: define consensus rule: no vote until delayed slot frozen; instrument metric + backoff.
-4) Invalid relay entries poisoning aggregate → incorrect inclusion
-- Mitigation: strict parsing (sorted/no duplicates), drop invalid entries only.
-5) Equivocation handling on relay/validator differs → inconsistent inclusion
-- Mitigation: same rule everywhere: if >1 commitment for proposer, exclude completely.
-6) Duplicate relay indices with same identity → incorrect counts
-- Mitigation: counts based on relay_index, not pubkey; schedule cache returns all indices.
-7) Witness_len not enforced → acceptance of malformed proofs
-- Mitigation: enforce exact length at parse time (8 for NUM_RELAYS=200).
-8) MCP shreds dropped by Agave sigverify/window_service path
-- Mitigation: partition BEFORE dedup/deserialize; add tests that ensure MCP shreds survive.
-9) Fee double-charging or missed charging across phases
-- Mitigation: unit-test two-phase path; ensure Phase B uses zero fees; track per-payer cumulative fees.
-10) Nonce fee rule mismatch (fee*NUM_PROPOSERS + min rent)
-- Mitigation: explicit check during Phase A; test with nonce accounts.
-
-Performance risks (top 10) + minimal mitigation
-1) CPU-only MCP signature + witness verification overhead
-- Mitigation: batch verify proposer sigs by grouping per proposer; cache proposer pubkey per slot.
-2) Relay broadcast fanout O(N^2) (relays→all validators)
-- Mitigation: use UDP batch send + rate-limit; consider reuse of existing cluster send helpers.
-3) Blockstore IO pressure from 200 shreds/proposer
-- Mitigation: write-batch inserts; small in-memory dedup before write.
-4) ReplayStage aggregation memory growth
-- Mitigation: keep per-slot caps; evict after deadlines.
-5) Rayon contention in window_service
-- Mitigation: collect MCP metadata in thread-local vector, aggregate sequentially.
-6) QUIC contention (single MCP socket)
-- Mitigation: reuse existing QUIC server thread; limit max in-flight streams.
-7) RS decode hotspots in reconstruction
-- Mitigation: cache ReedSolomon instance per thread; only decode once per proposer.
-8) Ordering sort cost for large payload
-- Mitigation: partial sort or bucket by fee if needed; keep stable tie-breaker.
-9) Schedule cache churn for proposer/relay lists
-- Mitigation: reuse LeaderScheduleCache LRU pattern; limit epochs stored.
-10) Sigverify path backpressure (verified_sender)
-- Mitigation: instrument queue size; drop MCP shreds only after metrics indicate saturation.
-
----
-
-5) TEST PLAN QUALITY GATE
-
-Missing ship-stopper tests
-- Tx format compliance: §7.1 serialization/deserialization and ordering_fee extraction.
-- Vote gate with partial invalid relay entries: ensure invalid entries dropped, not whole block.
-- Block_id/consensus_meta verification end-to-end with stubbed ledger commitment.
-- Delayed_bankhash unavailability: validator must refuse vote unless consensus rule allows.
-- Duplicate relay indices for same identity: counts by index not pubkey.
-- Witness_len enforcement (reject non-8 len proofs).
-
-Minimal integration harness design (fits Agave test style)
-- New `core/tests/mcp_integration.rs` using existing local cluster test utilities.
-- Use a deterministic `LeaderScheduleCache` seeded by a fixed epoch and static stakes.
-- Stub QUIC handler with in-process channels to avoid network flakiness; feed MCP messages directly into ReplayStage receivers.
-- Use a tiny Blockstore temp dir and inject MCP shreds + attestations to simulate relay/leader behavior.
-
-Coverage requirements mapping
-- Partition-before-Agave-layout assumptions: tests ensuring MCP shreds are not dropped in `sigverify_shreds` and `window_service`.
-- QUIC payload sizing: assert RelayAttestation/ConsensusBlock sizes exceed PACKET_DATA_SIZE; ensure QUIC path used.
-- Vote gate + partial invalid relay entries: confirm invalid entries dropped, inclusion threshold computed correctly.
-- Two-phase fee correctness: includes nonce edge (fee*NUM_PROPOSERS + min rent), cumulative per payer, and Phase B zero-fee path.
-
-
----
-
-Addendum — Review of “McpProposerContext” light-bank proposal (2026-02-04)
-
-Decision: PARTIAL ACCEPT with corrections. Good direction for minimal-diff, but current suggestion conflicts with spec and Agave reality in two places and needs tighter scoping to avoid re-implementing Bank logic.
-
-High issues
-1) Fee validation at proposer is NOT required by spec; must not be treated as authoritative
-- Spec: proposer stage only requires batch size bound and per-proposer resource split; fee payer DOS handling is a replay-time validator rule (§3.2, §8). Proposers can include invalid/insufficient-fee txs; validators will filter/charge in Phase A. Early filtering is allowed as local policy but must not change consensus outcomes.
-- Correction: if implemented, this must be “best-effort local admission” only, and MUST NOT affect inclusion guarantees or be assumed by validators.
-
-2) Using AccountsDb load_with_fixed_root risks inconsistency with replay eligibility
-- Proposer may read balances from a parent bank snapshot that diverges from validators’ replay-time view (forks, root changes). This can cause proposer to drop txs that would be valid on the eventual fork, reducing liveness.
-- Correction: treat fee validation as optional admission control with metrics; do not enforce hard rejection at proposer unless explicitly required by network policy. Alternatively, avoid balance checks entirely and only enforce size/QoS.
-
-Codebase reality checks (Agave)
-- “consumer.rs:460-493” reference is likely stale; current fee payer validation path is in `svm/src/account_loader.rs:370` and transaction fee computation in `runtime/src/bank/check_transactions.rs:100-126` (see earlier). If mirroring logic, use these real locations; otherwise mark as UNVERIFIED.
-- `CostTracker` and `CostModel` are in the runtime/banking pipeline; they assume a Bank-scoped config (block cost limits, loaded accounts data size). You can construct a local `CostTracker` with explicit limits, but ensure you import from the same module as `QosService` to avoid duplication.
-
-Minimal-diff recommendation
-- Keep proposer thread bankless; add a tiny “admission control” helper that reuses existing cost model and compute budget parsing but does NOT read accounts or compute fees unless absolutely necessary.
-- If fee checks are desired, do them as soft filters (metrics + optional drop) and guard with `mcp_protocol_v1` feature gate to keep behavior contained.
-
-Concrete corrections to the proposed design
-1) McpProposerContext should be explicit about non-authoritative admission:
-- Add: `mode: AdmissionMode { SizeOnly, SizePlusQoS, SizePlusQoSPlusFeeSoft }`.
-- Default to SizePlusQoS; use fee checks only if product requires it.
-
-2) Fee validation path must be aligned with spec tx format decision
-- If MCP uses §7.1 Transaction format, ordering_fee and fee computation should use that config values. If MCP uses legacy Solana txs, compute_budget_instructions are fine, but this is spec-deviant and must be flagged (see Critical issue #1 above).
-
-3) Use cost_tracker limits derived from per-proposer share
-- Limits must be 1/NUM_PROPOSERS of the same block-level limits used by QoS for Agave banking. Ensure loaded_accounts_data_size limits are also scaled (spec §3.2 requires both CU and loaded accounts data size).
-
-4) Avoid direct AccountsDb load unless policy requires
-- If kept: use a consistent snapshot (rooted bank or fixed root) and do not treat failure as consensus-critical. Record in metrics to assess false negatives.
-
-Updated Plan v2 patch (delta only)
-- Pass 5 proposer loop: add optional “Admission control” subsection
-  - Use compute budget parsing + local CostTracker to enforce per-proposer CU + loaded-accounts-data limits.
-  - Fee payer balance check is OPTIONAL/soft; must not affect consensus correctness.
-  - If implemented, document that validation is advisory only and may drop txs that would be valid on final fork (liveness trade-off).
-
-UNVERIFIED items to explicitly mark in plan
-- Exact source of block-level loaded-accounts-data size limits to divide by NUM_PROPOSERS.
-- Correct module paths for cost model and cost tracker in Agave at time of implementation.
-
----
-
-L8 Review Fixes Applied (2026-02-07)
-
-Issues fixed in plan.md:
-1) BUG-1 (HIGH): Phase A fee granularity changed from per-proposer-batch to per-transaction. Spec §8 requires "deduct fees for all transactions that pass" — per-tx granularity is consensus-critical.
-2) ARCH-1 (HIGH): Phase A bank mutation changed from bank.withdraw() (doesn't exist) to bank.get_account() + bank.store_account() which properly tracks dirty accounts.
-3) M-1 (HIGH): Added proposer slot source — PohRecorder::slot() (same as BankingStage).
-4) M-2 (MEDIUM): Added FeatureSet source — clone Arc<FeatureSet> from root bank, refresh per epoch.
-5) BUG-3 (MEDIUM): §5.4 now includes loaded_accounts_data_size_limit /= 16.
-6) BUG-4 (MEDIUM): RelayAttestation parse-time validation added — reject unsorted/duplicate proposer_index entries.
-7) ARCH-2 (MEDIUM): MCP replay logic extracted into core/src/mcp_replay.rs. replay_stage diff reduced to ~20 lines.
-8) ARCH-3 (MEDIUM): §5.4 purpose clarified — replay-side QoS enforcement, must agree with proposer-side §5.3 limits.
-9) M-5 (MEDIUM): BankingStage interaction clarified — continues to run normally, MCP proposer loop is independent.
-10) BUG-2 (MEDIUM): ordering_fee sort direction noted as PENDING SPEC AMENDMENT (spec §3.6 is ambiguous).
-
-Remaining UNVERIFIED (unchanged):
-- block_id derivation (requires Alpenglow integration)
-- delayed_bankhash unavailability policy
-- MCP shred detection predicate finalization
+Under‑specified or incorrect assumptions
+- QUIC message size: existing streamer enforces PACKET_DATA_SIZE, so MCP messages must be fragmented or handled by a dedicated server.
+- Vortexor path: MCP proposer clone is bypassed; MCP must be disabled or Vortexor extended.
+- Deadline timing: clock source and slot start must be defined; wallclock constants alone are insufficient.
+- MCP shred detection predicate is not fully specified; needs an exact rule and tests.
+- Proposer routing in ForwardingStage needs explicit slot offset semantics to match existing `next_leaders()` behavior.
+- Replay availability check must verify witness for the included commitment, not just any valid shred.
+- QosService change affects leader path only; replay enforcement must be defined separately.
+- Two‑phase fee implementation should use `Bank::withdraw()` instead of manual account store.
+- `entry::verify_transactions()` signature mismatch in plan needs correction.
