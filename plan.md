@@ -513,11 +513,12 @@ Validators that miss the direct broadcast request ConsensusBlocks from ANY peer 
 1. Verify leader_signature, leader_index matches Leader[s].
 2. Verify delayed_bankhash against local bank hash for `slot - MCP_DELAY_SLOTS` via `BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())`. Accept Hash::default() during warmup period (first MCP_DELAY_SLOTS slots after genesis or restart).
 3. Verify every relay_signature and proposer_signature in aggregate. **Per spec section 3.5:** ignore individual relay entries that fail signature verification — do not reject the entire block. Keep valid relay entries and discard invalid ones, then proceed with the valid set.
-4. Compute implied proposers:
+4. **Global relay-count threshold (spec section 3.4):** Count total valid relay entries remaining after step 3. If count < 120 (ATTESTATION_THRESHOLD = ceil(0.6 * 200)), reject the block as invalid. This is separate from the leader-side check in §6.3 — validators MUST independently enforce this threshold.
+5. Compute implied proposers:
    - 2+ distinct commitments -> equivocating -> exclude.
    - 1 commitment with >=80 relay attestations (INCLUSION_THRESHOLD) -> include.
-5. For each included proposer: count locally stored shreds with valid witness >=40 (RECONSTRUCTION_THRESHOLD).
-6. Any included proposer below 40 -> do not vote.
+6. For each included proposer: count locally stored shreds with valid witness >=40 (RECONSTRUCTION_THRESHOLD).
+7. Any included proposer below 40 -> do not vote.
 
 ### 7.2 Reconstruct
 
@@ -599,7 +600,7 @@ Consensus outputs empty result -> freeze bank with no transactions.
 
 ### 7.6 Tests
 
-- Vote gate rejects: bad leader sig, bad bankhash, equivocating proposer, insufficient shreds.
+- Vote gate rejects: bad leader sig, bad bankhash, equivocating proposer, insufficient shreds, global relay count < 120 after filtering invalid entries.
 - Reconstruction round-trip: shred -> reconstruct -> verify commitment.
 - Ordering: ordering_fee sort is deterministic.
 - Fee multiplier: payer needs 16x balance.
