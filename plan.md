@@ -94,7 +94,7 @@ Spec section 3.1 requires "each transaction bytes value is a Transaction message
 
 Types (all with serialize/deserialize/sign/verify):
 - `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). **PENDING SPEC AMENDMENT:** Each `tx_bytes` is a standard Solana wire-format transaction. See SPEC AMENDMENT REQUIREMENT above. ordering_fee is derived from compute_unit_price. Trailing zero padding ignored.
-- `RelayAttestation` — version:1 + slot:8 + relay_index:4 + entries_len:1 + entries[proposer_index:4 + commitment:32 + proposer_sig:64] + relay_sig:64 (section 7.3).
+- `RelayAttestation` — version:1 + slot:8 + relay_index:4 + entries_len:1 + entries[proposer_index:4 + commitment:32 + proposer_sig:64] + relay_sig:64 (section 7.3). **Parse-time validation:** entries MUST be sorted by proposer_index ascending with no duplicates (spec §7.3). Reject on deserialization if unsorted or contains duplicate proposer_index values.
 - `AggregateAttestation` — version:1 + slot:8 + leader_index:4 + relays_len:2 + relay_entries sorted by relay_index (section 7.4).
 - `ConsensusBlock` — version:1 + slot:8 + leader_index:4 + aggregate_len:4 + aggregate + consensus_meta_len:4 + consensus_meta + delayed_bankhash:32 + leader_sig:64 (section 7.5).
 - `reconstruct_batch()` — RS decode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` (NOT `ReedSolomonCache` — it is `pub(crate)`), re-encode, verify commitment matches (section 3.6).
@@ -395,7 +395,9 @@ When `mcp_protocol_v1` active and `leader_schedule_cache.proposers_at_slot(slot)
 
 ### 5.3 Proposer loop
 
-`core/src/tpu.rs` — add an MCP proposer thread:
+`core/src/tpu.rs` — add an MCP proposer thread.
+
+**Slot and FeatureSet source:** The proposer thread obtains the current slot from `PohRecorder::slot()` (same mechanism used by BankingStage). For `FeatureSet` (needed by `CostModel::calculate_cost()`), clone `Arc<FeatureSet>` from the most recent root bank via `BankForks::root_bank().feature_set.clone()` at thread start and refresh periodically (e.g., every epoch). This is advisory — stale feature set only affects admission control accuracy, not consensus.
 
 1. Receive cloned packets from 5.2.
 2. Deserialize each transaction and extract ordering_fee via `process_compute_budget_instructions()` from `compute-budget-instruction/src/instructions_processor.rs:13`. This reuses the same extraction logic as BankingStage's `ImmutableDeserializedPacket` (`core/src/banking_stage/immutable_deserialized_packet.rs:61-96`).
@@ -419,11 +421,18 @@ When `mcp_protocol_v1` active and `leader_schedule_cache.proposers_at_slot(slot)
 
 No bank, no PoH — this is bankless per spec section 9.
 
+**BankingStage interaction:** When `mcp_protocol_v1` is active for a slot, BankingStage continues to run normally — it processes transactions for the current leader's block (which may be a different slot). MCP proposer batches are built independently via this proposer loop. BankingStage is NOT disabled; the two systems produce output for different purposes (leader block vs. MCP proposer batch).
+
+**PENDING SPEC AMENDMENT — ordering_fee sort direction:** Spec §3.6 says "order them by ordering_fee" without specifying ascending or descending. This plan uses **descending** (higher fee = higher priority). Spec amendment should clarify direction.
+
 ### 5.4 Per-proposer CU budgets
 
-`core/src/banking_stage/qos_service.rs` — when `mcp_protocol_v1` active, divide block-level limits by `NUM_PROPOSERS` (16):
+`core/src/banking_stage/qos_service.rs` — when `mcp_protocol_v1` active, divide block-level limits by `NUM_PROPOSERS` (16) per spec §3.2 ("Global block-level constraints on compute units (CU) and loaded account data are divided evenly among the proposers"):
 - `block_cost_limit /= 16`
 - `account_cost_limit /= 16`
+- `loaded_accounts_data_size_limit /= 16`
+
+**Purpose:** This change applies to the replay-side QoS enforcement when validators process MCP transactions through the execution pipeline. The proposer-side admission control (§5.3) enforces the same 1/16th limits locally before encoding. Both paths must agree on limits to avoid proposers producing batches that validators reject.
 
 ### 5.5 Tests
 
@@ -450,7 +459,7 @@ MCP attestation packets arrive via the "solMcpAttest" QUIC thread from Pass 4.3.
 
 ### 6.2 Verify and aggregate
 
-`core/src/replay_stage.rs` — in the main loop at line 823, drain attestations each iteration:
+Create `core/src/mcp_replay.rs` — all MCP-specific replay logic lives here to keep replay_stage diff minimal (~20 lines). `replay_stage.rs` main loop at line 823 calls `mcp_replay::drain_attestations()` and `mcp_replay::process_consensus_block()` as entry points. Drain attestations each iteration:
 
 1. Verify relay_signature; discard message if invalid (spec section 3.4).
 2. Verify each proposer_signature against commitment; drop invalid entries.
@@ -551,22 +560,21 @@ process_entries(bank, replay_entries, processing_environment, ...)?;
 
 The key insight: `entry::verify_transactions()` does signature verification independent of PoH. The dummy `hash` and `num_hashes` fields are never checked because we skip the PoH verification path.
 
-**Phase A (fees):** Pre-process fee deduction directly on the Bank, BEFORE entering the standard execution pipeline.
+**Phase A (fees):** Pre-process fee deduction on the Bank per-transaction, BEFORE entering Phase B.
 
-**Atomicity and failure handling:**
-- Fee deductions are applied **atomically per-proposer batch** using a RocksDB write-batch or equivalent transactional mechanism.
-- If ANY fee deduction within a proposer batch fails (insufficient funds after cumulative tracking), the **entire proposer's batch is excluded** from execution — not just the failing transaction. This prevents partial state from an excluded proposer.
+**Per-transaction granularity (spec section 8 requirement):**
+Spec §8: "validators MUST deduct fees for all transactions that pass signature and basic validity checks." This requires **per-transaction** processing, NOT per-proposer-batch atomicity. If tx #3 in proposer P's batch fails fee validation, txs #1 and #2 are still fee-deducted and proceed to Phase B. Only the individual failing transaction is dropped.
+
+**Cumulative tracking:**
 - Per-payer cumulative tracking uses an **in-memory `HashMap<Pubkey, u64>`** for the slot duration only. No persistence needed since replay is deterministic from ConsensusBlock.
 - The HashMap is cleared at slot boundary.
 
 **Per-transaction processing:**
 - Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8). For nonce transactions, payer must cover `fee * NUM_PROPOSERS + minimum_rent` per spec section 8.
-- Check `cumulative_fees[payer] + fee * NUM_PROPOSERS <= payer_balance`. If not, exclude this proposer's batch.
+- Check `cumulative_fees[payer] + fee * NUM_PROPOSERS <= payer_balance`. If not, **drop this transaction only** — other transactions in the same proposer's batch proceed normally.
 - Update `cumulative_fees[payer] += fee * NUM_PROPOSERS`.
-- Directly debit fee payer accounts on the Bank via `bank.withdraw()` or equivalent.
+- Load fee payer account via `bank.get_account(&payer)`, debit the fee amount, and write back via `bank.store_account(&payer, &updated_account)`. This properly tracks dirty accounts for bank hash computation. Do NOT use `bank.withdraw()` which does not exist as a public method for this purpose.
 - Collect the list of fee-valid transactions for Phase B.
-
-This avoids threading a flag through 12 layers of execution (process_entries -> process_batches -> ... -> validate_fee_payer).
 
 **Phase B (execution):** Skip fee re-charging. The fee is computed as `signature_count * lamports_per_signature` in `calculate_fee_details()` at `fee/src/lib.rs:44-63`, using `Bank.fee_structure.lamports_per_signature` (called from `runtime/src/bank/check_transactions.rs:106-112`). To zero the fee:
 
@@ -596,6 +604,10 @@ Consensus outputs empty result -> freeze bank with no transactions.
 - Ordering: ordering_fee sort is deterministic.
 - Fee multiplier: payer needs 16x balance.
 - Phase B correctly skips fee re-deduction via zero_fees_for_test path.
+- **Per-transaction fee granularity:** tx #3 fails fee validation -> txs #1, #2 still fee-deducted and executed. NOT per-batch.
+- **Cross-proposer cumulative fees:** same payer in proposer P0 and P3, cumulative tracking catches over-commitment.
+- **Phase A→B state handoff:** fee-deducted accounts in Phase A are visible to Phase B execution with correct balances.
+- **RelayAttestation with unsorted/duplicate entries:** rejected at parse time.
 - End-to-end in `core/tests/mcp_integration.rs`.
 
 ---
@@ -607,6 +619,7 @@ Consensus outputs empty result -> freeze bank with no transactions.
 | `ledger/src/mcp.rs` | Constants (SHRED_DATA_BYTES=863, MAX_PROPOSER_PAYLOAD=34520), wire types (McpPayload, RelayAttestation, AggregateAttestation, ConsensusBlock), reconstruct_batch(), order_transactions() |
 | `ledger/src/mcp_merkle.rs` | MCP-specific Merkle tree with 1-byte prefixes (0x00/0x01) and 32-byte proof entries per spec section 6 |
 | `ledger/src/shred/mcp_shred.rs` | MCP shred wire format, parse/serialize, is_mcp_shred_packet(), verify signature + witness |
+| `core/src/mcp_replay.rs` | MCP replay logic: attestation aggregation, ConsensusBlock validation, vote gate, reconstruction, two-phase execution. Called from replay_stage main loop. |
 
 ## Modified Files
 
@@ -630,8 +643,8 @@ Consensus outputs empty result -> freeze bank with no transactions.
 | `core/src/tvu.rs` | Single "solMcp" QUIC endpoint with message type multiplexing (attestations, ConsensusBlocks, requests/responses) + channels to replay |
 | `core/src/tpu.rs` | MCP proposer channel creation + proposer loop thread |
 | `core/src/banking_stage/qos_service.rs` | CU limits / NUM_PROPOSERS |
-| `core/src/replay_stage.rs` | `mcp_attestation_receiver` + `mcp_consensus_block_receiver` in ReplayReceivers; attestation aggregation, ConsensusBlock building, direct QUIC broadcast, vote gate, reconstruction dispatch |
-| `ledger/src/blockstore_processor.rs` | `confirm_slot_mcp()` with two-phase fee execution (Phase A direct debit + Phase B with zero_fees_for_test) |
+| `core/src/replay_stage.rs` | `mcp_attestation_receiver` + `mcp_consensus_block_receiver` in ReplayReceivers; calls `mcp_replay::drain_attestations()` and `mcp_replay::process_consensus_block()` (~20 lines diff) |
+| `ledger/src/blockstore_processor.rs` | `confirm_slot_mcp()` with two-phase fee execution (Phase A per-tx fee debit via store_account + Phase B with zero_fees_for_test) |
 | `runtime/src/bank/check_transactions.rs` | Check `skip_fee_deduction` flag, pass `zero_fees_for_test: true` to `calculate_fee_details()` |
 | `svm/src/transaction_processor.rs` | Add `skip_fee_deduction: bool` to `TransactionProcessingEnvironment` |
 | `validator/src/commands/run/execute.rs` | Wire MCP attestation + consensus sockets from `Node` through to `TvuSockets` / `Tvu::new()` |

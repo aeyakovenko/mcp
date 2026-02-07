@@ -343,3 +343,181 @@ Fee payer check happens at replay Phase A. This keeps proposer truly bankless.
 | Coding shred format | LOW | Add clarification |
 | Proposer CU tracking missing | **HIGH** | Add `CostTracker` to plan §5.3 |
 | Fee payer validation | MEDIUM | Defer to Phase A (bankless) |
+
+---
+
+## 7. L8 MULTI-PASS REVIEW (2026-02-07)
+
+### PASS A: SPEC↔PLAN CORRECTNESS BUGS
+
+**BUG-1 (HIGH): Phase A batch atomicity contradicts spec §8**
+
+Plan §7.3 says: "If ANY fee deduction within a proposer batch fails, the **entire proposer's batch is excluded**."
+
+Spec §8 says: "validators MUST deduct fees for **all transactions that pass** signature and basic validity checks, even if later execution fails."
+
+The spec requires per-transaction granularity. If tx #3 in proposer P's batch fails fee validation, txs #1 and #2 should still be fee-deducted and executed. The plan's per-proposer-batch atomicity is a consensus-divergence risk — two validators implementing different granularity will produce different bank hashes.
+
+**Fix:** Process fees per-transaction, not per-proposer-batch. Drop individual transactions that fail fee validation; keep the rest.
+
+---
+
+**BUG-2 (MEDIUM): ordering_fee sort direction unspecified in spec**
+
+Spec §3.6: "order them by ordering_fee" — does NOT specify ascending or descending.
+
+Plan §7.3: "sort by ordering_fee desc." Economically correct (higher fee = higher priority) but spec-deviant until clarified.
+
+**Fix:** File spec amendment to say "descending." Document as PENDING.
+
+---
+
+**BUG-3 (MEDIUM): §5.4 is incomplete — missing loaded_accounts_data_size_limit**
+
+Plan §5.4 divides `block_cost_limit` and `account_cost_limit` by 16.
+
+Spec §3.2: "Global block-level constraints on **compute units (CU) and loaded account data** are divided evenly among the proposers."
+
+§5.3 correctly divides all three limits. §5.4 is missing `loaded_accounts_data_size_limit /= 16`.
+
+**Fix:** Add `loaded_accounts_data_size_limit /= 16` to §5.4.
+
+---
+
+**BUG-4 (MEDIUM): Leader aggregate validation is incomplete**
+
+Spec §7.4: "Relay entries MUST be sorted by relay_index... entries inside each relay entry MUST be sorted by proposer_index."
+
+Plan §6.2 accumulates entries but never validates that incoming RelayAttestations have entries sorted by proposer_index and contain no duplicates (spec §7.3 requires this). A malicious relay could send unsorted/duplicate entries.
+
+**Fix:** Add parse-time validation: reject RelayAttestation with unsorted or duplicate proposer_index entries.
+
+---
+
+**BUG-5 (LOW): block_id derivation violates spec §7.5 (KNOWN)**
+
+Spec: "block_id...is not computed by hashing aggregate_bytes."
+Plan §6.3: computes `SHA-256(slot || leader_index || aggregate_hash)`.
+
+Already tracked in codex.md. Marked UNVERIFIED pending Alpenglow integration.
+
+---
+
+### PASS B: CODEBASE REALITY CHECK
+
+**All 45+ line references verified correct.** One minor note:
+
+- Plan §3.3 references "line 437: verify_packets" — actual line 437 is `verify_shreds_gpu()` call inside `verify_packets()` (defined at line 423). The reference is functional but imprecise. Non-blocking.
+
+---
+
+### PASS C: ARCHITECTURAL ISSUES
+
+**ARCH-1 (HIGH): Phase A `bank.withdraw()` bypasses transaction pipeline**
+
+Plan §7.3 says "Directly debit fee payer accounts on the Bank via `bank.withdraw()` or equivalent." Problems:
+
+1. Bank has no public `withdraw(pubkey, amount)` for arbitrary debits in the tx pipeline
+2. Account mutations outside the processor bypass read/write lock management
+3. AccountsDb dirty-account tracking may be inconsistent
+4. Concurrent access with Phase B execution creates data races
+
+**Fix:** Implement Phase A as a preprocessing step within `confirm_slot_mcp()` that iterates ordered transactions and uses the existing `validate_fee_payer()` + account debit path from the SVM account loader. Specifically:
+- For each tx: load fee payer account, validate `cumulative_fees[payer] + fee*16 <= balance`, debit, store
+- Use `bank.store_account()` which properly tracks dirty accounts
+- Then run Phase B with `skip_fee_deduction: true`
+
+---
+
+**ARCH-2 (MEDIUM): replay_stage overload**
+
+Passes 6 + 7 add ~5 responsibilities to replay_stage (already the most complex module):
+- Attestation aggregation
+- ConsensusBlock construction
+- Vote gate logic
+- Reconstruction dispatch
+- Two-phase execution
+
+**Fix:** Create `core/src/mcp_replay.rs` module containing all MCP-specific replay logic. replay_stage calls into it as a single `mcp_replay::process_slot()` entry point. Keeps replay_stage diff to ~20 lines.
+
+---
+
+**ARCH-3 (MEDIUM): §5.4 QoS change may be redundant with §5.3**
+
+§5.3 adds CostTracker to the proposer loop (admission control).
+§5.4 modifies BankingStage's qos_service.rs to divide limits by 16.
+
+With MCP active, the proposer builds batches via §5.3, NOT BankingStage. What is §5.4 for?
+
+If §5.4 is for the replay-side CU enforcement: that's handled by the bank's existing limits. If it's for hybrid MCP+Agave operation: document the scenario.
+
+**Fix:** Clarify purpose of §5.4. If only for replay: move to §7.3. If not needed: remove.
+
+---
+
+**ARCH-4 (LOW): Two QUIC endpoints (alpenglow + solMcp)**
+
+Existing `alpenglow_quic` socket (tvu.rs:258) and new `solMcp` socket (§4.3) overlap in purpose. If Alpenglow IS the consensus protocol for MCP, these should share one socket.
+
+**Fix:** Clarify relationship. If independent: document why two sockets. If shared: reuse alpenglow_quic with message type multiplexing.
+
+---
+
+### PASS D: MISSING PIECES
+
+| # | Missing Piece | Severity | Notes |
+|---|---|---|---|
+| M-1 | Proposer slot source | HIGH | §5.3 uses `slot` in Merkle leaf hash + McpShred but never says where proposer gets the current slot. PohRecorder? Bank? PoH tick height? |
+| M-2 | FeatureSet source for CostModel | MEDIUM | §5.3 calls `CostModel::calculate_cost()` which requires `&FeatureSet`. Proposer is bankless. Must clone from recent root bank. |
+| M-3 | Slot boundary cleanup | MEDIUM | Per-slot MCP state (attestation tracking HashMap, fee cumulative HashMap) needs explicit cleanup to prevent memory leak. |
+| M-4 | Liveness fallback | MEDIUM | If MCP consistently fails (no ConsensusBlock for N slots), is there fallback to normal Agave block production? |
+| M-5 | BankingStage interaction | MEDIUM | Does BankingStage still build blocks when MCP is active? If yes: double work. If no: where is it disabled? |
+| M-6 | Feature gate activation boundary | LOW | Which exact slot transitions from Agave to MCP? What about in-flight pipelines spanning the boundary? |
+| M-7 | AggregateAttestation bandwidth | LOW | With 200 relays × 16 proposers: ~334KB per ConsensusBlock broadcast to all validators per slot. Document as expected. |
+
+---
+
+### PASS E: MINIMAL DIFF ASSESSMENT
+
+**Current plan: 3 new files + 22 modified files.** This is reasonable for the scope.
+
+Reduction opportunities:
+1. Merge `mcp_merkle.rs` into `mcp.rs` — saves 1 file (merkle is ~30 lines of logic)
+2. Extract MCP replay logic from replay_stage into `mcp_replay.rs` — net zero files but cleaner diff
+3. §5.4 may be removable (see ARCH-3) — saves 1 file modification
+
+The plan correctly avoids modifying ShredVariant, ShredCommonHeader, and CRDS (each would add 3-5 more files).
+
+---
+
+### PASS F: SHIP-STOPPER TESTS MISSING
+
+| # | Test | Why ship-stopper |
+|---|---|---|
+| T-1 | Per-transaction fee granularity (not per-batch) | Consensus divergence if wrong (BUG-1) |
+| T-2 | Cumulative fee tracking across proposers: payer in P0 and P3 | Under-committed payer must be caught |
+| T-3 | Phase A→B state handoff: fee-deducted accounts visible in Phase B | Bank state consistency |
+| T-4 | Proposer slot determination: correct slot used in Merkle leaf hash | Wrong slot = all witness verification fails |
+| T-5 | RelayAttestation with unsorted/duplicate proposer entries rejected | Malformed input must not corrupt aggregate |
+| T-6 | 200-relay broadcast bandwidth: measure actual bytes/slot | Capacity planning (M-7) |
+| T-7 | Feature gate boundary: last Agave slot → first MCP slot transition | No dropped/duplicate blocks |
+
+---
+
+### VERDICT
+
+**CONDITIONAL PASS — 1 correctness bug, 4 medium issues, 7 missing pieces.**
+
+The plan is well-researched with accurate codebase references. The core architecture (7-pass structure, shred format, erasure coding, Merkle construction, schedule reuse, sigverify partition, window service partition) is correct and minimal.
+
+**Must fix before implementation:**
+1. BUG-1: Phase A fee granularity (per-tx, not per-batch) — consensus-critical
+2. ARCH-1: Phase A account debit mechanism — needs safe Bank mutation path
+3. M-1: Proposer slot source — fundamental gap
+
+**Should fix:**
+4. BUG-3: §5.4 missing loaded_accounts_data_size_limit
+5. BUG-4: RelayAttestation parse validation
+6. ARCH-2: MCP replay module extraction
+7. M-2: FeatureSet source for proposer CostModel
+8. M-5: BankingStage interaction clarification
