@@ -3372,6 +3372,19 @@ impl Blockstore {
         self.put_mcp_execution_output(slot, &[])
     }
 
+    /// Stores an empty MCP execution output if no output is currently present.
+    /// Returns `true` when the stored value is empty after this call.
+    pub fn put_mcp_empty_execution_output_if_absent(&self, slot: Slot) -> Result<bool> {
+        let _lock = self.insert_shreds_lock.lock().unwrap();
+        match self.mcp_execution_output_cf.get_bytes(slot)? {
+            Some(existing) => Ok(existing.is_empty()),
+            None => {
+                self.mcp_execution_output_cf.put_bytes(slot, &[])?;
+                Ok(true)
+            }
+        }
+    }
+
     pub fn get_index_from_location(
         &self,
         slot: Slot,
@@ -6774,6 +6787,31 @@ pub mod tests {
             .unwrap();
         assert_eq!(
             blockstore.get_mcp_execution_output(99).unwrap(),
+            Some(b"ordered-output".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_mcp_empty_execution_output_if_absent_does_not_overwrite_non_empty() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        assert!(blockstore
+            .put_mcp_empty_execution_output_if_absent(100)
+            .unwrap());
+        assert_eq!(
+            blockstore.get_mcp_execution_output(100).unwrap(),
+            Some(vec![])
+        );
+
+        blockstore
+            .put_mcp_execution_output(100, b"ordered-output")
+            .unwrap();
+        assert!(!blockstore
+            .put_mcp_empty_execution_output_if_absent(100)
+            .unwrap());
+        assert_eq!(
+            blockstore.get_mcp_execution_output(100).unwrap(),
             Some(b"ordered-output".to_vec())
         );
     }
