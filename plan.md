@@ -201,17 +201,17 @@ Non-reusable for MCP wire correctness:
 
 - `turbine/src/sigverify_shreds.rs`:
   - Partition MCP packets before Agave dedup/GPU/resign code paths.
+  - MCP partition classifier MUST be strict (`McpShred` wire-size/layout + witness-length/path checks), not a loose size-only check.
   - Agave packets: unchanged existing path.
-  - MCP packets: CPU verification path only:
-    - parse MCP shred
-    - lookup proposer pubkey from MCP schedule for slot
-    - verify proposer signature
-    - verify Merkle witness
-  - Forward verified MCP packets through existing `verified_sender` channel.
+  - MCP packets:
+    - apply slot feature gate
+    - bypass Agave shred-id/leader-sigverify assumptions
+    - forward through existing `verified_sender` channel for MCP-specific verification in `window_service`
 
 ### 3.4 Tests
 
 - MCP shreds survive partition and are not dropped by Agave layout assumptions.
+- classifier rejects valid Agave Merkle shreds.
 - Valid MCP shred passes, bad signature/proof fails.
 - MCP CF put/get + purge behavior.
 
@@ -227,15 +227,18 @@ Non-reusable for MCP wire correctness:
   - Partition on raw payload bytes before `Shred::new_from_serialized_shred`.
   - MCP payload path:
     - parse + validate MCP shred
+    - verify proposer signature + witness against slot schedule
     - store via MCP blockstore APIs
     - feed relay-attestation tracker
+    - accept/store valid relay-broadcast MCP shreds on all validators (no local relay-index storage filter)
   - Non-MCP path remains unchanged.
 
 ### 4.2 Relay attestation semantics
 
 - Track attestation state by `(slot, relay_index, proposer_index)`.
 - Relay self-check:
-  - if node owns relay indices `R = relay_indices_at_slot(...)`, accept only shreds with `shred_index in R` for relay-attest path.
+  - relay-index ownership (`relay_indices_at_slot`) applies only to relay-attestation emission.
+  - MCP shred storage/retransmit ingestion remains index-agnostic for validator reconstruction.
 - Equivocation:
   - conflicting commitments for same `(slot, relay_index, proposer_index)` => no attestation entry for that tuple.
 - Cardinality:
@@ -246,24 +249,17 @@ Non-reusable for MCP wire correctness:
 
 ### 4.3 MCP QUIC transport
 
-- Need dedicated MCP QUIC stream server (standard streamer path enforces 1232-byte packet limit).
-- Add one socket tag in contact info for MCP endpoint:
-  - `gossip/src/contact_info.rs`
-  - `gossip/src/node.rs`
-  - `gossip/src/cluster_info.rs`
-  - `core/src/validator.rs` wiring
-- `core/src/tvu.rs`:
-  - spawn MCP QUIC service (small helper module, for example `core/src/mcp_quic.rs`).
-  - stream framing: 1-byte message type prefix + payload.
-  - message types:
-    - `0x01` RelayAttestation
-    - `0x02` ConsensusBlock
-  - reject unknown type and oversize frame.
+- Reuse existing QUIC endpoint patterns (no new gossip socket enums unless proven necessary).
+- MCP control messages use `1-byte type + payload` framing:
+  - `0x01` RelayAttestation
+  - `0x02` ConsensusBlock
+- Leader resolution reuses existing leader-schedule lookup and TVU QUIC contact info.
+- Reject unknown type and oversize frame.
 
 ### 4.4 Relay shred broadcast
 
 - Relay retransmits verified MCP shreds to validators over existing TVU fetch UDP sockets.
-- Do not use existing retransmit-stage shred-id logic for MCP bytes.
+- Extend retransmit addressing to derive slot/shred-id from MCP wire format when Agave shred-id parsing fails.
 
 ### 4.5 Tests
 
@@ -299,6 +295,10 @@ Non-reusable for MCP wire correctness:
   5. serialize payload and enforce `MAX_PROPOSER_PAYLOAD`; emit latest §7.1 format where available, otherwise legacy bytes.
   6. call ledger MCP encode helper -> 200 shreds + witnesses.
   7. send shred `i` to relay index `i` address.
+- Bankless recording guardrails:
+  - record path is explicit opt-in from replay-stage call sites
+  - reject if a working bank is installed
+  - reject slot-mismatch vs PoH recorder start slot
 
 ### 5.3 Forwarding stage changes
 
@@ -344,7 +344,7 @@ Validation rules:
 - invalid relay signature => drop relay message
 - invalid proposer signature inside relay entry => drop that entry, keep other valid entries
 - canonical aggregate ordering by `relay_index`
-- enforce aggregate and consensus wire-size upper bounds before decode
+- enforce aggregate and consensus wire-size upper bounds before decode (including QUIC control payload cap)
 - threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation; proposer-entry filtering does not change this relay count
 
 ### 6.3 Leader finalization
