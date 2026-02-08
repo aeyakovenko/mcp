@@ -31,6 +31,7 @@ use {
     },
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
+    solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
     solana_streamer::evicting_sender::EvictingSender,
@@ -38,6 +39,7 @@ use {
     solana_turbine::cluster_nodes,
     std::{
         borrow::Cow,
+        collections::HashMap,
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -201,6 +203,7 @@ fn run_insert<F>(
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     blockstore: &Blockstore,
     bank_forks: &RwLock<BankForks>,
+    local_pubkey: &Pubkey,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
@@ -226,6 +229,8 @@ where
     let mut mcp_retransmit_batch = Vec::new();
     let mut mcp_shred_count = 0usize;
     let mut legacy_shreds = Vec::with_capacity(shreds.len());
+    let mut relay_indices_cache: HashMap<Slot, Vec<u32>> = HashMap::new();
+    let mut proposer_pubkeys_cache: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
 
     for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
@@ -245,6 +250,8 @@ where
             last_bank_refresh = Instant::now();
             root_bank = bank_forks.read().unwrap().root_bank();
             mcp_relay_processor.prune_below_slot(root_bank.slot());
+            relay_indices_cache.clear();
+            proposer_pubkeys_cache.clear();
         }
 
         if !cluster_nodes::check_feature_activation(
@@ -255,11 +262,29 @@ where
             continue;
         }
 
-        // MCP proposer schedule APIs are wired in another pass; use slot leader as the
-        // proposer verifier until proposer-index schedules are available here.
-        let Some(proposer_pubkey) = leader_schedule_cache
-            .slot_leader_at(mcp_shred.slot, Some(&root_bank))
-            .or_else(|| leader_schedule_cache.slot_leader_at(mcp_shred.slot, None))
+        let relay_indices = relay_indices_cache
+            .entry(mcp_shred.slot)
+            .or_insert_with(|| {
+                leader_schedule_cache.relay_indices_at_slot(
+                    mcp_shred.slot,
+                    local_pubkey,
+                    Some(&root_bank),
+                )
+            });
+        if !relay_indices.contains(&mcp_shred.shred_index) {
+            continue;
+        }
+
+        let proposer_pubkeys = proposer_pubkeys_cache
+            .entry(mcp_shred.slot)
+            .or_insert_with(|| {
+                leader_schedule_cache
+                    .proposers_at_slot(mcp_shred.slot, Some(&root_bank))
+                    .unwrap_or_default()
+            });
+        let Some(proposer_pubkey) = proposer_pubkeys
+            .get(mcp_shred.proposer_index as usize)
+            .copied()
         else {
             continue;
         };
@@ -384,6 +409,7 @@ impl WindowService {
     ) -> WindowService {
         let cluster_info = repair_info.cluster_info.clone();
         let bank_forks = repair_info.bank_forks.clone();
+        let local_pubkey = cluster_info.id();
 
         // In wen_restart, we discard all shreds from Turbine and keep only those from repair to
         // avoid new shreds make validator OOM before wen_restart is over.
@@ -435,6 +461,7 @@ impl WindowService {
             exit,
             blockstore,
             bank_forks,
+            local_pubkey,
             leader_schedule_cache,
             verified_receiver,
             cluster_info,
@@ -489,6 +516,7 @@ impl WindowService {
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
         bank_forks: Arc<RwLock<BankForks>>,
+        local_pubkey: Pubkey,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         cluster_info: Arc<ClusterInfo>,
@@ -528,6 +556,7 @@ impl WindowService {
                         &verified_receiver,
                         &blockstore,
                         &bank_forks,
+                        &local_pubkey,
                         &leader_schedule_cache,
                         handle_duplicate,
                         &mut metrics,
