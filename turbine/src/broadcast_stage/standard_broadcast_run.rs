@@ -20,6 +20,7 @@ use {
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
         },
     },
+    solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
     solana_time_utils::AtomicInterval,
@@ -31,6 +32,7 @@ use {
 
 #[derive(Clone)]
 pub struct StandardBroadcastRun {
+    identity: Pubkey,
     slot: Slot,
     parent: Slot,
     parent_block_id: Hash,
@@ -72,12 +74,17 @@ const MCP_DISPATCH_STATE_MAX_SLOTS: usize = 1024;
 const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
 
 impl StandardBroadcastRun {
-    pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
+    pub(super) fn new(
+        identity: Pubkey,
+        shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
+    ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
         ));
         Self {
+            identity,
             slot: Slot::MAX,
             parent: Slot::MAX,
             parent_block_id: Hash::default(),
@@ -417,6 +424,11 @@ impl StandardBroadcastRun {
         get_leader_schedule_time.stop();
 
         let mut coding_send_time = Measure::start("broadcast_coding_send");
+        self.maybe_record_mcp_payload_batch(
+            &bank,
+            &receive_results.component,
+            num_expected_batches,
+        );
 
         let shreds = Arc::new(shreds);
         debug_assert!(shreds.iter().all(|shred| shred.slot() == bank.slot()));
@@ -572,9 +584,71 @@ impl StandardBroadcastRun {
         );
     }
 
+    fn maybe_record_mcp_payload_batch(
+        &self,
+        bank: &Bank,
+        component: &BlockComponent,
+        num_expected_batches: Option<usize>,
+    ) {
+        if !bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
+        {
+            return;
+        }
+
+        let proposer_indices = {
+            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
+            let cache = cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(bank));
+            cache.proposer_indices_at_slot(bank.slot(), &self.identity, Some(bank))
+        };
+        if proposer_indices.is_empty() {
+            return;
+        }
+
+        let mut state = self.mcp_dispatch_state.lock().unwrap();
+        let min_retained_slot = bank
+            .slot()
+            .saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
+        state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
+        if state.len() >= MCP_DISPATCH_STATE_MAX_SLOTS && !state.contains_key(&bank.slot()) {
+            if let Some(oldest_slot) = state.keys().min().copied() {
+                state.remove(&oldest_slot);
+            }
+        }
+        let slot_state = state.entry(bank.slot()).or_default();
+        slot_state.seen_batches = slot_state.seen_batches.saturating_add(1);
+        if let Some(expected_batches) = num_expected_batches {
+            slot_state.expected_batches = Some(expected_batches);
+        }
+        let BlockComponent::EntryBatch(entries) = component else {
+            return;
+        };
+        for entry in entries {
+            for tx in &entry.transactions {
+                let Ok(serialized_tx) = bincode::serialize(tx) else {
+                    warn!(
+                        "MCP proposer payload serialization failed for slot {}",
+                        bank.slot()
+                    );
+                    return;
+                };
+                let remaining = mcp_proposer::MCP_MAX_PAYLOAD_SIZE
+                    .saturating_sub(slot_state.payload_bytes.len());
+                if remaining == 0 {
+                    return;
+                }
+                if serialized_tx.len() > remaining {
+                    return;
+                }
+                slot_state.payload_bytes.extend_from_slice(&serialized_tx);
+            }
+        }
+    }
+
     fn maybe_dispatch_mcp_shreds(
         &self,
-        shreds: &[Shred],
+        _shreds: &[Shred],
         batch_info: &Option<BroadcastShredBatchInfo>,
         cluster_info: &ClusterInfo,
         bank_forks: &RwLock<BankForks>,
@@ -585,7 +659,7 @@ impl StandardBroadcastRun {
             return;
         };
         let slot = batch_info.slot;
-        let (feature_active, working_bank, root_slot) = {
+        let (feature_active, working_bank, root_bank, root_slot) = {
             let bank_forks = bank_forks.read().unwrap();
             let bank = bank_forks
                 .get(slot)
@@ -593,9 +667,29 @@ impl StandardBroadcastRun {
             let feature_active = bank
                 .feature_set
                 .is_active(&feature_set::mcp_protocol_v1::id());
-            (feature_active, bank, bank_forks.root())
+            (
+                feature_active,
+                bank,
+                bank_forks.root_bank(),
+                bank_forks.root(),
+            )
         };
         if !feature_active {
+            return;
+        }
+
+        let identity = cluster_info.id();
+        let (proposer_indices, relay_schedule) = {
+            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
+            let cache =
+                cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&working_bank));
+            cache.set_root(&root_bank);
+            (
+                cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
+                cache.relays_at_slot(slot, Some(&working_bank)),
+            )
+        };
+        if proposer_indices.is_empty() {
             return;
         }
 
@@ -603,37 +697,17 @@ impl StandardBroadcastRun {
             let mut state = self.mcp_dispatch_state.lock().unwrap();
             let min_retained_slot = root_slot.saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
             state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
-            if state.len() >= MCP_DISPATCH_STATE_MAX_SLOTS && !state.contains_key(&slot) {
-                if let Some(oldest_slot) = state.keys().min().copied() {
-                    state.remove(&oldest_slot);
-                }
-            }
-            let slot_state = state.entry(slot).or_default();
-            slot_state.seen_batches = slot_state.seen_batches.saturating_add(1);
-            if let Some(num_expected_batches) = batch_info.num_expected_batches {
-                slot_state.expected_batches = Some(num_expected_batches);
-            }
-            for shred in shreds {
-                if shred.shred_type() != ShredType::Data {
-                    continue;
-                }
-                let remaining =
-                    mcp_proposer::MCP_MAX_PAYLOAD_SIZE.saturating_sub(slot_state.payload_bytes.len());
-                if remaining == 0 {
-                    break;
-                }
-                let shred_payload = shred.payload().as_ref();
-                let copy_len = remaining.min(shred_payload.len());
-                slot_state
-                    .payload_bytes
-                    .extend_from_slice(&shred_payload[..copy_len]);
-            }
+            let Some(slot_state) = state.get(&slot) else {
+                return;
+            };
             let is_slot_complete = slot_state
                 .expected_batches
                 .map(|num_expected_batches| slot_state.seen_batches >= num_expected_batches)
                 .unwrap_or(false);
             if is_slot_complete {
-                state.remove(&slot).map(|slot_state| slot_state.payload_bytes)
+                state
+                    .remove(&slot)
+                    .map(|slot_state| slot_state.payload_bytes)
             } else {
                 None
             }
@@ -652,21 +726,6 @@ impl StandardBroadcastRun {
                 return;
             }
         };
-
-        let identity = cluster_info.id();
-        let (proposer_indices, relay_schedule) = {
-            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
-            let cache = cache
-                .get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&working_bank));
-            cache.set_root(&working_bank);
-            (
-                cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
-                cache.relays_at_slot(slot, Some(&working_bank)),
-            )
-        };
-        if proposer_indices.is_empty() {
-            return;
-        }
 
         let relay_schedule = match relay_schedule {
             Some(relays) => relays,
@@ -875,7 +934,7 @@ mod test {
     #[test_case(MigrationStatus::post_migration_status(); "post_migration")]
     fn test_interrupted_slot_last_shred(migration_status: MigrationStatus) {
         let keypair = Arc::new(Keypair::new());
-        let mut run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut run = StandardBroadcastRun::new(keypair.pubkey(), 0, Arc::new(migration_status));
         assert!(run.completed);
 
         // Set up the slot to be interrupted
@@ -935,7 +994,8 @@ mod test {
         };
 
         // Step 1: Make an incomplete transmission for slot 0
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -1080,7 +1140,8 @@ mod test {
         let (ssend, _srecv) = unbounded();
         let (cbsend, _) = unbounded();
         let mut last_tick_height = 0;
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
             last_tick_height += (ticks.len() - 1) as u64;
@@ -1143,7 +1204,8 @@ mod test {
             last_tick_height: ticks.len() as u64,
         };
 
-        let mut standard_broadcast_run = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut standard_broadcast_run =
+            StandardBroadcastRun::new(leader_keypair.pubkey(), 0, Arc::new(migration_status));
         standard_broadcast_run
             .test_process_receive_results(
                 &leader_keypair,
@@ -1163,7 +1225,7 @@ mod test {
     fn entries_to_shreds_max(migration_status: MigrationStatus) {
         agave_logger::setup();
         let keypair = Keypair::new();
-        let mut bs = StandardBroadcastRun::new(0, Arc::new(migration_status));
+        let mut bs = StandardBroadcastRun::new(keypair.pubkey(), 0, Arc::new(migration_status));
         bs.slot = 1;
         bs.parent = 0;
         let entries = create_ticks(10_000, 1, solana_hash::Hash::default());

@@ -3,6 +3,7 @@ use {
         stake_weighted_slot_leaders_domain_separated, IdentityKeyedLeaderSchedule, LeaderSchedule,
         VoteKeyedLeaderSchedule,
     },
+    agave_feature_set as feature_set,
     solana_clock::{Epoch, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -38,6 +39,12 @@ pub fn leader_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
 }
 
 fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8]) -> Option<LeaderSchedule> {
+    if !bank
+        .feature_set
+        .is_active(&feature_set::mcp_protocol_v1::id())
+    {
+        return None;
+    }
     let use_new_leader_schedule = bank.should_use_vote_keyed_leader_schedule(epoch)?;
     if use_new_leader_schedule {
         bank.epoch_vote_accounts(epoch).map(|vote_accounts_map| {
