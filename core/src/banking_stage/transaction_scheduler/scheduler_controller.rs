@@ -26,7 +26,7 @@ use {
         num::Saturating,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, Mutex, RwLock,
         },
     },
 };
@@ -58,6 +58,7 @@ where
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     /// Detailed scheduling metrics.
     scheduling_details: SchedulingDetails,
+    mcp_fee_payer_tracker: Mutex<McpFeePayerTracker>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -84,6 +85,7 @@ where
             timing_metrics: SchedulerTimingMetrics::default(),
             worker_metrics,
             scheduling_details: SchedulingDetails::default(),
+            mcp_fee_payer_tracker: Mutex::default(),
         }
     }
 
@@ -145,7 +147,13 @@ where
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     |txs, results| {
-                        Self::pre_graph_filter(txs, results, bank, MAX_PROCESSING_AGE)
+                        Self::pre_graph_filter(
+                            txs,
+                            results,
+                            bank,
+                            MAX_PROCESSING_AGE,
+                            &self.mcp_fee_payer_tracker,
+                        )
                     },
                     |_| PreLockFilterAction::AttemptToSchedule // no pre-lock filter for now
                 )?);
@@ -188,9 +196,10 @@ where
         results: &mut [bool],
         bank: &Bank,
         max_age: usize,
+        mcp_fee_payer_tracker: &Mutex<McpFeePayerTracker>,
     ) {
         let mcp_enabled = bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id());
-        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
+        let mut mcp_fee_payer_tracker = mcp_fee_payer_tracker.lock().unwrap();
         let lock_results = vec![Ok(()); transactions.len()];
         let mut error_counters = TransactionErrorMetrics::default();
         let check_results = bank.check_transactions::<R::Transaction>(
