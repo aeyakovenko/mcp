@@ -13,17 +13,33 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Release Blockers (`UNVERIFIED` until resolved)
 
-- `B1` Transaction payload format:
-  - Spec §3.1/§7.1 requires MCP payload tx bytes to use the §7.1 Transaction format.
-  - If Agave keeps legacy Solana tx bytes, this is spec-non-compliant and must be explicitly amended.
+- none currently
+
+## Resolved Policy Decisions
+
+- `B1` Transaction payload compatibility:
+  - MCP payload decoder accepts both:
+    - latest MCP §7.1 transaction format
+    - legacy Solana wire-format transaction bytes
+  - Producer behavior:
+    - produce latest §7.1 format whenever the transaction representation supports it
+    - otherwise pass through legacy bytes
+  - Fee/ordering extraction:
+    - latest format: read `ordering_fee` from §7.1 config field
+    - legacy format: derive ordering key from `compute_unit_price`
+  - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
-  - Spec §3.6 says “order by ordering_fee” but does not define ascending/descending.
-- `B3` `block_id` encoding in `consensus_meta`:
-  - Spec §3.4/§7.5 defers to underlying consensus/ledger rules.
-  - No local placeholder hash is allowed in production.
-- `B4` `delayed_bankhash` delayed-slot rule:
-  - Spec §3.5 says delayed slot is defined by consensus protocol.
-  - No implicit fallback (for example `Hash::default()`) unless consensus defines it.
+  - Execute highest-paying transactions first.
+  - Ordering rule is `ordering_fee` descending.
+  - Stable tie-break remains concatenated position (after proposer-index concatenation).
+- `B3` `block_id` authority:
+  - `block_id` is defined by Alpenglow consensus.
+  - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
+  - `consensus_meta` carries the consensus-defined data needed to recover/verify that `block_id`.
+- `B4` delayed bankhash availability:
+  - There must always be a delayed-slot bankhash before MCP progression.
+  - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
+  - No fallback hash value is permitted.
 
 ---
 
@@ -72,6 +88,10 @@ Non-reusable for MCP wire correctness:
     - `RelayAttestation`
     - `AggregateAttestation`
     - `ConsensusBlock`
+  - `McpPayload` parser behavior:
+    - decode `tx_count + [tx_len, tx_bytes]` framing
+    - for each `tx_bytes`, accept latest MCP §7.1 tx or legacy Solana tx
+    - carry per-tx format tag for later ordering-key extraction and possible re-encoding
   - Common parser invariants:
     - reject unknown version
     - reject out-of-range indices
@@ -266,10 +286,10 @@ Non-reusable for MCP wire correctness:
   - proposer activation: node is proposer for current slot if own pubkey appears in proposer indices.
 - Worker steps:
   1. drain verified tx packets from MCP channel.
-  2. parse ordering key according to resolved `B1/B2` rules.
+  2. parse ordering key using dual-format rules from resolved `B1` and descending-fee policy from `B2`.
   3. optional local admission control with `CostModel` + local `CostTracker` budgeted per proposer.
   4. order transactions deterministically.
-  5. serialize payload and enforce max payload bound.
+  5. serialize payload and enforce max payload bound; emit latest §7.1 format where available, otherwise legacy bytes.
   6. call ledger MCP encode helper -> 200 shreds + witnesses.
   7. send shred `i` to relay index `i` address.
 
@@ -325,8 +345,8 @@ When this node is leader for slot `s` at aggregation deadline:
 2. if valid relay entries < 120 -> submit empty result
 3. build `AggregateAttestation`
 4. construct/sign `ConsensusBlock` with:
-   - `consensus_meta` and `block_id` from consensus adapter (`B3`)
-   - `delayed_bankhash` per consensus delayed-slot rule (`B4`)
+   - `consensus_meta` and authoritative `block_id` from Alpenglow consensus (`B3`)
+   - `delayed_bankhash` for the consensus-defined delayed slot; if unavailable locally, defer finalization and do not submit yet
 
 ### 6.4 Distribution
 
@@ -350,7 +370,7 @@ When this node is leader for slot `s` at aggregation deadline:
 
 - `core/src/mcp_replay.rs` (called from replay loop):
   1. verify leader signature and leader index for slot
-  2. verify delayed bankhash by consensus-defined delayed slot (`B4`)
+  2. verify delayed bankhash by consensus-defined delayed slot; if local delayed bankhash is unavailable, do not vote and keep block pending
   3. verify relay/proposer signatures and ignore invalid entries
   4. enforce global relay threshold after filtering (`>=120`)
   5. implied proposer rules:
@@ -366,13 +386,13 @@ When this node is leader for slot `s` at aggregation deadline:
   - load shreds from MCP CF
   - decode + re-encode + recompute commitment via ledger helper
   - discard proposer batch on commitment mismatch
-  - decode payload tx list
+  - decode payload tx list with dual-format `B1` parser (latest + legacy)
 
 ### 7.3 Ordering and execution
 
 - Deterministic order:
   - concat by proposer index
-  - apply `ordering_fee` ordering per resolved `B2` rule
+  - apply `ordering_fee` descending (highest fee first)
   - stable tie-break by concatenated position
 
 - `ledger/src/blockstore_processor.rs`:
@@ -397,7 +417,7 @@ Implementation wiring:
 
 ### 7.4 Bank/block ID and vote
 
-- set `bank.block_id()` from consensus-meta-derived `block_id` (`B3`).
+- set `bank.block_id()` directly from the Alpenglow-consensus `block_id` carried in `ConsensusBlock` (`B3`).
 - underlying vote wire format remains unchanged.
 
 ### 7.5 Empty result
@@ -407,8 +427,11 @@ Implementation wiring:
 ### 7.6 Tests
 
 - vote-gate rejections: bad leader sig/index, bad delayed bankhash, equivocation, insufficient local valid shreds, global threshold failure
+- delayed bankhash availability gate: leader does not finalize and validator does not vote until delayed-slot bankhash is available locally
 - reconstruction mismatch rejection
 - deterministic ordering behavior
+- dual-format payload acceptance: mixed latest + legacy tx bytes decode correctly
+- producer serialization preference: latest format emitted when available, legacy retained otherwise
 - two-phase fees:
   - per-transaction granularity
   - cross-proposer cumulative payer accounting
