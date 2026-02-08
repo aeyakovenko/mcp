@@ -1,6 +1,6 @@
 use {
+    crate::mcp_merkle,
     reed_solomon_erasure::galois_8::ReedSolomon,
-    solana_sha256_hasher::hashv,
     std::sync::OnceLock,
 };
 
@@ -130,32 +130,8 @@ pub fn commitment_root(
     proposer_index: u32,
     shreds: &[[u8; MCP_SHRED_DATA_BYTES]],
 ) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = shreds
-        .iter()
-        .enumerate()
-        .map(|(shred_index, shred_data)| {
-            hashv(&[
-                &[0x00],
-                &slot.to_le_bytes(),
-                &proposer_index.to_le_bytes(),
-                &(shred_index as u32).to_le_bytes(),
-                shred_data,
-            ])
-            .to_bytes()
-        })
-        .collect();
-
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(left);
-            next.push(hashv(&[&[0x01], &left, &right]).to_bytes());
-        }
-        level = next;
-    }
-
-    level[0]
+    mcp_merkle::commitment_root(slot, proposer_index, shreds)
+        .expect("MCP erasure always computes commitment over a non-empty fixed-size shred set")
 }
 
 fn payload_to_data_shards(payload: &[u8]) -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
