@@ -5,6 +5,7 @@
 use {
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
+        mcp_relay::{McpRelayOutcome, McpRelayProcessor, McpShredMessage},
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
@@ -26,6 +27,7 @@ use {
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
     solana_streamer::evicting_sender::EvictingSender,
+    solana_streamer::streamer::ChannelSend,
     solana_turbine::cluster_nodes,
     solana_votor_messages::migration::MigrationStatus,
     std::{
@@ -191,6 +193,7 @@ fn run_insert<F>(
     thread_pool: &ThreadPool,
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
@@ -199,6 +202,7 @@ fn run_insert<F>(
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     reed_solomon_cache: &ReedSolomonCache,
     accept_repairs_only: bool,
+    mcp_relay_processor: &mut McpRelayProcessor,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -210,26 +214,79 @@ where
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
-    let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
+    let mut root_bank = bank_forks.read().unwrap().root_bank();
+    let mut last_bank_refresh = Instant::now();
+    let mut mcp_retransmit_batch = Vec::new();
+    let mut mcp_shred_count = 0usize;
+    let mut legacy_shreds = Vec::with_capacity(shreds.len());
+
+    for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
-            return None;
+            continue;
         }
         if repair {
             ws_metrics.num_repairs.fetch_add(1, Ordering::Relaxed);
         }
+
+        let Ok(mcp_shred) = McpShredMessage::from_bytes(&shred) else {
+            legacy_shreds.push((shred, repair, block_location));
+            continue;
+        };
+        mcp_shred_count += 1;
+
+        if last_bank_refresh.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
+            last_bank_refresh = Instant::now();
+            root_bank = bank_forks.read().unwrap().root_bank();
+        }
+
+        if !cluster_nodes::check_feature_activation(
+            &feature_set::mcp_protocol_v1::id(),
+            mcp_shred.slot,
+            &root_bank,
+        ) {
+            continue;
+        }
+
+        // MCP proposer schedule APIs are wired in another pass; use slot leader as the
+        // proposer verifier until proposer-index schedules are available here.
+        let Some(proposer_pubkey) = leader_schedule_cache
+            .slot_leader_at(mcp_shred.slot, Some(&root_bank))
+            .or_else(|| leader_schedule_cache.slot_leader_at(mcp_shred.slot, None))
+        else {
+            continue;
+        };
+
+        match mcp_relay_processor.process_shred(&shred, mcp_shred.shred_index, &proposer_pubkey) {
+            McpRelayOutcome::StoredAndBroadcast { payload, .. } => {
+                mcp_retransmit_batch.push(payload.into());
+            }
+            McpRelayOutcome::Dropped(_) | McpRelayOutcome::Duplicate => {}
+        }
+    }
+
+    let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
         let shred = Shred::new_from_serialized_shred(shred).ok()?;
         Some((Cow::Owned(shred), repair, block_location))
     };
     let now = Instant::now();
     let shreds: Vec<_> = thread_pool.install(|| {
-        shreds
+        legacy_shreds
             .into_par_iter()
             .with_min_len(32)
             .filter_map(handle_shred)
             .collect()
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
-    ws_metrics.num_shreds_received += shreds.len();
+    ws_metrics.num_shreds_received += shreds.len() + mcp_shred_count;
+
+    if !mcp_retransmit_batch.is_empty() {
+        retransmit_sender.send(mcp_retransmit_batch)?;
+    }
+
+    if shreds.is_empty() {
+        return Ok(());
+    }
+
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         Some(leader_schedule_cache),
@@ -325,13 +382,14 @@ impl WindowService {
             blockstore.clone(),
             duplicate_receiver,
             duplicate_slots_sender,
-            bank_forks,
+            bank_forks.clone(),
             migration_status,
         );
 
         let t_insert = Self::start_window_insert_thread(
             exit,
             blockstore,
+            bank_forks,
             leader_schedule_cache,
             verified_receiver,
             duplicate_sender,
@@ -383,6 +441,7 @@ impl WindowService {
     fn start_window_insert_thread(
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
+        bank_forks: Arc<RwLock<BankForks>>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
@@ -411,12 +470,14 @@ impl WindowService {
                 };
                 let mut metrics = BlockstoreInsertionMetrics::default();
                 let mut ws_metrics = WindowServiceMetrics::default();
+                let mut mcp_relay_processor = McpRelayProcessor::default();
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
                         &thread_pool,
                         &verified_receiver,
                         &blockstore,
+                        &bank_forks,
                         &leader_schedule_cache,
                         handle_duplicate,
                         &mut metrics,
@@ -425,6 +486,7 @@ impl WindowService {
                         &retransmit_sender,
                         &reed_solomon_cache,
                         accept_repairs_only,
+                        &mut mcp_relay_processor,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
