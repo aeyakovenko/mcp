@@ -87,13 +87,13 @@ Non-reusable for MCP wire correctness:
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
     - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (this is always `<= NUM_RELAYS * SHRED_DATA_BYTES` because `DATA_SHREDS_PER_FEC_BLOCK <= NUM_RELAYS`)
   - Types:
-    - `McpPayload`
     - `RelayAttestation`
     - `AggregateAttestation`
     - `ConsensusBlock`
+- Add `transaction-view/src/mcp_payload.rs`:
   - `McpPayload` parser behavior:
     - decode `tx_count + [tx_len, tx_bytes]` framing
-    - for each `tx_bytes`, accept latest MCP §7.1 tx or legacy Solana tx
+    - for each `tx_bytes`, accept latest MCP §7.1 tx or legacy layout without version prefix
     - carry per-tx format tag for later ordering-key extraction and possible re-encoding
     - after decoding `tx_count` entries, ignore trailing zero bytes and reject trailing non-zero bytes
   - Common parser invariants:
@@ -108,6 +108,7 @@ Non-reusable for MCP wire correctness:
   - node hash: `SHA-256(0x01 || left || right)`
   - witness entries are 32 bytes
   - odd-node rule pairs with self
+  - shared by `mcp_shred`, `mcp_erasure`, and `mcp_reconstruction` (no duplicated Merkle implementations)
 
 ### 1.4 MCP shred wire format
 
@@ -407,8 +408,10 @@ Staged rollout guard:
   - apply `ordering_fee` descending (highest fee first)
   - stable tie-break by concatenated position
 
-- `ledger/src/blockstore_processor.rs`:
-  - add `confirm_slot_mcp()` that bypasses PoH checks and reuses transaction verification + execution pipeline.
+- Replay execution wiring:
+  - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path when feature active.
+  - Phase A calls `Bank::collect_fees_only_for_transactions`.
+  - Phase B calls `Bank::load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback`.
 
 Two-phase fee handling (spec §8):
 - Phase A (fee commitment):
@@ -424,8 +427,9 @@ Two-phase fee handling (spec §8):
   - no second fee charge
 
 Implementation wiring:
-- add explicit fee-mode control in SVM validation path (for example `skip_fee_deduction` in processing environment)
-- plumb through bank execution API via MCP-specific execution entrypoint; default path unchanged
+- keep default non-MCP execution path unchanged
+- use explicit fee-mode control already plumbed through SVM (`skip_fee_collection`)
+- apply phase-A fee failures as execution filters for phase B
 
 ### 7.4 Bank/block ID and vote
 
@@ -458,6 +462,7 @@ Implementation wiring:
 New files:
 - `ledger/src/mcp.rs`
 - `ledger/src/mcp_merkle.rs`
+- `transaction-view/src/mcp_payload.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
 - `core/src/mcp_quic.rs` (or equivalent small helper)
@@ -485,6 +490,8 @@ Modified files:
 - `core/src/replay_stage.rs`
 - `ledger/src/blockstore_processor.rs`
 - `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
+- `transaction-view/src/lib.rs`
+- `transaction-view/src/mcp_transaction.rs`
 - `svm/src/transaction_processor.rs` (fee-mode plumbing)
 - `core/src/validator.rs` (socket wiring)
 
