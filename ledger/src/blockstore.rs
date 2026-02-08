@@ -297,6 +297,7 @@ pub struct Blockstore {
     alt_merkle_root_meta_cf: LedgerColumn<cf::AlternateMerkleRootMeta>,
     mcp_shred_data_cf: LedgerColumn<cf::McpShredData>,
     mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
+    mcp_execution_output_cf: LedgerColumn<cf::McpExecutionOutput>,
     parent_meta_cf: LedgerColumn<cf::ParentMeta>,
     double_merkle_meta_cf: LedgerColumn<cf::DoubleMerkleMeta>,
 
@@ -484,6 +485,7 @@ impl Blockstore {
         let alt_merkle_root_meta_cf = db.column();
         let mcp_shred_data_cf = db.column();
         let mcp_relay_attestation_cf = db.column();
+        let mcp_execution_output_cf = db.column();
         let parent_meta_cf = db.column();
         let double_merkle_meta_cf = db.column();
 
@@ -527,6 +529,7 @@ impl Blockstore {
             alt_merkle_root_meta_cf,
             mcp_shred_data_cf,
             mcp_relay_attestation_cf,
+            mcp_execution_output_cf,
             parent_meta_cf,
             double_merkle_meta_cf,
 
@@ -1258,6 +1261,7 @@ impl Blockstore {
         self.alt_merkle_root_meta_cf.submit_rocksdb_cf_metrics();
         self.mcp_shred_data_cf.submit_rocksdb_cf_metrics();
         self.mcp_relay_attestation_cf.submit_rocksdb_cf_metrics();
+        self.mcp_execution_output_cf.submit_rocksdb_cf_metrics();
     }
 
     /// Report the accumulated RPC API metrics
@@ -3354,6 +3358,18 @@ impl Blockstore {
 
     pub fn get_index(&self, slot: Slot) -> Result<Option<Index>> {
         self.index_cf.get(slot)
+    }
+
+    pub fn get_mcp_execution_output(&self, slot: Slot) -> Result<Option<Vec<u8>>> {
+        self.mcp_execution_output_cf.get_bytes(slot)
+    }
+
+    pub fn put_mcp_execution_output(&self, slot: Slot, output: &[u8]) -> Result<()> {
+        self.mcp_execution_output_cf.put_bytes(slot, output)
+    }
+
+    pub fn put_mcp_empty_execution_output(&self, slot: Slot) -> Result<()> {
+        self.put_mcp_execution_output(slot, &[])
     }
 
     pub fn get_index_from_location(
@@ -6433,6 +6449,13 @@ pub fn test_all_empty_or_min(blockstore: &Blockstore, min_slot: Slot) {
             .unwrap()
             .next()
             .map(|((slot, _), _)| slot >= min_slot)
+            .unwrap_or(true)
+        & blockstore
+            .mcp_execution_output_cf
+            .iter(IteratorMode::Start)
+            .unwrap()
+            .next()
+            .map(|(slot, _)| slot >= min_slot)
             .unwrap_or(true);
 
     assert!(condition_met);
@@ -6733,6 +6756,25 @@ pub mod tests {
                 actual,
                 max: MAX_MCP_RELAY_ATTESTATION_BYTES
             } if actual == MAX_MCP_RELAY_ATTESTATION_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn test_mcp_execution_output_put_get_empty() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), None);
+
+        blockstore.put_mcp_empty_execution_output(99).unwrap();
+        assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), Some(vec![]));
+
+        blockstore
+            .put_mcp_execution_output(99, b"ordered-output")
+            .unwrap();
+        assert_eq!(
+            blockstore.get_mcp_execution_output(99).unwrap(),
+            Some(b"ordered-output".to_vec())
         );
     }
 

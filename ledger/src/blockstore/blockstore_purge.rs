@@ -331,6 +331,7 @@ impl Blockstore {
                 .is_ok()
             & self
                 .mcp_relay_attestation_cf
+                .mcp_execution_output_cf
                 .delete_range_in_batch(write_batch, from_slot, to_slot)
                 .is_ok()
             & self
@@ -447,6 +448,7 @@ impl Blockstore {
                 .is_ok()
             & self
                 .mcp_relay_attestation_cf
+                .mcp_execution_output_cf
                 .delete_file_in_range(from_slot, to_slot)
                 .is_ok()
             & self
@@ -616,6 +618,9 @@ pub mod tests {
                     .unwrap(),
                 McpPutStatus::Inserted
             );
+            blockstore
+                .put_mcp_execution_output(slot, &[slot as u8])
+                .unwrap();
         }
 
         blockstore.purge_and_compact_slots(0, 5);
