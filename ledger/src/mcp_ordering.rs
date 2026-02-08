@@ -18,16 +18,10 @@ pub fn order_batches_by_fee_desc<T>(
     proposer_batches: impl IntoIterator<Item = (u32, Vec<T>)>,
     mut ordering_fee_of: impl FnMut(&T) -> u64,
 ) -> Vec<T> {
-    let concatenated = concat_batches_by_proposer_index(proposer_batches);
-
-    let mut with_fee: Vec<(Reverse<u64>, T)> = concatenated
-        .into_iter()
-        .map(|tx| (Reverse(ordering_fee_of(&tx)), tx))
-        .collect();
-
+    let mut concatenated = concat_batches_by_proposer_index(proposer_batches);
     // Stable sort keeps concatenation order for equal fees.
-    with_fee.sort_by_key(|(fee, _)| *fee);
-    with_fee.into_iter().map(|(_, tx)| tx).collect()
+    concatenated.sort_by_cached_key(|tx| Reverse(ordering_fee_of(tx)));
+    concatenated
 }
 
 #[cfg(test)]
