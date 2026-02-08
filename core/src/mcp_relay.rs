@@ -211,6 +211,10 @@ impl McpRelayProcessor {
         self.shreds.len()
     }
 
+    pub fn prune_below_slot(&mut self, root_slot: Slot) {
+        self.shreds.retain(|(slot, _, _), _| *slot >= root_slot);
+    }
+
     pub fn process_shred(
         &mut self,
         payload: &[u8],
@@ -499,6 +503,52 @@ mod tests {
             conflict_outcome,
             McpRelayOutcome::Dropped(McpDropReason::ConflictingShred)
         );
+        assert_eq!(relay.stored_count(), 1);
+    }
+
+    #[test]
+    fn test_prune_below_slot_discards_old_entries() {
+        let proposer = Keypair::new();
+        let proposer_index = 1;
+        let relay_index = 0u32;
+        let shreds = make_shreds();
+
+        let (commitment_a, witnesses_a) =
+            derive_commitment_and_witnesses(20, proposer_index, &shreds);
+        let payload_a = build_message(
+            20,
+            proposer_index,
+            relay_index,
+            commitment_a,
+            shreds[relay_index as usize],
+            witnesses_a[relay_index as usize],
+            &proposer,
+        );
+
+        let (commitment_b, witnesses_b) =
+            derive_commitment_and_witnesses(21, proposer_index, &shreds);
+        let payload_b = build_message(
+            21,
+            proposer_index,
+            relay_index,
+            commitment_b,
+            shreds[relay_index as usize],
+            witnesses_b[relay_index as usize],
+            &proposer,
+        );
+
+        let mut relay = McpRelayProcessor::default();
+        assert!(matches!(
+            relay.process_shred(&payload_a, relay_index, &proposer.pubkey()),
+            McpRelayOutcome::StoredAndBroadcast { .. }
+        ));
+        assert!(matches!(
+            relay.process_shred(&payload_b, relay_index, &proposer.pubkey()),
+            McpRelayOutcome::StoredAndBroadcast { .. }
+        ));
+        assert_eq!(relay.stored_count(), 2);
+
+        relay.prune_below_slot(21);
         assert_eq!(relay.stored_count(), 1);
     }
 }
