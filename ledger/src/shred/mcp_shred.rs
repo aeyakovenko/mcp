@@ -1,11 +1,13 @@
 use {
+    crate::mcp_merkle,
     solana_clock::Slot,
     solana_perf::packet::{Packet, PacketRef},
     solana_pubkey::Pubkey,
-    solana_sha256_hasher::hashv,
     solana_signature::{Signature, SIGNATURE_BYTES},
     thiserror::Error,
 };
+#[cfg(test)]
+use solana_sha256_hasher::hashv;
 
 pub const MCP_NUM_RELAYS: usize = 200;
 pub const MCP_NUM_PROPOSERS: usize = 16;
@@ -27,7 +29,9 @@ const OFFSET_WITNESS_LEN: usize = std::mem::size_of::<Slot>()
     + 32
     + MCP_SHRED_DATA_BYTES;
 
+#[cfg(test)]
 const LEAF_DOMAIN: [u8; 1] = [0x00];
+#[cfg(test)]
 const NODE_DOMAIN: [u8; 1] = [0x01];
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -193,27 +197,16 @@ impl McpShred {
     }
 
     pub fn verify_witness(&self) -> bool {
-        let leaf = hashv(&[
-            &LEAF_DOMAIN,
-            &self.slot.to_le_bytes(),
-            &self.proposer_index.to_le_bytes(),
-            &self.shred_index.to_le_bytes(),
+        mcp_merkle::verify_witness(
+            self.slot,
+            self.proposer_index,
+            self.shred_index,
             &self.shred_data,
-        ])
-        .to_bytes();
-
-        let mut node = leaf;
-        let mut index = self.shred_index as usize;
-        for sibling in self.witness.iter() {
-            node = if index & 1 == 0 {
-                hashv(&[&NODE_DOMAIN, &node, sibling]).to_bytes()
-            } else {
-                hashv(&[&NODE_DOMAIN, sibling, &node]).to_bytes()
-            };
-            index >>= 1;
-        }
-
-        node == self.commitment
+            &self.witness,
+            &self.commitment,
+            MCP_NUM_RELAYS,
+        )
+        .unwrap_or(false)
     }
 }
 
