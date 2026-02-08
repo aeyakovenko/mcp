@@ -1,9 +1,13 @@
-use {reed_solomon_erasure::galois_8::ReedSolomon, solana_sha256_hasher::hashv};
+use {
+    crate::mcp,
+    reed_solomon_erasure::galois_8::ReedSolomon,
+    solana_sha256_hasher::hashv,
+};
 
-pub const MCP_RECON_DATA_SHREDS: usize = 40;
-pub const MCP_RECON_CODING_SHREDS: usize = 160;
+pub const MCP_RECON_DATA_SHREDS: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
+pub const MCP_RECON_CODING_SHREDS: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
 pub const MCP_RECON_NUM_SHREDS: usize = MCP_RECON_DATA_SHREDS + MCP_RECON_CODING_SHREDS;
-pub const MCP_RECON_SHRED_BYTES: usize = 863;
+pub const MCP_RECON_SHRED_BYTES: usize = mcp::SHRED_DATA_BYTES;
 pub const MCP_RECON_MAX_PAYLOAD_BYTES: usize = MCP_RECON_DATA_SHREDS * MCP_RECON_SHRED_BYTES;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -20,6 +24,10 @@ pub enum McpReconstructionError {
     ConflictingShard(usize),
     #[error("commitment mismatch")]
     CommitmentMismatch,
+    #[error("commitment root requires at least one shred")]
+    EmptyShredSet,
+    #[error("too many shreds for u32 indices: {0}")]
+    TooManyShreds(usize),
     #[error("reed-solomon error: {0}")]
     ReedSolomon(String),
 }
@@ -137,8 +145,8 @@ pub fn reconstruct_payload(
     }
 
     let mut rs_shards: Vec<Option<Vec<u8>>> = shards
-        .iter_mut()
-        .map(|shard| shard.take().map(Vec::from))
+        .iter()
+        .map(|shard| shard.map(Vec::from))
         .collect();
     ReedSolomon::new(MCP_RECON_DATA_SHREDS, MCP_RECON_CODING_SHREDS)
         .map_err(|err| McpReconstructionError::ReedSolomon(err.to_string()))?
@@ -158,14 +166,14 @@ pub fn reconstruct_payload(
         rebuilt.push(bytes);
     }
 
-    let computed = commitment_root(slot, proposer_index, &rebuilt);
+    let computed = commitment_root(slot, proposer_index, &rebuilt)?;
     if computed != expected_commitment {
         return Err(McpReconstructionError::CommitmentMismatch);
     }
 
-    // Restore caller shards after reconstruction.
+    // Fill in missing caller shards after successful reconstruction.
     for (index, shard) in rebuilt.iter().copied().enumerate() {
-        shards[index] = Some(shard);
+        shards[index].get_or_insert(shard);
     }
 
     let mut payload = Vec::with_capacity(MCP_RECON_MAX_PAYLOAD_BYTES);
@@ -180,21 +188,29 @@ pub fn commitment_root(
     slot: u64,
     proposer_index: u32,
     shreds: &[[u8; MCP_RECON_SHRED_BYTES]],
-) -> [u8; 32] {
+) -> Result<[u8; 32], McpReconstructionError> {
+    if shreds.is_empty() {
+        return Err(McpReconstructionError::EmptyShredSet);
+    }
+    if shreds.len() > u32::MAX as usize {
+        return Err(McpReconstructionError::TooManyShreds(shreds.len()));
+    }
     let mut level: Vec<[u8; 32]> = shreds
         .iter()
         .enumerate()
         .map(|(shred_index, shred_data)| {
-            hashv(&[
+            let shred_index = u32::try_from(shred_index)
+                .map_err(|_| McpReconstructionError::TooManyShreds(shreds.len()))?;
+            Ok(hashv(&[
                 &[0x00],
                 &slot.to_le_bytes(),
                 &proposer_index.to_le_bytes(),
-                &(shred_index as u32).to_le_bytes(),
+                &shred_index.to_le_bytes(),
                 shred_data,
             ])
-            .to_bytes()
+            .to_bytes())
         })
-        .collect();
+        .collect::<Result<Vec<_>, McpReconstructionError>>()?;
 
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
@@ -206,7 +222,7 @@ pub fn commitment_root(
         level = next;
     }
 
-    level[0]
+    Ok(level[0])
 }
 
 #[cfg(test)]
@@ -242,9 +258,9 @@ mod tests {
 
     #[test]
     fn test_reconstruct_valid_payload() {
-        let payload: Vec<u8> = (0..20_000).map(|i| (i % 255) as u8).collect();
+        let payload: Vec<u8> = (0..20_000).map(|i| (i % 256) as u8).collect();
         let shreds = encode_payload(&payload);
-        let root = commitment_root(9, 2, &shreds);
+        let root = commitment_root(9, 2, &shreds).unwrap();
 
         let mut sparse = vec![None; MCP_RECON_NUM_SHREDS];
         for i in (0..20).chain(120..140) {
@@ -257,9 +273,9 @@ mod tests {
 
     #[test]
     fn test_reconstruct_rejects_commitment_mismatch() {
-        let payload: Vec<u8> = (0..1000).map(|i| (i % 255) as u8).collect();
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let mut shreds = encode_payload(&payload);
-        let root = commitment_root(9, 2, &shreds);
+        let root = commitment_root(9, 2, &shreds).unwrap();
         shreds[3][0] ^= 1;
 
         let mut sparse = vec![None; MCP_RECON_NUM_SHREDS];
@@ -277,7 +293,7 @@ mod tests {
     fn test_reconstruct_rejects_insufficient_shards() {
         let payload = vec![7u8; 500];
         let shreds = encode_payload(&payload);
-        let root = commitment_root(1, 0, &shreds);
+        let root = commitment_root(1, 0, &shreds).unwrap();
 
         let mut sparse = vec![None; MCP_RECON_NUM_SHREDS];
         for i in 0..39 {
@@ -295,9 +311,9 @@ mod tests {
 
     #[test]
     fn test_state_reconstructs_once_threshold_is_met() {
-        let payload: Vec<u8> = (0..9_000).map(|i| (i % 255) as u8).collect();
+        let payload: Vec<u8> = (0..9_000).map(|i| (i % 256) as u8).collect();
         let shreds = encode_payload(&payload);
-        let root = commitment_root(12, 4, &shreds);
+        let root = commitment_root(12, 4, &shreds).unwrap();
         let mut state = McpReconstructionState::new(12, 4, payload.len(), root).unwrap();
 
         for i in 0..(MCP_RECON_DATA_SHREDS - 1) {
@@ -322,9 +338,9 @@ mod tests {
 
     #[test]
     fn test_state_rejects_conflicting_shard_at_same_index() {
-        let payload: Vec<u8> = (0..1000).map(|i| (i % 255) as u8).collect();
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let mut shreds = encode_payload(&payload);
-        let root = commitment_root(7, 1, &shreds);
+        let root = commitment_root(7, 1, &shreds).unwrap();
         let mut state = McpReconstructionState::new(7, 1, payload.len(), root).unwrap();
 
         state.insert_shard(3, shreds[3]).unwrap();
@@ -339,13 +355,57 @@ mod tests {
     fn test_state_rejects_out_of_bounds_shard_index() {
         let payload = vec![1u8; 64];
         let shreds = encode_payload(&payload);
-        let root = commitment_root(1, 1, &shreds);
+        let root = commitment_root(1, 1, &shreds).unwrap();
         let mut state = McpReconstructionState::new(1, 1, payload.len(), root).unwrap();
         assert_eq!(
             state
                 .insert_shard(MCP_RECON_NUM_SHREDS, shreds[0])
                 .unwrap_err(),
             McpReconstructionError::InvalidShredIndex(MCP_RECON_NUM_SHREDS)
+        );
+    }
+
+    #[test]
+    fn test_commitment_mismatch_does_not_destroy_state() {
+        let payload: Vec<u8> = (0..8_000).map(|i| (i % 256) as u8).collect();
+        let mut shreds = encode_payload(&payload);
+        let root = commitment_root(3, 5, &shreds).unwrap();
+        shreds[0][0] ^= 1;
+
+        let mut sparse = vec![None; MCP_RECON_NUM_SHREDS];
+        for i in 0..MCP_RECON_DATA_SHREDS {
+            sparse[i] = Some(shreds[i]);
+        }
+        let snapshot = sparse.clone();
+
+        assert_eq!(
+            reconstruct_payload(3, 5, payload.len(), root, &mut sparse).unwrap_err(),
+            McpReconstructionError::CommitmentMismatch
+        );
+        assert_eq!(sparse, snapshot);
+    }
+
+    #[test]
+    fn test_state_can_reconstruct_again_after_success() {
+        let payload: Vec<u8> = (0..4_000).map(|i| (i % 256) as u8).collect();
+        let shreds = encode_payload(&payload);
+        let root = commitment_root(22, 1, &shreds).unwrap();
+        let mut state = McpReconstructionState::new(22, 1, payload.len(), root).unwrap();
+        for i in 0..MCP_RECON_DATA_SHREDS {
+            state.insert_shard(i, shreds[i]).unwrap();
+        }
+
+        let first = state.try_reconstruct().unwrap();
+        let second = state.try_reconstruct().unwrap();
+        assert_eq!(first, McpReconstructionAttempt::Reconstructed(payload.clone()));
+        assert_eq!(second, McpReconstructionAttempt::Reconstructed(payload));
+    }
+
+    #[test]
+    fn test_commitment_root_rejects_empty_input() {
+        assert_eq!(
+            commitment_root(1, 1, &[]).unwrap_err(),
+            McpReconstructionError::EmptyShredSet
         );
     }
 }
