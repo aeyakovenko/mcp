@@ -1,4 +1,5 @@
 use {
+    agave_feature_set::mcp_protocol_v1,
     super::Bank,
     crate::bank::CollectorFeeDetails,
     log::debug,
@@ -75,11 +76,15 @@ impl Bank {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(self.feature_set.as_ref()),
         );
-        let fee_details = transaction
-            .mcp_fee_components()
-            .map_or(fee_details, |(inclusion_fee, ordering_fee)| {
-                apply_mcp_fee_component_values(fee_details, inclusion_fee, ordering_fee)
-            });
+        let fee_details = if self.feature_set.is_active(&mcp_protocol_v1::id()) {
+            transaction
+                .mcp_fee_components()
+                .map_or(fee_details, |(inclusion_fee, ordering_fee)| {
+                    apply_mcp_fee_component_values(fee_details, inclusion_fee, ordering_fee)
+                })
+        } else {
+            fee_details
+        };
         let FeeDistribution {
             deposit: reward,
             burn: _,
