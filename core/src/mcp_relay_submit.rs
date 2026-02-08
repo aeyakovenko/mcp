@@ -3,7 +3,7 @@ use {
     bytes::Bytes,
     solana_clock::Slot,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
-    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
+    solana_ledger::{leader_schedule_cache::LeaderScheduleCache, mcp},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
@@ -47,6 +47,12 @@ pub enum RelaySubmitError {
     TrailingBytes,
     #[error("relay attestation entries must be sorted and unique by proposer_index")]
     UnsortedOrDuplicateEntries,
+    #[error("relay attestation entries must be non-empty")]
+    EmptyEntries,
+    #[error("relay attestation contains too many entries: {actual} > {max}")]
+    TooManyEntries { actual: usize, max: usize },
+    #[error("relay attestation proposer_index out of range: {0}")]
+    ProposerIndexOutOfRange(u32),
     #[error("unknown MCP control message type: {0:#x}")]
     UnknownMessageType(u8),
     #[error("missing leader for slot {0}")]
@@ -60,8 +66,35 @@ pub enum RelaySubmitError {
 }
 
 impl RelayAttestationV1 {
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(1 + 8 + 4 + 1 + self.entries.len() * (4 + 32 + 64));
+    fn validate_entries(entries: &[RelayAttestationEntry]) -> Result<(), RelaySubmitError> {
+        if entries.is_empty() {
+            return Err(RelaySubmitError::EmptyEntries);
+        }
+        if entries.len() > mcp::NUM_PROPOSERS {
+            return Err(RelaySubmitError::TooManyEntries {
+                actual: entries.len(),
+                max: mcp::NUM_PROPOSERS,
+            });
+        }
+        let mut prev_index = None;
+        for entry in entries {
+            if entry.proposer_index as usize >= mcp::NUM_PROPOSERS {
+                return Err(RelaySubmitError::ProposerIndexOutOfRange(
+                    entry.proposer_index,
+                ));
+            }
+            if prev_index.is_some_and(|prev| entry.proposer_index <= prev) {
+                return Err(RelaySubmitError::UnsortedOrDuplicateEntries);
+            }
+            prev_index = Some(entry.proposer_index);
+        }
+        Ok(())
+    }
+
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, RelaySubmitError> {
+        Self::validate_entries(&self.entries)?;
+        let mut bytes =
+            Vec::with_capacity(1 + 8 + 4 + 1 + self.entries.len() * (4 + 32 + SIGNATURE_BYTES));
         bytes.push(RELAY_ATTESTATION_VERSION_V1);
         bytes.extend_from_slice(&self.slot.to_le_bytes());
         bytes.extend_from_slice(&self.relay_index.to_le_bytes());
@@ -71,13 +104,13 @@ impl RelayAttestationV1 {
             bytes.extend_from_slice(&entry.commitment);
             bytes.extend_from_slice(entry.proposer_signature.as_ref());
         }
-        bytes
+        Ok(bytes)
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = self.signing_bytes();
+    pub fn to_bytes(&self) -> Result<Vec<u8>, RelaySubmitError> {
+        let mut bytes = self.signing_bytes()?;
         bytes.extend_from_slice(self.relay_signature.as_ref());
-        bytes
+        Ok(bytes)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RelaySubmitError> {
@@ -98,6 +131,15 @@ impl RelayAttestationV1 {
         offset += 4;
         let entries_len = bytes[offset] as usize;
         offset += 1;
+        if entries_len == 0 {
+            return Err(RelaySubmitError::EmptyEntries);
+        }
+        if entries_len > mcp::NUM_PROPOSERS {
+            return Err(RelaySubmitError::TooManyEntries {
+                actual: entries_len,
+                max: mcp::NUM_PROPOSERS,
+            });
+        }
 
         let mut entries = Vec::with_capacity(entries_len);
         let mut prev_index = None;
@@ -107,6 +149,9 @@ impl RelayAttestationV1 {
             }
             let proposer_index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
             offset += 4;
+            if proposer_index as usize >= mcp::NUM_PROPOSERS {
+                return Err(RelaySubmitError::ProposerIndexOutOfRange(proposer_index));
+            }
             if prev_index.is_some_and(|prev| proposer_index <= prev) {
                 return Err(RelaySubmitError::UnsortedOrDuplicateEntries);
             }
@@ -115,9 +160,13 @@ impl RelayAttestationV1 {
             let mut commitment = [0u8; 32];
             commitment.copy_from_slice(&bytes[offset..offset + 32]);
             offset += 32;
-            let proposer_signature =
-                Signature::from(<[u8; 64]>::try_from(&bytes[offset..offset + 64]).unwrap());
-            offset += 64;
+            let proposer_signature = Signature::from(
+                <[u8; SIGNATURE_BYTES]>::try_from(
+                    &bytes[offset..offset + SIGNATURE_BYTES],
+                )
+                .unwrap(),
+            );
+            offset += SIGNATURE_BYTES;
 
             entries.push(RelayAttestationEntry {
                 proposer_index,
@@ -130,8 +179,8 @@ impl RelayAttestationV1 {
             return Err(RelaySubmitError::PayloadTooShort);
         }
         let relay_signature =
-            Signature::from(<[u8; 64]>::try_from(&bytes[offset..offset + 64]).unwrap());
-        offset += 64;
+            Signature::from(<[u8; SIGNATURE_BYTES]>::try_from(&bytes[offset..offset + SIGNATURE_BYTES]).unwrap());
+        offset += SIGNATURE_BYTES;
 
         if offset != bytes.len() {
             return Err(RelaySubmitError::TrailingBytes);
@@ -146,8 +195,9 @@ impl RelayAttestationV1 {
     }
 
     pub fn verify_relay_signature(&self, relay_pubkey: &Pubkey) -> bool {
-        self.relay_signature
-            .verify(relay_pubkey.as_ref(), &self.signing_bytes())
+        self.signing_bytes()
+            .map(|bytes| self.relay_signature.verify(relay_pubkey.as_ref(), &bytes))
+            .unwrap_or(false)
     }
 
     pub fn valid_entries<F>(&self, mut proposer_pubkey_for_index: F) -> Vec<RelayAttestationEntry>
@@ -197,7 +247,7 @@ where
     Ok(RelayAttestationDispatch {
         slot: attestation.slot,
         leader_pubkey,
-        frame: encode_relay_attestation_frame(&attestation.to_bytes()),
+        frame: encode_relay_attestation_frame(&attestation.to_bytes()?),
     })
 }
 
@@ -230,7 +280,7 @@ pub fn dispatch_relay_attestation_to_slot_leader(
             dispatch.leader_pubkey,
         ))?;
     quic_endpoint_sender
-        .blocking_send((leader_addr, Bytes::from(dispatch.frame.clone())))
+        .try_send((leader_addr, Bytes::copy_from_slice(&dispatch.frame)))
         .map_err(|_| RelaySubmitError::SendError)?;
 
     Ok(dispatch)
@@ -269,13 +319,36 @@ mod tests {
         entries: Vec<RelayAttestationEntry>,
         relay: &Keypair,
     ) -> RelayAttestationV1 {
+        fn signing_bytes_unchecked(
+            slot: Slot,
+            relay_index: u32,
+            entries: &[RelayAttestationEntry],
+        ) -> Vec<u8> {
+            let mut bytes =
+                Vec::with_capacity(1 + 8 + 4 + 1 + entries.len() * (4 + 32 + SIGNATURE_BYTES));
+            bytes.push(RELAY_ATTESTATION_VERSION_V1);
+            bytes.extend_from_slice(&slot.to_le_bytes());
+            bytes.extend_from_slice(&relay_index.to_le_bytes());
+            bytes.push(entries.len() as u8);
+            for entry in entries {
+                bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
+                bytes.extend_from_slice(&entry.commitment);
+                bytes.extend_from_slice(entry.proposer_signature.as_ref());
+            }
+            bytes
+        }
+
         let mut attestation = RelayAttestationV1 {
             slot,
             relay_index,
             entries,
             relay_signature: Signature::default(),
         };
-        let signature = relay.sign_message(&attestation.signing_bytes());
+        let signature = relay.sign_message(&signing_bytes_unchecked(
+            attestation.slot,
+            attestation.relay_index,
+            &attestation.entries,
+        ));
         attestation.relay_signature = signature;
         attestation
     }
@@ -297,7 +370,7 @@ mod tests {
             &relay,
         );
 
-        let bytes = attestation.to_bytes();
+        let bytes = attestation.to_bytes().unwrap();
         let decoded = RelayAttestationV1::from_bytes(&bytes).unwrap();
         assert_eq!(decoded, attestation);
         assert!(decoded.verify_relay_signature(&relay.pubkey()));
@@ -324,9 +397,68 @@ mod tests {
             ],
             &relay,
         );
+        let mut bytes = Vec::new();
+        bytes.push(RELAY_ATTESTATION_VERSION_V1);
+        bytes.extend_from_slice(&attestation.slot.to_le_bytes());
+        bytes.extend_from_slice(&attestation.relay_index.to_le_bytes());
+        bytes.push(attestation.entries.len() as u8);
+        for entry in &attestation.entries {
+            bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
+            bytes.extend_from_slice(&entry.commitment);
+            bytes.extend_from_slice(entry.proposer_signature.as_ref());
+        }
+        bytes.extend_from_slice(attestation.relay_signature.as_ref());
 
-        let err = RelayAttestationV1::from_bytes(&attestation.to_bytes()).unwrap_err();
+        let err = RelayAttestationV1::from_bytes(&bytes).unwrap_err();
         assert_eq!(err, RelaySubmitError::UnsortedOrDuplicateEntries);
+    }
+
+    #[test]
+    fn test_empty_entries_rejected() {
+        let attestation = RelayAttestationV1 {
+            slot: 1,
+            relay_index: 2,
+            entries: vec![],
+            relay_signature: Signature::default(),
+        };
+        assert_eq!(
+            attestation.signing_bytes().unwrap_err(),
+            RelaySubmitError::EmptyEntries
+        );
+    }
+
+    #[test]
+    fn test_too_many_entries_rejected() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let entries: Vec<_> = (0..=mcp::NUM_PROPOSERS as u32)
+            .map(|index| signed_entry(index, [index as u8; 32], &proposer))
+            .collect();
+        let attestation = RelayAttestationV1 {
+            slot: 9,
+            relay_index: 1,
+            entries,
+            relay_signature: relay.sign_message(b"placeholder"),
+        };
+        assert_eq!(
+            attestation.signing_bytes().unwrap_err(),
+            RelaySubmitError::TooManyEntries {
+                actual: mcp::NUM_PROPOSERS + 1,
+                max: mcp::NUM_PROPOSERS,
+            }
+        );
+    }
+
+    #[test]
+    fn test_truncated_payload_rejected() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let attestation =
+            signed_attestation(55, 12, vec![signed_entry(1, [5u8; 32], &proposer)], &relay);
+        let mut bytes = attestation.to_bytes().unwrap();
+        bytes.pop();
+        let err = RelayAttestationV1::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err, RelaySubmitError::PayloadTooShort);
     }
 
     #[test]
@@ -410,7 +542,13 @@ mod tests {
             relay,
             SocketAddrSpace::Unspecified,
         );
-        let attestation = signed_attestation(0, 0, vec![], &Keypair::new());
+        let proposer = Keypair::new();
+        let attestation = signed_attestation(
+            0,
+            0,
+            vec![signed_entry(0, [1u8; 32], &proposer)],
+            &Keypair::new(),
+        );
         let (sender, _receiver) = tokio::sync::mpsc::channel(1);
 
         let err = dispatch_relay_attestation_to_slot_leader(
