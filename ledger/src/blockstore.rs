@@ -3365,7 +3365,16 @@ impl Blockstore {
     }
 
     pub fn put_mcp_execution_output(&self, slot: Slot, output: &[u8]) -> Result<()> {
-        self.mcp_execution_output_cf.put_bytes(slot, output)
+        let _lock = self.insert_shreds_lock.lock().unwrap();
+        match self.mcp_execution_output_cf.get_bytes(slot)? {
+            None => self.mcp_execution_output_cf.put_bytes(slot, output),
+            Some(existing) if existing.as_slice() == output => Ok(()),
+            Some(existing) if existing.is_empty() && !output.is_empty() => {
+                self.mcp_execution_output_cf.put_bytes(slot, output)
+            }
+            Some(existing) if !existing.is_empty() && output.is_empty() => Ok(()),
+            Some(_) => Err(BlockstoreError::McpExecutionOutputConflict(slot)),
+        }
     }
 
     pub fn put_mcp_empty_execution_output(&self, slot: Slot) -> Result<()> {
@@ -6813,6 +6822,37 @@ pub mod tests {
         assert_eq!(
             blockstore.get_mcp_execution_output(100).unwrap(),
             Some(b"ordered-output".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_put_mcp_empty_execution_output_does_not_overwrite_non_empty() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        blockstore
+            .put_mcp_execution_output(101, b"ordered-output")
+            .unwrap();
+        blockstore.put_mcp_empty_execution_output(101).unwrap();
+        assert_eq!(
+            blockstore.get_mcp_execution_output(101).unwrap(),
+            Some(b"ordered-output".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_put_mcp_execution_output_rejects_conflicting_non_empty_value() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        blockstore.put_mcp_execution_output(102, b"first").unwrap();
+        assert_matches!(
+            blockstore.put_mcp_execution_output(102, b"second"),
+            Err(BlockstoreError::McpExecutionOutputConflict(102))
+        );
+        assert_eq!(
+            blockstore.get_mcp_execution_output(102).unwrap(),
+            Some(b"first".to_vec())
         );
     }
 

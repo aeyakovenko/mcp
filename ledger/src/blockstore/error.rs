@@ -70,5 +70,7 @@ pub enum BlockstoreError {
         actual: usize,
         max: usize,
     },
+    #[error("MCP execution output conflict for slot {0}")]
+    McpExecutionOutputConflict(Slot),
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
