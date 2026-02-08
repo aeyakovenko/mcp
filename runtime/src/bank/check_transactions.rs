@@ -6,7 +6,7 @@ use {
     solana_clock::{
         MAX_PROCESSING_AGE, MAX_TRANSACTION_FORWARDING_DELAY, MAX_TRANSACTION_FORWARDING_DELAY_GPU,
     },
-    solana_fee::{calculate_fee_details, FeeFeatures},
+    solana_fee::{apply_mcp_fee_component_values, calculate_fee_details, FeeFeatures},
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_nonce::{
         state::{Data as NonceData, DurableNonce, State as NonceState},
@@ -110,6 +110,16 @@ impl Bank {
                                 fee_budget.prioritization_fee,
                                 fee_features,
                             );
+                            let fee_details = tx
+                                .borrow()
+                                .mcp_fee_components()
+                                .map_or(fee_details, |(inclusion_fee, ordering_fee)| {
+                                    apply_mcp_fee_component_values(
+                                        fee_details,
+                                        inclusion_fee,
+                                        ordering_fee,
+                                    )
+                                });
                             if let Some(compute_budget) = self.compute_budget {
                                 // This block of code is only necessary to retain legacy behavior of the code.
                                 // It should be removed along with the change to favor transaction's compute budget limits
