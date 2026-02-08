@@ -11,6 +11,7 @@ const HEADER_LEN: usize = 1 + 8 + 4 + 1;
 const ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
 const FOOTER_LEN: usize = SIGNATURE_BYTES;
 const MIN_WIRE_LEN: usize = HEADER_LEN + FOOTER_LEN;
+const MAX_RELAY_ATTESTATION_ENTRIES: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayAttestationEntry {
@@ -32,7 +33,7 @@ pub struct RelayAttestation {
 pub enum RelayAttestationError {
     #[error("unknown relay attestation version: {0}")]
     UnknownVersion(u8),
-    #[error("relay attestation entries exceed u8::MAX: {0}")]
+    #[error("relay attestation entries exceed MCP proposer limit: {0}")]
     TooManyEntries(usize),
     #[error("relay attestation entries must be strictly sorted by proposer_index")]
     EntriesNotStrictlySorted,
@@ -48,7 +49,7 @@ impl RelayAttestation {
         relay_index: u32,
         mut entries: Vec<RelayAttestationEntry>,
     ) -> Result<Self, RelayAttestationError> {
-        if entries.len() > u8::MAX as usize {
+        if entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(entries.len()));
         }
         entries.sort_unstable_by_key(|entry| entry.proposer_index);
@@ -63,7 +64,7 @@ impl RelayAttestation {
     }
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, RelayAttestationError> {
-        if self.entries.len() > u8::MAX as usize {
+        if self.entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(self.entries.len()));
         }
         ensure_entries_strictly_sorted(&self.entries)?;
@@ -103,6 +104,9 @@ impl RelayAttestation {
         let slot = read_u64_le(bytes, &mut cursor)?;
         let relay_index = read_u32_le(bytes, &mut cursor)?;
         let entries_len = read_u8(bytes, &mut cursor)? as usize;
+        if entries_len > MAX_RELAY_ATTESTATION_ENTRIES {
+            return Err(RelayAttestationError::TooManyEntries(entries_len));
+        }
 
         let mut entries = Vec::with_capacity(entries_len);
         for _ in 0..entries_len {
@@ -388,6 +392,46 @@ mod tests {
         assert_eq!(
             RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
             RelayAttestationError::TrailingBytes,
+        );
+    }
+
+    #[test]
+    fn test_new_unsigned_rejects_too_many_entries() {
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries: Vec<_> = (0..=MAX_RELAY_ATTESTATION_ENTRIES as u32)
+            .map(|proposer_index| RelayAttestationEntry {
+                proposer_index,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            })
+            .collect();
+        assert_eq!(
+            RelayAttestation::new_unsigned(1, 2, entries).unwrap_err(),
+            RelayAttestationError::TooManyEntries(MAX_RELAY_ATTESTATION_ENTRIES + 1)
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_too_many_entries() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push((MAX_RELAY_ATTESTATION_ENTRIES + 1) as u8);
+        for proposer_index in 0..=MAX_RELAY_ATTESTATION_ENTRIES as u32 {
+            bytes.extend_from_slice(&proposer_index.to_le_bytes());
+            bytes.extend_from_slice(commitment.as_ref());
+            bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        }
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::TooManyEntries(MAX_RELAY_ATTESTATION_ENTRIES + 1),
         );
     }
 }
