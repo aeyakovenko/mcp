@@ -20,6 +20,7 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_vote_gate::{self, VoteGateDecision, VoteGateInput},
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
             cluster_slot_state_verifier::*,
@@ -301,6 +302,7 @@ pub struct ReplayStageConfig {
     pub consensus_metrics_sender: ConsensusMetricsEventSender,
     pub consensus_metrics_receiver: ConsensusMetricsEventReceiver,
     pub migration_status: Arc<MigrationStatus>,
+    pub mcp_vote_gate_inputs: Arc<RwLock<HashMap<Slot, VoteGateInput>>>,
     pub reward_votes_receiver: Receiver<AddVoteMessage>,
     pub reward_certs_sender: Sender<BuildRewardCertsResponse>,
     pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
@@ -625,6 +627,7 @@ impl ReplayStage {
             consensus_metrics_sender,
             consensus_metrics_receiver,
             migration_status,
+            mcp_vote_gate_inputs,
             reward_votes_receiver,
             build_reward_certs_receiver,
             reward_certs_sender,
@@ -1181,6 +1184,7 @@ impl ReplayStage {
                         if let Err(e) = Self::handle_votable_bank(
                             vote_bank,
                             switch_fork_decision,
+                            &mcp_vote_gate_inputs,
                             &bank_forks,
                             &mut tower,
                             &mut progress,
@@ -2798,6 +2802,7 @@ impl ReplayStage {
     fn handle_votable_bank(
         bank: &Arc<Bank>,
         switch_fork_decision: &SwitchForkDecision,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
         bank_forks: &Arc<RwLock<BankForks>>,
         tower: &mut Tower,
         progress: &mut ProgressMap,
@@ -2821,6 +2826,14 @@ impl ReplayStage {
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
         assert!(!migration_status.is_alpenglow_enabled());
+        if bank
+            .feature_set
+            .is_active(&agave_feature_set::mcp_protocol_v1::id())
+            && !Self::should_vote_mcp_slot(bank.slot(), mcp_vote_gate_inputs)
+        {
+            return Ok(());
+        }
+
         if bank.is_empty() {
             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
         }
@@ -2915,6 +2928,28 @@ impl ReplayStage {
             wait_to_vote_slot,
         );
         Ok(())
+    }
+
+    fn should_vote_mcp_slot(
+        slot: Slot,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+    ) -> bool {
+        let maybe_input = mcp_vote_gate_inputs.read().unwrap().get(&slot).cloned();
+        let Some(input) = maybe_input else {
+            info!(
+                "MCP vote gate rejected slot {}: gate input unavailable",
+                slot
+            );
+            return false;
+        };
+
+        match mcp_vote_gate::evaluate_vote_gate(&input) {
+            VoteGateDecision::Vote { .. } => true,
+            VoteGateDecision::Reject(reason) => {
+                info!("MCP vote gate rejected slot {}: {}", slot, reason);
+                false
+            }
+        }
     }
 
     fn generate_vote_tx(
@@ -4983,6 +5018,54 @@ pub(crate) mod tests {
             .unwrap()
             .insert(bank)
             .clone_without_scheduler()
+    }
+
+    fn make_mcp_vote_gate_input(delayed_bankhash_available: bool) -> VoteGateInput {
+        let commitment = [7u8; 32];
+        let aggregate = (0..mcp_vote_gate::REQUIRED_ATTESTATIONS)
+            .map(|relay_index| mcp_vote_gate::RelayAttestationObservation {
+                relay_index: relay_index as u32,
+                relay_signature_valid: true,
+                entries: vec![mcp_vote_gate::RelayProposerEntry {
+                    proposer_index: 0,
+                    commitment,
+                    proposer_signature_valid: true,
+                }],
+            })
+            .collect();
+
+        VoteGateInput {
+            leader_signature_valid: true,
+            leader_index_matches: true,
+            delayed_bankhash_available,
+            delayed_bankhash_matches: true,
+            aggregate,
+            proposer_indices: vec![0],
+            local_valid_shreds: HashMap::from([(0, mcp_vote_gate::REQUIRED_RECONSTRUCTION)]),
+        }
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_rejects_missing_input() {
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        assert!(!ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_rejects_missing_delayed_bankhash() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(11, make_mcp_vote_gate_input(false))]));
+        assert!(!ReplayStage::should_vote_mcp_slot(
+            11,
+            &mcp_vote_gate_inputs
+        ));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_accepts_valid_gate_input() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(13, make_mcp_vote_gate_input(true))]));
+        assert!(ReplayStage::should_vote_mcp_slot(13, &mcp_vote_gate_inputs));
     }
 
     #[test]
