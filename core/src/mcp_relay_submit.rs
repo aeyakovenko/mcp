@@ -14,6 +14,13 @@ use {
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
 pub const RELAY_ATTESTATION_VERSION_V1: u8 = 1;
+pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
+    + 8
+    + 4
+    + 1
+    + (mcp::NUM_PROPOSERS * (4 + 32 + SIGNATURE_BYTES))
+    + SIGNATURE_BYTES;
+pub const MAX_RELAY_ATTESTATION_FRAME_BYTES: usize = 1 + MAX_RELAY_ATTESTATION_BYTES;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayAttestationEntry {
@@ -61,8 +68,12 @@ pub enum RelaySubmitError {
     MissingLeaderAddress(Pubkey),
     #[error("MCP protocol v1 is not active for slot {slot}")]
     FeatureNotActive { slot: Slot },
-    #[error("failed to send relay attestation frame")]
-    SendError,
+    #[error("relay attestation frame too large: {actual} > {max}")]
+    FrameTooLarge { actual: usize, max: usize },
+    #[error("relay attestation send queue is full")]
+    SendChannelFull,
+    #[error("relay attestation send queue is closed")]
+    SendChannelClosed,
 }
 
 impl RelayAttestationV1 {
@@ -218,16 +229,31 @@ impl RelayAttestationV1 {
     }
 }
 
-pub fn encode_relay_attestation_frame(attestation_bytes: &[u8]) -> Vec<u8> {
+pub fn encode_relay_attestation_frame(
+    attestation_bytes: &[u8],
+) -> Result<Vec<u8>, RelaySubmitError> {
+    let frame_len = 1 + attestation_bytes.len();
+    if frame_len > MAX_RELAY_ATTESTATION_FRAME_BYTES {
+        return Err(RelaySubmitError::FrameTooLarge {
+            actual: frame_len,
+            max: MAX_RELAY_ATTESTATION_FRAME_BYTES,
+        });
+    }
     let mut frame = Vec::with_capacity(1 + attestation_bytes.len());
     frame.push(MCP_CONTROL_MSG_RELAY_ATTESTATION);
     frame.extend_from_slice(attestation_bytes);
-    frame
+    Ok(frame)
 }
 
 pub fn decode_relay_attestation_frame(frame: &[u8]) -> Result<&[u8], RelaySubmitError> {
     if frame.is_empty() {
         return Err(RelaySubmitError::PayloadTooShort);
+    }
+    if frame.len() > MAX_RELAY_ATTESTATION_FRAME_BYTES {
+        return Err(RelaySubmitError::FrameTooLarge {
+            actual: frame.len(),
+            max: MAX_RELAY_ATTESTATION_FRAME_BYTES,
+        });
     }
     if frame[0] != MCP_CONTROL_MSG_RELAY_ATTESTATION {
         return Err(RelaySubmitError::UnknownMessageType(frame[0]));
@@ -247,7 +273,7 @@ where
     Ok(RelayAttestationDispatch {
         slot: attestation.slot,
         leader_pubkey,
-        frame: encode_relay_attestation_frame(&attestation.to_bytes()?),
+        frame: encode_relay_attestation_frame(&attestation.to_bytes()?)?,
     })
 }
 
@@ -281,7 +307,12 @@ pub fn dispatch_relay_attestation_to_slot_leader(
         ))?;
     quic_endpoint_sender
         .try_send((leader_addr, Bytes::copy_from_slice(&dispatch.frame)))
-        .map_err(|_| RelaySubmitError::SendError)?;
+        .map_err(|err| match err {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => RelaySubmitError::SendChannelFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                RelaySubmitError::SendChannelClosed
+            }
+        })?;
 
     Ok(dispatch)
 }
@@ -319,36 +350,13 @@ mod tests {
         entries: Vec<RelayAttestationEntry>,
         relay: &Keypair,
     ) -> RelayAttestationV1 {
-        fn signing_bytes_unchecked(
-            slot: Slot,
-            relay_index: u32,
-            entries: &[RelayAttestationEntry],
-        ) -> Vec<u8> {
-            let mut bytes =
-                Vec::with_capacity(1 + 8 + 4 + 1 + entries.len() * (4 + 32 + SIGNATURE_BYTES));
-            bytes.push(RELAY_ATTESTATION_VERSION_V1);
-            bytes.extend_from_slice(&slot.to_le_bytes());
-            bytes.extend_from_slice(&relay_index.to_le_bytes());
-            bytes.push(entries.len() as u8);
-            for entry in entries {
-                bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
-                bytes.extend_from_slice(&entry.commitment);
-                bytes.extend_from_slice(entry.proposer_signature.as_ref());
-            }
-            bytes
-        }
-
         let mut attestation = RelayAttestationV1 {
             slot,
             relay_index,
             entries,
             relay_signature: Signature::default(),
         };
-        let signature = relay.sign_message(&signing_bytes_unchecked(
-            attestation.slot,
-            attestation.relay_index,
-            &attestation.entries,
-        ));
+        let signature = relay.sign_message(&attestation.signing_bytes().unwrap());
         attestation.relay_signature = signature;
         attestation
     }
@@ -388,26 +396,23 @@ mod tests {
         let relay = Keypair::new();
         let proposer_a = Keypair::new();
         let proposer_b = Keypair::new();
-        let attestation = signed_attestation(
-            1,
-            2,
-            vec![
-                signed_entry(9, [1u8; 32], &proposer_a),
-                signed_entry(4, [2u8; 32], &proposer_b),
-            ],
-            &relay,
-        );
+        let slot: Slot = 1;
+        let relay_index: u32 = 2;
+        let entries = vec![
+            signed_entry(9, [1u8; 32], &proposer_a),
+            signed_entry(4, [2u8; 32], &proposer_b),
+        ];
         let mut bytes = Vec::new();
         bytes.push(RELAY_ATTESTATION_VERSION_V1);
-        bytes.extend_from_slice(&attestation.slot.to_le_bytes());
-        bytes.extend_from_slice(&attestation.relay_index.to_le_bytes());
-        bytes.push(attestation.entries.len() as u8);
-        for entry in &attestation.entries {
+        bytes.extend_from_slice(&slot.to_le_bytes());
+        bytes.extend_from_slice(&relay_index.to_le_bytes());
+        bytes.push(entries.len() as u8);
+        for entry in &entries {
             bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
             bytes.extend_from_slice(&entry.commitment);
             bytes.extend_from_slice(entry.proposer_signature.as_ref());
         }
-        bytes.extend_from_slice(attestation.relay_signature.as_ref());
+        bytes.extend_from_slice(relay.sign_message(b"placeholder").as_ref());
 
         let err = RelayAttestationV1::from_bytes(&bytes).unwrap_err();
         assert_eq!(err, RelaySubmitError::UnsortedOrDuplicateEntries);
