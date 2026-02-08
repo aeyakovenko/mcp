@@ -89,8 +89,9 @@ pub(crate) fn stake_weighted_slot_leaders_domain_separated(
 ) -> Vec<Pubkey> {
     let mut seed = [0u8; 32];
     seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-    let copy_len = std::cmp::min(seed.len() - 8, domain.len());
-    seed[8..8 + copy_len].copy_from_slice(&domain[..copy_len]);
+    const DOMAIN_BYTES: usize = 24; // seed bytes [8..32)
+    assert!(domain.len() <= DOMAIN_BYTES, "domain seed is too long");
+    seed[8..8 + domain.len()].copy_from_slice(domain);
     stake_weighted_slot_leaders_from_seed(keyed_stakes, len, repeat, seed)
 }
 
@@ -211,5 +212,19 @@ mod tests {
 
         assert_ne!(leader, proposer);
         assert_ne!(proposer, relay);
+    }
+
+    #[test]
+    #[should_panic(expected = "domain seed is too long")]
+    fn test_domain_separated_seed_rejects_long_domain() {
+        let stakes = vec![(Pubkey::new_unique(), 100), (Pubkey::new_unique(), 50)];
+        let keyed_stakes: Vec<_> = stakes.iter().map(|(k, stake)| (k, *stake)).collect();
+        let _ = stake_weighted_slot_leaders_domain_separated(
+            keyed_stakes,
+            1,
+            16,
+            1,
+            b"mcp:this-domain-is-way-too-long-for-the-seed",
+        );
     }
 }

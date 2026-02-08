@@ -73,8 +73,7 @@ impl LeaderScheduleCache {
             .get_leader_schedule_epoch(root_bank.slot());
         for epoch in 0..leader_schedule_epoch {
             cache.compute_epoch_schedule(epoch, root_bank);
-            cache.compute_epoch_mcp_schedule(epoch, root_bank, McpScheduleKind::Proposer);
-            cache.compute_epoch_mcp_schedule(epoch, root_bank, McpScheduleKind::Relay);
+            cache.compute_epoch_mcp_schedules(epoch, root_bank);
         }
         cache
     }
@@ -104,8 +103,7 @@ impl LeaderScheduleCache {
         // Calculate the epoch as soon as it's rooted
         if new_max_epoch > old_max_epoch {
             self.compute_epoch_schedule(new_max_epoch, root_bank);
-            self.compute_epoch_mcp_schedule(new_max_epoch, root_bank, McpScheduleKind::Proposer);
-            self.compute_epoch_mcp_schedule(new_max_epoch, root_bank, McpScheduleKind::Relay);
+            self.compute_epoch_mcp_schedules(new_max_epoch, root_bank);
         }
     }
 
@@ -304,7 +302,10 @@ impl LeaderScheduleCache {
         kind: McpScheduleKind,
     ) -> Option<Arc<LeaderSchedule>> {
         self.get_epoch_mcp_schedule_no_compute(epoch, kind)
-            .or_else(|| self.compute_epoch_mcp_schedule(epoch, bank, kind))
+            .or_else(|| self.compute_epoch_mcp_schedules(epoch, bank).map(|(p, r)| match kind {
+                McpScheduleKind::Proposer => p,
+                McpScheduleKind::Relay => r,
+            }))
     }
 
     fn get_epoch_schedule_else_compute(
@@ -323,30 +324,35 @@ impl LeaderScheduleCache {
         }
     }
 
-    fn compute_epoch_mcp_schedule(
+    fn compute_epoch_mcp_schedules(
         &self,
         epoch: Epoch,
         bank: &Bank,
-        kind: McpScheduleKind,
-    ) -> Option<Arc<LeaderSchedule>> {
-        let schedule = match kind {
-            McpScheduleKind::Proposer => leader_schedule_utils::mcp_proposer_schedule(epoch, bank),
-            McpScheduleKind::Relay => leader_schedule_utils::mcp_relay_schedule(epoch, bank),
-        };
-        schedule.map(|schedule| {
-            let schedule = Arc::new(schedule);
-            let cache = match kind {
-                McpScheduleKind::Proposer => &self.cached_mcp_proposer_schedules,
-                McpScheduleKind::Relay => &self.cached_mcp_relay_schedules,
-            };
-            let (ref mut cached_schedules, ref mut order) = *cache.write().unwrap();
-            if let Entry::Vacant(v) = cached_schedules.entry(epoch) {
-                v.insert(schedule.clone());
-                order.push_back(epoch);
-                Self::retain_latest(cached_schedules, order, self.max_schedules());
-            }
-            schedule
-        })
+    ) -> Option<(Arc<LeaderSchedule>, Arc<LeaderSchedule>)> {
+        let proposer = leader_schedule_utils::mcp_proposer_schedule(epoch, bank)?;
+        let relay = leader_schedule_utils::mcp_relay_schedule(epoch, bank)?;
+        let proposer = Arc::new(proposer);
+        let relay = Arc::new(relay);
+
+        // Insert both MCP schedules under write locks held at the same time so
+        // readers cannot observe a mixed epoch view.
+        let mut proposer_cache = self.cached_mcp_proposer_schedules.write().unwrap();
+        let mut relay_cache = self.cached_mcp_relay_schedules.write().unwrap();
+
+        if let Entry::Vacant(v) = proposer_cache.0.entry(epoch) {
+            v.insert(proposer.clone());
+            proposer_cache.1.push_back(epoch);
+            let (ref mut cached_schedules, ref mut order) = *proposer_cache;
+            Self::retain_latest(cached_schedules, order, self.max_schedules());
+        }
+        if let Entry::Vacant(v) = relay_cache.0.entry(epoch) {
+            v.insert(relay.clone());
+            relay_cache.1.push_back(epoch);
+            let (ref mut cached_schedules, ref mut order) = *relay_cache;
+            Self::retain_latest(cached_schedules, order, self.max_schedules());
+        }
+
+        Some((proposer, relay))
     }
 
     fn compute_epoch_schedule(&self, epoch: Epoch, bank: &Bank) -> Option<Arc<LeaderSchedule>> {
