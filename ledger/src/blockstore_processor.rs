@@ -8,6 +8,7 @@ use {
         transaction_balances::compile_collected_balances,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
+    agave_feature_set as feature_set,
     chrono_humanize::{Accuracy, HumanTime, Tense},
     crossbeam_channel::Sender,
     itertools::Itertools,
@@ -53,6 +54,7 @@ use {
     solana_signature::Signature,
     solana_svm::{
         transaction_commit_result::{TransactionCommitResult, TransactionCommitResultExtensions},
+        transaction_error_metrics::TransactionErrorMetrics,
         transaction_processing_result::ProcessedTransaction,
         transaction_processor::ExecutionRecordingConfig,
     },
@@ -225,16 +227,52 @@ pub fn execute_batch<'a>(
         }
     };
 
-    let (commit_results, balance_collector) = batch
-        .bank()
-        .load_execute_and_commit_transactions_with_pre_commit_callback(
-            batch,
+    let mcp_two_pass_fees = block_verification
+        && bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id());
+    let (commit_results, balance_collector) = if mcp_two_pass_fees {
+        let mut fee_error_counters = TransactionErrorMetrics::default();
+        let fee_collection_results =
+            bank.collect_fees_only_for_transactions(batch, MAX_PROCESSING_AGE, &mut fee_error_counters);
+
+        let mut phase_b_lock_results = batch.lock_results().clone();
+        for (lock_result, fee_result) in phase_b_lock_results
+            .iter_mut()
+            .zip(fee_collection_results.iter())
+        {
+            if let Err(err) = fee_result {
+                *lock_result = Err(err.clone());
+            }
+        }
+
+        let mut phase_b_batch = TransactionBatch::new(
+            phase_b_lock_results,
+            bank,
+            OwnedOrBorrowed::Borrowed(batch.sanitized_transactions()),
+        );
+        // Original `batch` owns lock lifetimes and unlocks on drop.
+        phase_b_batch.set_needs_unlock(false);
+        bank.load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback(
+            &phase_b_batch,
             MAX_PROCESSING_AGE,
             ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
             timings,
             log_messages_bytes_limit,
             pre_commit_callback,
-        )?;
+        )?
+    } else {
+        batch
+            .bank()
+            .load_execute_and_commit_transactions_with_pre_commit_callback(
+                batch,
+                MAX_PROCESSING_AGE,
+                ExecutionRecordingConfig::new_single_setting(transaction_status_sender.is_some()),
+                timings,
+                log_messages_bytes_limit,
+                pre_commit_callback,
+            )?
+    };
 
     let mut check_block_costs_elapsed = Measure::start("check_block_costs");
     let tx_costs = if block_verification {
