@@ -1,5 +1,6 @@
 use {
     agave_feature_set::{enable_secp256r1_precompile, FeatureSet},
+    agave_transaction_view::mcp_transaction::McpTransaction,
     solana_fee_structure::FeeDetails,
     solana_svm_transaction::svm_message::SVMMessage,
 };
@@ -62,6 +63,40 @@ pub fn calculate_fee_details(
     )
 }
 
+pub fn calculate_fee_details_with_mcp(
+    message: &impl SVMMessage,
+    zero_fees_for_test: bool,
+    lamports_per_signature: u64,
+    prioritization_fee: u64,
+    fee_features: FeeFeatures,
+    mcp_transaction: Option<&McpTransaction>,
+) -> FeeDetails {
+    let base = calculate_fee_details(
+        message,
+        zero_fees_for_test,
+        lamports_per_signature,
+        prioritization_fee,
+        fee_features,
+    );
+    apply_mcp_fee_components(base, mcp_transaction)
+}
+
+pub fn apply_mcp_fee_components(
+    base: FeeDetails,
+    mcp_transaction: Option<&McpTransaction>,
+) -> FeeDetails {
+    let Some(mcp_transaction) = mcp_transaction else {
+        return base;
+    };
+
+    let inclusion_fee = u64::from(mcp_transaction.inclusion_fee().unwrap_or_default());
+    let ordering_fee = u64::from(mcp_transaction.ordering_fee().unwrap_or_default());
+    FeeDetails::new(
+        base.transaction_fee().saturating_add(inclusion_fee),
+        base.prioritization_fee().saturating_add(ordering_fee),
+    )
+}
+
 /// Calculate fees from signatures.
 pub fn calculate_signature_fee(
     SignatureCounts {
@@ -103,6 +138,10 @@ impl<Tx: SVMMessage> From<&Tx> for SignatureCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agave_transaction_view::mcp_transaction::{
+        LegacyHeader, McpTransaction, MCP_TX_CONFIG_BIT_INCLUSION_FEE,
+        MCP_TX_CONFIG_BIT_ORDERING_FEE,
+    };
 
     #[test]
     fn test_calculate_signature_fee() {
@@ -167,5 +206,37 @@ mod tests {
             ),
             6 * LAMPORTS_PER_SIGNATURE
         );
+    }
+
+    #[test]
+    fn test_apply_mcp_fee_components_adds_inclusion_and_ordering_fee() {
+        let mcp_tx = McpTransaction {
+            version: 1,
+            legacy_header: LegacyHeader {
+                num_required_signatures: 0,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 0,
+            },
+            transaction_config_mask: (1u32 << MCP_TX_CONFIG_BIT_INCLUSION_FEE)
+                | (1u32 << MCP_TX_CONFIG_BIT_ORDERING_FEE),
+            lifetime_specifier: [0u8; 32],
+            addresses: vec![],
+            config_values: vec![17, 29],
+            instruction_headers: vec![],
+            instruction_payloads: vec![],
+            signatures: vec![],
+        };
+
+        let base = FeeDetails::new(100, 5);
+        let with_mcp = apply_mcp_fee_components(base, Some(&mcp_tx));
+        assert_eq!(with_mcp.transaction_fee(), 117);
+        assert_eq!(with_mcp.prioritization_fee(), 34);
+        assert_eq!(with_mcp.total_fee(), 151);
+    }
+
+    #[test]
+    fn test_apply_mcp_fee_components_is_noop_without_mcp_tx() {
+        let base = FeeDetails::new(55, 44);
+        assert_eq!(apply_mcp_fee_components(base, None), base);
     }
 }
