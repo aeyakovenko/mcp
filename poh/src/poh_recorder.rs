@@ -65,6 +65,12 @@ pub enum PohRecorderError {
 
     #[error("channel disconnected")]
     ChannelDisconnected,
+
+    #[error("bankless recording only allowed when no working bank is installed")]
+    BanklessWorkingBankPresent,
+
+    #[error("bankless recording slot mismatch: expected {expected}, got {actual}")]
+    BanklessSlotMismatch { expected: Slot, actual: Slot },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, PohRecorderError>;
@@ -421,6 +427,16 @@ impl PohRecorder {
         mixins: Vec<Hash>,
         transaction_batches: Vec<Vec<VersionedTransaction>>,
     ) -> Result<BanklessRecordSummary> {
+        if self.has_bank() {
+            return Err(PohRecorderError::BanklessWorkingBankPresent);
+        }
+        let expected_slot = self.start_slot();
+        if slot != expected_slot {
+            return Err(PohRecorderError::BanklessSlotMismatch {
+                expected: expected_slot,
+                actual: slot,
+            });
+        }
         assert!(
             mixins.len() == transaction_batches.len(),
             "mismatched mixin and transaction batch lengths"
@@ -1370,6 +1386,35 @@ mod tests {
             .unwrap();
         assert_eq!(summary.recorded_entries.len(), 1);
         assert_eq!(summary.recorded_entries[0].entry.transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_slot_mismatch() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(
+                bank.slot().saturating_add(1),
+                vec![hash(&[1u8])],
+                vec![vec![test_tx().into()]],
+            ),
+            Err(PohRecorderError::BanklessSlotMismatch { .. })
+        );
     }
 
     #[test]

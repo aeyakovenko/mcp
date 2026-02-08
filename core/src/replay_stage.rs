@@ -2597,9 +2597,10 @@ impl ReplayStage {
 
         assert!(parent_bank.is_frozen());
 
-        let allow_bankless_start = parent_bank
-            .feature_set
-            .is_active(&agave_feature_set::mcp_protocol_v1::id());
+        let allow_bankless_start = migration_status.is_alpenglow_enabled()
+            && parent_bank
+                .feature_set
+                .is_active(&agave_feature_set::mcp_protocol_v1::id());
 
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
