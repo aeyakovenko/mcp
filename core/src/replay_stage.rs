@@ -2597,6 +2597,10 @@ impl ReplayStage {
 
         assert!(parent_bank.is_frozen());
 
+        let allow_bankless_start = parent_bank
+            .feature_set
+            .is_active(&agave_feature_set::mcp_protocol_v1::id());
+
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
             leader_schedule_cache,
@@ -2604,7 +2608,7 @@ impl ReplayStage {
             bank_forks,
             maybe_my_leader_slot,
             has_new_vote_been_rooted,
-            migration_status.is_alpenglow_enabled(),
+            allow_bankless_start,
         ) {
             return None;
         }
@@ -9879,6 +9883,43 @@ pub(crate) mod tests {
         assert!(!fork_choice
             .is_candidate(&(5, bank_forks.bank_hash(5).unwrap()))
             .unwrap());
+    }
+
+    #[test]
+    fn test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote() {
+        let ReplayBlockstoreComponents {
+            my_pubkey,
+            leader_schedule_cache,
+            vote_simulator,
+            ..
+        } = replay_blockstore_components(None, 1, None::<GenerateVotes>);
+        let VoteSimulator { bank_forks, .. } = vote_simulator;
+
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let maybe_my_leader_slot = ((parent_bank.slot() + 1)..=(parent_bank.slot() + 2048))
+            .find(|slot| {
+                leader_schedule_cache.slot_leader_at(*slot, Some(&parent_bank)) == Some(my_pubkey)
+            })
+            .expect("a leader slot should exist for the local validator");
+
+        assert!(!ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            false,
+        ));
+        assert!(ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            true,
+        ));
     }
 
     #[test]
