@@ -5,9 +5,11 @@ use {
         broadcast_utils::{self, ReceiveResults},
         *,
     },
-    crate::cluster_nodes::ClusterNodesCache,
+    crate::{cluster_nodes::ClusterNodesCache, mcp_proposer},
+    agave_feature_set as feature_set,
     crossbeam_channel::Sender,
     solana_entry::block_component::BlockComponent,
+    solana_gossip::contact_info::Protocol,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
@@ -22,7 +24,7 @@ use {
     solana_time_utils::AtomicInterval,
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
-    std::{borrow::Cow, sync::RwLock},
+    std::{borrow::Cow, collections::HashMap, sync::RwLock},
     tokio::sync::mpsc::Sender as AsyncSender,
 };
 
@@ -49,11 +51,19 @@ pub struct StandardBroadcastRun {
     cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
+    mcp_dispatch_state: Arc<Mutex<HashMap<Slot, McpSlotDispatchState>>>,
 }
 
 #[derive(Debug)]
 enum BroadcastError {
     TooManyShreds,
+}
+
+#[derive(Default)]
+struct McpSlotDispatchState {
+    seen_batches: usize,
+    expected_batches: Option<usize>,
+    shred_payloads: Vec<[u8; mcp_proposer::MCP_SHRED_DATA_BYTES]>,
 }
 
 impl StandardBroadcastRun {
@@ -82,6 +92,7 @@ impl StandardBroadcastRun {
             cluster_nodes_cache,
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
+            mcp_dispatch_state: Arc::default(),
         }
     }
 
@@ -554,6 +565,120 @@ impl StandardBroadcastRun {
             slot_broadcast_time,
         );
     }
+
+    fn maybe_dispatch_mcp_shreds(
+        &self,
+        shreds: &[Shred],
+        batch_info: &Option<BroadcastShredBatchInfo>,
+        cluster_info: &ClusterInfo,
+        bank_forks: &RwLock<BankForks>,
+        quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    ) {
+        let Some(batch_info) = batch_info else {
+            // Retransmit batches have no slot metadata and are not MCP proposer outputs.
+            return;
+        };
+        let slot = batch_info.slot;
+        let feature_active = {
+            let bank_forks = bank_forks.read().unwrap();
+            bank_forks
+                .get(slot)
+                .unwrap_or_else(|| bank_forks.root_bank())
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+        };
+        if !feature_active {
+            return;
+        }
+
+        let maybe_shred_payloads = {
+            let mut state = self.mcp_dispatch_state.lock().unwrap();
+            let slot_state = state.entry(slot).or_default();
+            slot_state.seen_batches = slot_state.seen_batches.saturating_add(1);
+            if let Some(num_expected_batches) = batch_info.num_expected_batches {
+                slot_state.expected_batches = Some(num_expected_batches);
+            }
+            for shred in shreds {
+                if slot_state.shred_payloads.len() == mcp_proposer::MCP_NUM_RELAYS {
+                    break;
+                }
+                slot_state
+                    .shred_payloads
+                    .push(mcp_proposer::payload_to_mcp_shred_data(
+                        shred.payload().as_ref(),
+                    ));
+            }
+            let is_slot_complete = slot_state
+                .expected_batches
+                .map(|num_expected_batches| slot_state.seen_batches >= num_expected_batches)
+                .unwrap_or(false);
+            if is_slot_complete {
+                state
+                    .remove(&slot)
+                    .map(|slot_state| slot_state.shred_payloads)
+            } else {
+                None
+            }
+        };
+        let Some(shred_payloads) = maybe_shred_payloads else {
+            return;
+        };
+        if shred_payloads.len() != mcp_proposer::MCP_NUM_RELAYS {
+            warn!(
+                "MCP proposer dispatch skipped for slot {}: expected {} shreds, collected {}",
+                slot,
+                mcp_proposer::MCP_NUM_RELAYS,
+                shred_payloads.len(),
+            );
+            return;
+        }
+
+        let mut relay_addrs: Vec<_> = cluster_info
+            .tvu_peers(|node| node.tvu(Protocol::QUIC).map(|addr| (*node.pubkey(), addr)))
+            .into_iter()
+            .flatten()
+            .collect();
+        relay_addrs.sort_unstable_by_key(|(pubkey, _)| *pubkey);
+        relay_addrs.dedup_by_key(|(pubkey, _)| *pubkey);
+        if relay_addrs.len() < mcp_proposer::MCP_NUM_RELAYS {
+            warn!(
+                "MCP proposer dispatch skipped for slot {}: only {} QUIC relay peers available",
+                slot,
+                relay_addrs.len(),
+            );
+            return;
+        }
+        relay_addrs.truncate(mcp_proposer::MCP_NUM_RELAYS);
+
+        // UNVERIFIED: proposer schedule index APIs are added in MCP schedule pass; until then use
+        // index 0 with our current identity key for proposer signature.
+        let proposer_index = 0u32;
+        let proposer_keypair = {
+            let keypair = cluster_info.keypair();
+            Arc::clone(&*keypair)
+        };
+        let messages = match mcp_proposer::build_shred_messages(
+            slot,
+            proposer_index,
+            &shred_payloads,
+            proposer_keypair.as_ref(),
+        ) {
+            Ok(messages) => messages,
+            Err(err) => {
+                warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
+                return;
+            }
+        };
+
+        for ((_, relay_addr), message) in relay_addrs.into_iter().zip(messages) {
+            if quic_endpoint_sender
+                .blocking_send((relay_addr, Bytes::copy_from_slice(&message)))
+                .is_err()
+            {
+                warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
+            }
+        }
+    }
 }
 
 impl BroadcastRun for StandardBroadcastRun {
@@ -596,11 +721,19 @@ impl BroadcastRun for StandardBroadcastRun {
         self.broadcast(
             sock,
             cluster_info,
-            shreds,
-            batch_info,
+            shreds.clone(),
+            batch_info.clone(),
             bank_forks,
             quic_endpoint_sender,
-        )
+        )?;
+        self.maybe_dispatch_mcp_shreds(
+            &shreds,
+            &batch_info,
+            cluster_info,
+            bank_forks,
+            quic_endpoint_sender,
+        );
+        Ok(())
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
         let (shreds, slot_start_ts) = receiver.recv()?;
