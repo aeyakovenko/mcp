@@ -46,18 +46,19 @@ pub const REQUIRED_RECONSTRUCTION: usize = ceil_threshold_count(
 /// We use the lower of the two spec expressions:
 /// - NUM_RELAYS * SHRED_DATA_BYTES
 /// - DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES
-pub const MAX_PROPOSER_PAYLOAD: usize =
-    if NUM_RELAYS * SHRED_DATA_BYTES < DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES {
-        NUM_RELAYS * SHRED_DATA_BYTES
-    } else {
-        DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES
-    };
+///
+/// For MCP v1 constants, `DATA_SHREDS_PER_FEC_BLOCK (40)` is always lower than
+/// `NUM_RELAYS (200)`, so the RS-capacity expression is the binding limit.
+pub const MAX_PROPOSER_PAYLOAD: usize = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES;
 
 /// Expected witness length for MCP Merkle proofs.
 pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
 /// ceil((numerator / denominator) * total), integer-only.
 pub const fn ceil_threshold_count(numerator: usize, denominator: usize, total: usize) -> usize {
+    if denominator == 0 {
+        return 0;
+    }
     // ceil(a / b) for integers is (a + b - 1) / b.
     let scaled = numerator * total;
     (scaled + denominator - 1) / denominator

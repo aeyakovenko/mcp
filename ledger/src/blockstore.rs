@@ -3243,6 +3243,7 @@ impl Blockstore {
     }
 
     pub fn put_mcp_execution_output(&self, slot: Slot, output: &[u8]) -> Result<()> {
+        let _lock = self.insert_shreds_lock.lock().unwrap();
         self.mcp_execution_output_cf.put_bytes(slot, output)
     }
 
@@ -6507,7 +6508,10 @@ pub mod tests {
         assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), None);
 
         blockstore.put_mcp_empty_execution_output(99).unwrap();
-        assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), Some(vec![]));
+        assert_eq!(
+            blockstore.get_mcp_execution_output(99).unwrap(),
+            Some(vec![])
+        );
 
         blockstore
             .put_mcp_execution_output(99, b"ordered-output")
