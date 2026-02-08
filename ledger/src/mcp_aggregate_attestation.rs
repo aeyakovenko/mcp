@@ -4,6 +4,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::{Signature, SIGNATURE_BYTES},
     solana_signer::Signer,
+    std::collections::{BTreeMap, BTreeSet},
 };
 
 pub const AGGREGATE_ATTESTATION_V1: u8 = 1;
@@ -223,6 +224,30 @@ impl AggregateAttestation {
             .collect()
     }
 
+    /// Returns a canonical aggregate where:
+    /// - relay/proposer signatures are verified and invalid entries are removed
+    /// - equivocating proposers (multiple commitments) are removed from all relays
+    pub fn canonical_filtered<FRelay, FProposer>(
+        &self,
+        relay_pubkey_for_index: FRelay,
+        proposer_pubkey_for_index: FProposer,
+    ) -> Result<Self, AggregateAttestationError>
+    where
+        FRelay: FnMut(u32) -> Option<Pubkey>,
+        FProposer: FnMut(u32) -> Option<Pubkey>,
+    {
+        let mut relay_entries =
+            self.filtered_valid_entries(relay_pubkey_for_index, proposer_pubkey_for_index);
+        let equivocating_proposers = collect_equivocating_proposers(&relay_entries);
+        for relay_entry in &mut relay_entries {
+            relay_entry
+                .entries
+                .retain(|entry| !equivocating_proposers.contains(&entry.proposer_index));
+        }
+
+        Self::new_canonical(self.slot, self.leader_index, relay_entries)
+    }
+
     fn validate_for_serialize(&self) -> Result<(), AggregateAttestationError> {
         if self.relay_entries.len() > u16::MAX as usize {
             return Err(AggregateAttestationError::TooManyRelayEntries(
@@ -313,6 +338,25 @@ fn ensure_proposer_entries_strictly_sorted(
         return Ok(());
     }
     Err(AggregateAttestationError::ProposerEntriesNotStrictlySorted)
+}
+
+fn collect_equivocating_proposers(relay_entries: &[AggregateRelayEntry]) -> BTreeSet<u32> {
+    let mut proposer_commitments = BTreeMap::new();
+    let mut equivocating_proposers = BTreeSet::new();
+
+    for relay_entry in relay_entries {
+        for entry in &relay_entry.entries {
+            if let Some(existing_commitment) = proposer_commitments.get(&entry.proposer_index) {
+                if existing_commitment != &entry.commitment {
+                    equivocating_proposers.insert(entry.proposer_index);
+                }
+            } else {
+                proposer_commitments.insert(entry.proposer_index, entry.commitment);
+            }
+        }
+    }
+
+    equivocating_proposers
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, AggregateAttestationError> {
@@ -525,5 +569,86 @@ mod tests {
         let a = AggregateAttestation::new_canonical(4, 0, vec![relay_entry_a]).unwrap();
         let b = AggregateAttestation::new_canonical(4, 0, vec![relay_entry_b]).unwrap();
         assert_eq!(a.to_wire_bytes().unwrap(), b.to_wire_bytes().unwrap());
+    }
+
+    #[test]
+    fn test_canonical_filtered_drops_equivocating_proposer_entries() {
+        let relay0 = Keypair::new();
+        let relay1 = Keypair::new();
+        let proposer0 = Keypair::new();
+        let proposer1 = Keypair::new();
+
+        let proposer0_commitment_a = Hash::new_unique();
+        let proposer0_commitment_b = Hash::new_unique();
+        let proposer1_commitment = Hash::new_unique();
+
+        let mut relay_entry0 = AggregateRelayEntry {
+            relay_index: 2,
+            entries: vec![
+                AggregateProposerEntry {
+                    proposer_index: 0,
+                    commitment: proposer0_commitment_a,
+                    proposer_signature: proposer0.sign_message(proposer0_commitment_a.as_ref()),
+                },
+                AggregateProposerEntry {
+                    proposer_index: 1,
+                    commitment: proposer1_commitment,
+                    proposer_signature: proposer1.sign_message(proposer1_commitment.as_ref()),
+                },
+            ],
+            relay_signature: Signature::default(),
+        };
+        relay_entry0.sign(AGGREGATE_ATTESTATION_V1, 42, &relay0);
+
+        let mut relay_entry1 = AggregateRelayEntry {
+            relay_index: 9,
+            entries: vec![
+                AggregateProposerEntry {
+                    proposer_index: 0,
+                    commitment: proposer0_commitment_b,
+                    proposer_signature: proposer0.sign_message(proposer0_commitment_b.as_ref()),
+                },
+                AggregateProposerEntry {
+                    proposer_index: 1,
+                    commitment: proposer1_commitment,
+                    proposer_signature: proposer1.sign_message(proposer1_commitment.as_ref()),
+                },
+            ],
+            relay_signature: Signature::default(),
+        };
+        relay_entry1.sign(AGGREGATE_ATTESTATION_V1, 42, &relay1);
+
+        let aggregate =
+            AggregateAttestation::new_canonical(42, 4, vec![relay_entry1, relay_entry0]).unwrap();
+        let filtered = aggregate
+            .canonical_filtered(
+                |relay_index| match relay_index {
+                    2 => Some(relay0.pubkey()),
+                    9 => Some(relay1.pubkey()),
+                    _ => None,
+                },
+                |proposer_index| match proposer_index {
+                    0 => Some(proposer0.pubkey()),
+                    1 => Some(proposer1.pubkey()),
+                    _ => None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(filtered.relay_entries.len(), 2);
+        assert_eq!(filtered.relay_entries[0].relay_index, 2);
+        assert_eq!(filtered.relay_entries[1].relay_index, 9);
+        assert_eq!(filtered.relay_entries[0].entries.len(), 1);
+        assert_eq!(filtered.relay_entries[1].entries.len(), 1);
+        assert_eq!(filtered.relay_entries[0].entries[0].proposer_index, 1);
+        assert_eq!(filtered.relay_entries[1].entries[0].proposer_index, 1);
+        assert_eq!(
+            filtered.relay_entries[0].entries[0].commitment,
+            proposer1_commitment
+        );
+        assert_eq!(
+            filtered.relay_entries[1].entries[0].commitment,
+            proposer1_commitment
+        );
     }
 }
