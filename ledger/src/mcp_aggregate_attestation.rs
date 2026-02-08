@@ -12,9 +12,16 @@ pub const AGGREGATE_ATTESTATION_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 2;
 const RELAY_ENTRY_HEADER_LEN: usize = 4 + 1;
 const PROPOSER_ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
-const MAX_AGGREGATE_WIRE_BYTES: usize = HEADER_LEN
+const MAX_QUIC_CONTROL_PAYLOAD_BYTES: usize = 512 * 1024;
+const MAX_AGGREGATE_PROTOCOL_BYTES: usize = HEADER_LEN
     + mcp::NUM_RELAYS
         * (RELAY_ENTRY_HEADER_LEN + mcp::NUM_PROPOSERS * PROPOSER_ENTRY_LEN + SIGNATURE_BYTES);
+const MAX_AGGREGATE_WIRE_BYTES: usize = if MAX_AGGREGATE_PROTOCOL_BYTES < MAX_QUIC_CONTROL_PAYLOAD_BYTES
+{
+    MAX_AGGREGATE_PROTOCOL_BYTES
+} else {
+    MAX_QUIC_CONTROL_PAYLOAD_BYTES
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateProposerEntry {
@@ -781,5 +788,10 @@ mod tests {
                 entries_len: mcp::NUM_PROPOSERS + 1,
             }
         );
+    }
+
+    #[test]
+    fn test_max_wire_fits_quic_control_payload_bound() {
+        assert!(MAX_AGGREGATE_WIRE_BYTES <= MAX_QUIC_CONTROL_PAYLOAD_BYTES);
     }
 }
