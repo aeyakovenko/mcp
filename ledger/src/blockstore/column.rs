@@ -190,6 +190,14 @@ pub mod columns {
     /// * index type: `(slot: u64, relay_index: u32)`
     /// * value type: [`Vec<u8>`]
     pub struct McpRelayAttestation;
+    /// The MCP execution output column.
+    ///
+    /// Stores ordered MCP execution output bytes for each slot. Empty output is
+    /// represented by an empty byte vector.
+    ///
+    /// * index type: `u64` (see [`SlotColumn`])
+    /// * value type: [`Vec<u8>`]
+    pub struct McpExecutionOutput;
 
     #[derive(Debug)]
     /// The transaction status column
@@ -856,6 +864,11 @@ impl Column for columns::McpRelayAttestation {
 }
 impl ColumnName for columns::McpRelayAttestation {
     const NAME: &'static str = "mcp_relay_attestation";
+}
+
+impl SlotColumn for columns::McpExecutionOutput {}
+impl ColumnName for columns::McpExecutionOutput {
+    const NAME: &'static str = "mcp_execution_output";
 }
 
 impl SlotColumn for columns::Index {}
