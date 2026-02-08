@@ -3,6 +3,7 @@ use {
         blockstore::Blockstore,
         leader_schedule::{FixedSchedule, LeaderSchedule},
         leader_schedule_utils,
+        mcp,
     },
     itertools::Itertools,
     log::*,
@@ -18,8 +19,8 @@ use {
 
 type CachedSchedules = (HashMap<Epoch, Arc<LeaderSchedule>>, VecDeque<u64>);
 const MAX_SCHEDULES: usize = 10;
-const MCP_PROPOSERS_PER_SLOT: usize = 16;
-const MCP_RELAYS_PER_SLOT: usize = 200;
+const MCP_PROPOSERS_PER_SLOT: usize = mcp::NUM_PROPOSERS;
+const MCP_RELAYS_PER_SLOT: usize = mcp::NUM_RELAYS;
 
 #[derive(Copy, Clone)]
 enum McpScheduleKind {
