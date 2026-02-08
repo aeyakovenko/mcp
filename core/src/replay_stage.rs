@@ -2825,7 +2825,6 @@ impl ReplayStage {
         migration_status: &MigrationStatus,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
-        assert!(!migration_status.is_alpenglow_enabled());
         if bank
             .feature_set
             .is_active(&agave_feature_set::mcp_protocol_v1::id())
@@ -2939,22 +2938,22 @@ impl ReplayStage {
             Ok(mut inputs) => {
                 let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
                 inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-                inputs.get(&slot).cloned()
+                inputs.remove(&slot)
             }
             Err(err) => {
                 warn!(
-                    "MCP vote gate lock poisoned while evaluating slot {}: {}; allowing vote",
+                    "MCP vote gate lock poisoned while evaluating slot {}: {}; rejecting vote",
                     slot, err
                 );
-                return true;
+                return false;
             }
         };
         let Some(input) = maybe_input else {
             info!(
-                "MCP vote gate input unavailable for slot {}; allowing vote",
+                "MCP vote gate input unavailable for slot {}; rejecting vote",
                 slot
             );
-            return true;
+            return false;
         };
 
         match mcp_vote_gate::evaluate_vote_gate(&input) {
@@ -5060,9 +5059,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_should_vote_mcp_slot_allows_missing_input() {
+    fn test_should_vote_mcp_slot_rejects_missing_input() {
         let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
-        assert!(ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
+        assert!(!ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
     }
 
     #[test]
@@ -5080,6 +5079,17 @@ pub(crate) mod tests {
         let mcp_vote_gate_inputs =
             RwLock::new(HashMap::from([(13, make_mcp_vote_gate_input(true))]));
         assert!(ReplayStage::should_vote_mcp_slot(13, &mcp_vote_gate_inputs));
+    }
+
+    #[test]
+    fn test_should_vote_mcp_slot_consumes_input_for_slot() {
+        let mcp_vote_gate_inputs =
+            RwLock::new(HashMap::from([(15, make_mcp_vote_gate_input(true))]));
+        assert!(ReplayStage::should_vote_mcp_slot(15, &mcp_vote_gate_inputs));
+        assert!(!ReplayStage::should_vote_mcp_slot(
+            15,
+            &mcp_vote_gate_inputs
+        ));
     }
 
     #[test]
