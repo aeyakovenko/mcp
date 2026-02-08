@@ -47,6 +47,7 @@ pub struct McpTransaction {
 pub enum McpTransactionParseError {
     UnexpectedEof,
     TrailingBytes,
+    InvalidVersion(u8),
     InvalidConfigValuesLen,
     InstructionLengthMismatch,
 }
@@ -78,7 +79,11 @@ impl McpTransaction {
     fn parse_inner(bytes: &[u8], has_version_prefix: bool) -> Result<Self, McpTransactionParseError> {
         let mut offset = 0usize;
         let version = if has_version_prefix {
-            take_u8(bytes, &mut offset)?
+            let version = take_u8(bytes, &mut offset)?;
+            if version != MCP_TX_LATEST_VERSION {
+                return Err(McpTransactionParseError::InvalidVersion(version));
+            }
+            version
         } else {
             MCP_TX_LATEST_VERSION
         };
@@ -105,9 +110,6 @@ impl McpTransaction {
         let mut config_values = Vec::with_capacity(config_len);
         for _ in 0..config_len {
             config_values.push(take_u32(bytes, &mut offset)?);
-        }
-        if config_values.len() != config_len {
-            return Err(McpTransactionParseError::InvalidConfigValuesLen);
         }
 
         let mut instruction_headers = Vec::with_capacity(num_instructions);
@@ -216,11 +218,14 @@ fn take_bytes<'a>(
     offset: &mut usize,
     len: usize,
 ) -> Result<&'a [u8], McpTransactionParseError> {
-    if bytes.len() < *offset + len {
+    let Some(end) = offset.checked_add(len) else {
+        return Err(McpTransactionParseError::UnexpectedEof);
+    };
+    if bytes.len() < end {
         return Err(McpTransactionParseError::UnexpectedEof);
     }
-    let out = &bytes[*offset..*offset + len];
-    *offset += len;
+    let out = &bytes[*offset..end];
+    *offset = end;
     Ok(out)
 }
 
@@ -250,7 +255,14 @@ fn take_array_64(bytes: &[u8], offset: &mut usize) -> Result<[u8; 64], McpTransa
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::Transaction,
+    };
 
     fn sample_transaction() -> McpTransaction {
         let transaction_config_mask = (1u32 << MCP_TX_CONFIG_BIT_INCLUSION_FEE)
@@ -353,5 +365,35 @@ mod tests {
 
         assert_eq!(parsed.legacy_header.num_required_signatures, 1);
         assert_eq!(parsed.to_bytes(), latest);
+    }
+
+    #[test]
+    fn test_unknown_version_rejected() {
+        let mut bytes = sample_transaction().to_bytes();
+        bytes[0] = MCP_TX_LATEST_VERSION + 1;
+        assert_eq!(
+            McpTransaction::from_bytes(&bytes),
+            Err(McpTransactionParseError::InvalidVersion(
+                MCP_TX_LATEST_VERSION + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn test_standard_solana_transaction_is_not_mcp() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let mut tx = Transaction::new_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                1,
+            )],
+            Some(&payer.pubkey()),
+        );
+        tx.sign(&[&payer], Hash::new_unique());
+        let serialized = bincode::serialize(&tx).unwrap();
+
+        assert!(McpTransaction::from_bytes_compat(&serialized).is_err());
     }
 }
