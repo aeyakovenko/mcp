@@ -9,7 +9,9 @@ use {
 pub const CONSENSUS_BLOCK_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
-const SIGNING_DOMAIN_V1: &[u8] = b"mcp:consensus_block:v1";
+const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
+    1 + 8 + 4 + 2 + (200 * (4 + 1 + (16 * (4 + HASH_BYTES + SIGNATURE_BYTES)) + SIGNATURE_BYTES));
+const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBlock {
@@ -30,6 +32,10 @@ pub enum ConsensusBlockError {
     AggregateLengthOverflow(usize),
     #[error("consensus_meta length exceeds u32::MAX: {0}")]
     ConsensusMetaLengthOverflow(usize),
+    #[error("aggregate attestation exceeds protocol maximum: {actual} > {max}")]
+    AggregateLengthTooLarge { actual: usize, max: usize },
+    #[error("consensus_meta exceeds protocol maximum: {actual} > {max}")]
+    ConsensusMetaTooLarge { actual: usize, max: usize },
     #[error("consensus block is truncated")]
     Truncated,
     #[error("consensus block has trailing bytes")]
@@ -49,10 +55,22 @@ impl ConsensusBlock {
                 aggregate_bytes.len(),
             ));
         }
+        if aggregate_bytes.len() > MAX_AGGREGATE_ATTESTATION_BYTES {
+            return Err(ConsensusBlockError::AggregateLengthTooLarge {
+                actual: aggregate_bytes.len(),
+                max: MAX_AGGREGATE_ATTESTATION_BYTES,
+            });
+        }
         if consensus_meta.len() > u32::MAX as usize {
             return Err(ConsensusBlockError::ConsensusMetaLengthOverflow(
                 consensus_meta.len(),
             ));
+        }
+        if consensus_meta.len() > MAX_CONSENSUS_META_BYTES {
+            return Err(ConsensusBlockError::ConsensusMetaTooLarge {
+                actual: consensus_meta.len(),
+                max: MAX_CONSENSUS_META_BYTES,
+            });
         }
 
         Ok(Self {
@@ -72,10 +90,22 @@ impl ConsensusBlock {
                 self.aggregate_bytes.len(),
             ));
         }
+        if self.aggregate_bytes.len() > MAX_AGGREGATE_ATTESTATION_BYTES {
+            return Err(ConsensusBlockError::AggregateLengthTooLarge {
+                actual: self.aggregate_bytes.len(),
+                max: MAX_AGGREGATE_ATTESTATION_BYTES,
+            });
+        }
         if self.consensus_meta.len() > u32::MAX as usize {
             return Err(ConsensusBlockError::ConsensusMetaLengthOverflow(
                 self.consensus_meta.len(),
             ));
+        }
+        if self.consensus_meta.len() > MAX_CONSENSUS_META_BYTES {
+            return Err(ConsensusBlockError::ConsensusMetaTooLarge {
+                actual: self.consensus_meta.len(),
+                max: MAX_CONSENSUS_META_BYTES,
+            });
         }
 
         let mut out = Vec::with_capacity(
@@ -93,11 +123,7 @@ impl ConsensusBlock {
     }
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
-        let body = self.wire_body_bytes()?;
-        let mut out = Vec::with_capacity(SIGNING_DOMAIN_V1.len() + body.len());
-        out.extend_from_slice(SIGNING_DOMAIN_V1);
-        out.extend_from_slice(&body);
-        Ok(out)
+        self.wire_body_bytes()
     }
 
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
@@ -120,8 +146,20 @@ impl ConsensusBlock {
         let slot = read_u64_le(bytes, &mut cursor)?;
         let leader_index = read_u32_le(bytes, &mut cursor)?;
         let aggregate_len = read_u32_le(bytes, &mut cursor)? as usize;
+        if aggregate_len > MAX_AGGREGATE_ATTESTATION_BYTES {
+            return Err(ConsensusBlockError::AggregateLengthTooLarge {
+                actual: aggregate_len,
+                max: MAX_AGGREGATE_ATTESTATION_BYTES,
+            });
+        }
         let aggregate_bytes = read_vec(bytes, &mut cursor, aggregate_len)?;
         let consensus_meta_len = read_u32_le(bytes, &mut cursor)? as usize;
+        if consensus_meta_len > MAX_CONSENSUS_META_BYTES {
+            return Err(ConsensusBlockError::ConsensusMetaTooLarge {
+                actual: consensus_meta_len,
+                max: MAX_CONSENSUS_META_BYTES,
+            });
+        }
         let consensus_meta = read_vec(bytes, &mut cursor, consensus_meta_len)?;
         let delayed_bankhash = Hash::new_from_array(read_array::<HASH_BYTES>(bytes, &mut cursor)?);
         let leader_signature = Signature::from(read_array::<SIGNATURE_BYTES>(bytes, &mut cursor)?);
@@ -288,6 +326,45 @@ mod tests {
         assert_eq!(
             ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
             ConsensusBlockError::Truncated
+        );
+    }
+
+    #[test]
+    fn test_oversized_aggregate_len_rejected() {
+        let mut bytes = Vec::new();
+        bytes.push(CONSENSUS_BLOCK_V1);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&((MAX_AGGREGATE_ATTESTATION_BYTES as u32) + 1).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(Hash::new_unique().as_ref());
+        bytes.extend_from_slice(Signature::default().as_ref());
+
+        assert_eq!(
+            ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
+            ConsensusBlockError::AggregateLengthTooLarge {
+                actual: MAX_AGGREGATE_ATTESTATION_BYTES + 1,
+                max: MAX_AGGREGATE_ATTESTATION_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn test_oversized_consensus_meta_rejected() {
+        let err = ConsensusBlock::new_unsigned(
+            3,
+            4,
+            vec![],
+            vec![0u8; MAX_CONSENSUS_META_BYTES + 1],
+            Hash::new_unique(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ConsensusBlockError::ConsensusMetaTooLarge {
+                actual: MAX_CONSENSUS_META_BYTES + 1,
+                max: MAX_CONSENSUS_META_BYTES,
+            }
         );
     }
 }
