@@ -35,6 +35,19 @@ pub struct AggregateAttestation {
     pub relay_entries: Vec<AggregateRelayEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilteredRelayEntry {
+    pub relay_index: u32,
+    pub entries: Vec<AggregateProposerEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilteredAggregateAttestation {
+    pub slot: Slot,
+    pub leader_index: u32,
+    pub relay_entries: Vec<FilteredRelayEntry>,
+}
+
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum AggregateAttestationError {
     #[error("unknown aggregate attestation version: {0}")]
@@ -118,7 +131,7 @@ impl AggregateAttestation {
                 relay_entry.relay_index,
                 &relay_entry.entries,
                 &relay_entry.relay_signature,
-            );
+            )?;
         }
 
         Ok(out)
@@ -197,7 +210,7 @@ impl AggregateAttestation {
         &self,
         mut relay_pubkey_for_index: FRelay,
         mut proposer_pubkey_for_index: FProposer,
-    ) -> Vec<AggregateRelayEntry>
+    ) -> Vec<FilteredRelayEntry>
     where
         FRelay: FnMut(u32) -> Option<Pubkey>,
         FProposer: FnMut(u32) -> Option<Pubkey>,
@@ -209,18 +222,24 @@ impl AggregateAttestation {
                 if !relay_entry.verify_relay_signature(self.version, self.slot, &relay_pubkey) {
                     return None;
                 }
-                let all_proposers_valid = relay_entry.entries.iter().all(|entry| {
-                    proposer_pubkey_for_index(entry.proposer_index).is_some_and(|proposer_pubkey| {
-                        entry
-                            .proposer_signature
-                            .verify(proposer_pubkey.as_ref(), entry.commitment.as_ref())
+                let entries = relay_entry
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        proposer_pubkey_for_index(entry.proposer_index).is_some_and(
+                            |proposer_pubkey| {
+                                entry
+                                    .proposer_signature
+                                    .verify(proposer_pubkey.as_ref(), entry.commitment.as_ref())
+                            },
+                        )
                     })
-                });
-                if !all_proposers_valid || relay_entry.entries.is_empty() {
-                    return None;
-                }
-
-                Some(relay_entry.clone())
+                    .cloned()
+                    .collect();
+                Some(FilteredRelayEntry {
+                    relay_index: relay_entry.relay_index,
+                    entries,
+                })
             })
             .collect()
     }
@@ -232,7 +251,7 @@ impl AggregateAttestation {
         &self,
         relay_pubkey_for_index: FRelay,
         proposer_pubkey_for_index: FProposer,
-    ) -> Result<Self, AggregateAttestationError>
+    ) -> Result<FilteredAggregateAttestation, AggregateAttestationError>
     where
         FRelay: FnMut(u32) -> Option<Pubkey>,
         FProposer: FnMut(u32) -> Option<Pubkey>,
@@ -240,14 +259,17 @@ impl AggregateAttestation {
         let mut relay_entries =
             self.filtered_valid_entries(relay_pubkey_for_index, proposer_pubkey_for_index);
         let equivocating_proposers = collect_equivocating_proposers(&relay_entries);
-        relay_entries.retain(|relay_entry| {
+        for relay_entry in &mut relay_entries {
             relay_entry
                 .entries
-                .iter()
-                .all(|entry| !equivocating_proposers.contains(&entry.proposer_index))
-        });
+                .retain(|entry| !equivocating_proposers.contains(&entry.proposer_index));
+        }
 
-        Self::new_canonical(self.slot, self.leader_index, relay_entries)
+        Ok(FilteredAggregateAttestation {
+            slot: self.slot,
+            leader_index: self.leader_index,
+            relay_entries,
+        })
     }
 
     fn validate_for_serialize(&self) -> Result<(), AggregateAttestationError> {
@@ -323,15 +345,27 @@ fn append_relay_entry_bytes(
     relay_index: u32,
     entries: &[AggregateProposerEntry],
     relay_signature: &Signature,
-) {
+) -> Result<(), AggregateAttestationError> {
+    if entries.len() > mcp::NUM_PROPOSERS {
+        return Err(AggregateAttestationError::TooManyProposerEntries {
+            relay_index,
+            entries_len: entries.len(),
+        });
+    }
     out.extend_from_slice(&relay_index.to_le_bytes());
-    out.push(entries.len() as u8);
+    out.push(
+        entries
+            .len()
+            .try_into()
+            .expect("entries length is bounded by NUM_PROPOSERS"),
+    );
     for entry in entries {
         out.extend_from_slice(&entry.proposer_index.to_le_bytes());
         out.extend_from_slice(entry.commitment.as_ref());
         out.extend_from_slice(entry.proposer_signature.as_ref());
     }
     out.extend_from_slice(relay_signature.as_ref());
+    Ok(())
 }
 
 fn ensure_relay_entries_strictly_sorted(
@@ -358,7 +392,7 @@ fn ensure_proposer_entries_strictly_sorted(
     Err(AggregateAttestationError::ProposerEntriesNotStrictlySorted)
 }
 
-fn collect_equivocating_proposers(relay_entries: &[AggregateRelayEntry]) -> BTreeSet<u32> {
+fn collect_equivocating_proposers(relay_entries: &[FilteredRelayEntry]) -> BTreeSet<u32> {
     let mut proposer_commitments = BTreeMap::new();
     let mut equivocating_proposers = BTreeSet::new();
 
@@ -482,9 +516,11 @@ mod tests {
             },
         );
 
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].relay_index, 4);
         assert_eq!(filtered[0].entries.len(), 2);
+        assert_eq!(filtered[1].relay_index, 9);
+        assert_eq!(filtered[1].entries.len(), 0);
     }
 
     #[test]
@@ -596,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_filtered_drops_relays_with_equivocating_proposer_entries() {
+    fn test_canonical_filtered_drops_only_equivocating_proposer_entries() {
         let relay0 = Keypair::new();
         let relay1 = Keypair::new();
         let proposer0 = Keypair::new();
@@ -663,7 +699,15 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(filtered.relay_entries.len(), 0);
+        assert_eq!(filtered.relay_entries.len(), 2);
+        assert_eq!(filtered.relay_entries[0].relay_index, 2);
+        assert_eq!(filtered.relay_entries[0].entries.len(), 1);
+        assert_eq!(filtered.relay_entries[0].entries[0].proposer_index, 1);
+        assert_eq!(filtered.relay_entries[0].entries[0].commitment, proposer1_commitment);
+        assert_eq!(filtered.relay_entries[1].relay_index, 9);
+        assert_eq!(filtered.relay_entries[1].entries.len(), 1);
+        assert_eq!(filtered.relay_entries[1].entries[0].proposer_index, 1);
+        assert_eq!(filtered.relay_entries[1].entries[0].commitment, proposer1_commitment);
     }
 
     #[test]
