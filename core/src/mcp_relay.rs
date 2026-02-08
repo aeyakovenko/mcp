@@ -1,4 +1,5 @@
 use {
+    solana_ledger::mcp,
     solana_clock::Slot,
     solana_pubkey::Pubkey,
     solana_sha256_hasher::hashv,
@@ -7,9 +8,10 @@ use {
     thiserror::Error,
 };
 
-pub const MCP_NUM_RELAYS: usize = 200;
-pub const MCP_SHRED_DATA_BYTES: usize = 863;
-pub const MCP_WITNESS_LEN: usize = mcp_witness_len(MCP_NUM_RELAYS);
+pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
+pub const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
+pub const MCP_WITNESS_LEN: usize = mcp::MCP_WITNESS_LEN;
+pub const MCP_NUM_PROPOSERS: usize = mcp::NUM_PROPOSERS;
 pub const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
     + std::mem::size_of::<u32>() // proposer_index
     + std::mem::size_of::<u32>() // shred_index
@@ -21,16 +23,8 @@ pub const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
 
 const LEAF_DOMAIN: [u8; 1] = [0x00];
 const NODE_DOMAIN: [u8; 1] = [0x01];
-
-const fn mcp_witness_len(num_relays: usize) -> usize {
-    let mut width = 1usize;
-    let mut depth = 0usize;
-    while width < num_relays {
-        width <<= 1;
-        depth += 1;
-    }
-    depth
-}
+const MCP_RELAY_CACHE_MAX_ENTRIES: usize = MCP_NUM_RELAYS * MCP_NUM_PROPOSERS * 8;
+const MCP_RELAY_CACHE_SLOT_WINDOW: Slot = 64;
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum McpRelayError {
@@ -43,6 +37,7 @@ pub enum McpRelayError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpDropReason {
     DecodeError,
+    ProposerIndexOutOfRange,
     WrongRelayIndex,
     InvalidProposerSignature,
     InvalidWitness,
@@ -204,6 +199,7 @@ impl McpShredMessage {
 #[derive(Default)]
 pub struct McpRelayProcessor {
     shreds: HashMap<(Slot, u32, u32), Vec<u8>>,
+    highest_slot_seen: Slot,
 }
 
 impl McpRelayProcessor {
@@ -225,6 +221,14 @@ impl McpRelayProcessor {
             Ok(message) => message,
             Err(_) => return McpRelayOutcome::Dropped(McpDropReason::DecodeError),
         };
+        if message.proposer_index as usize >= MCP_NUM_PROPOSERS {
+            return McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange);
+        }
+        self.highest_slot_seen = self.highest_slot_seen.max(message.slot);
+        let min_slot = self
+            .highest_slot_seen
+            .saturating_sub(MCP_RELAY_CACHE_SLOT_WINDOW);
+        self.shreds.retain(|(slot, _, _), _| *slot >= min_slot);
 
         if message.shred_index != relay_index {
             return McpRelayOutcome::Dropped(McpDropReason::WrongRelayIndex);
@@ -242,6 +246,12 @@ impl McpRelayProcessor {
                 return McpRelayOutcome::Duplicate;
             }
             return McpRelayOutcome::Dropped(McpDropReason::ConflictingShred);
+        }
+        if self.shreds.len() >= MCP_RELAY_CACHE_MAX_ENTRIES {
+            if let Some(oldest_key) = self.shreds.keys().min_by_key(|(slot, _, _)| *slot).copied()
+            {
+                self.shreds.remove(&oldest_key);
+            }
         }
 
         let payload = payload.to_vec();
@@ -550,5 +560,69 @@ mod tests {
 
         relay.prune_below_slot(21);
         assert_eq!(relay.stored_count(), 1);
+    }
+
+    #[test]
+    fn test_from_bytes_rejects_wrong_size() {
+        let too_short = vec![0u8; MCP_SHRED_MESSAGE_SIZE - 1];
+        let err = McpShredMessage::from_bytes(&too_short).unwrap_err();
+        assert_eq!(
+            err,
+            McpRelayError::InvalidMessageSize {
+                expected: MCP_SHRED_MESSAGE_SIZE,
+                actual: MCP_SHRED_MESSAGE_SIZE - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn test_boundary_relay_indices_are_accepted() {
+        let proposer = Keypair::new();
+        let proposer_index = 2;
+        let slot = 31;
+        let shreds = make_shreds();
+        let (commitment, witnesses) = derive_commitment_and_witnesses(slot, proposer_index, &shreds);
+        let mut relay = McpRelayProcessor::default();
+
+        for relay_index in [0u32, (MCP_NUM_RELAYS - 1) as u32] {
+            let payload = build_message(
+                slot,
+                proposer_index,
+                relay_index,
+                commitment,
+                shreds[relay_index as usize],
+                witnesses[relay_index as usize],
+                &proposer,
+            );
+            let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+            assert!(matches!(outcome, McpRelayOutcome::StoredAndBroadcast { .. }));
+        }
+        assert_eq!(relay.stored_count(), 2);
+    }
+
+    #[test]
+    fn test_out_of_range_proposer_index_is_dropped() {
+        let proposer = Keypair::new();
+        let relay_index = 0u32;
+        let proposer_index = MCP_NUM_PROPOSERS as u32;
+        let slot = 33;
+        let shreds = make_shreds();
+        let (commitment, witnesses) = derive_commitment_and_witnesses(slot, proposer_index, &shreds);
+        let payload = build_message(
+            slot,
+            proposer_index,
+            relay_index,
+            commitment,
+            shreds[relay_index as usize],
+            witnesses[relay_index as usize],
+            &proposer,
+        );
+
+        let mut relay = McpRelayProcessor::default();
+        let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        assert_eq!(
+            outcome,
+            McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange)
+        );
     }
 }

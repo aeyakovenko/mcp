@@ -312,6 +312,7 @@ pub struct Blockstore {
     highest_primary_index_slot: RwLock<Option<Slot>>,
     max_root: AtomicU64,
     insert_shreds_lock: Mutex<()>,
+    insert_mcp_lock: Mutex<()>,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
     update_parent_signals: Mutex<Vec<UpdateParentSender>>,
@@ -543,6 +544,7 @@ impl Blockstore {
             completed_slots_senders: Mutex::default(),
             update_parent_signals: Mutex::default(),
             insert_shreds_lock: Mutex::<()>::default(),
+            insert_mcp_lock: Mutex::<()>::default(),
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
             slots_stats: SlotsStats::default(),
@@ -3441,7 +3443,7 @@ impl Blockstore {
         C: Column + ColumnName,
         C::Index: Clone,
     {
-        let _lock = self.insert_shreds_lock.lock().unwrap();
+        let _lock = self.insert_mcp_lock.lock().unwrap();
         if let Some(existing) = column.get_bytes(index.clone())? {
             if existing.as_slice() == value {
                 return Ok(McpPutStatus::Duplicate);
