@@ -1,670 +1,473 @@
-# MCP Implementation Plan
+# MCP Implementation Plan (Agave, Minimal-Diff v2)
 
 Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
-## Constraints
+## Constraints (must hold)
 
-- Reuse existing TPU/TVU pipelines, sigverify, window_service, blockstore, replay_stage, and execution paths.
-- No new stages. Only add small, targeted modules where no equivalent exists.
-- All MCP paths gated by `feature_set::mcp_protocol_v1::id()`. Concrete gate locations:
-  - `sigverify_shreds.rs`: check before MCP partition at line 162
-  - `window_service.rs`: check in handle_shred closure before MCP branch
-  - `tvu.rs`: conditionally spawn MCP QUIC threads
-  - `tpu.rs`: conditionally create MCP proposer channel and thread
-  - `forwarding_stage.rs`: check before routing to proposers
-  - `replay_stage.rs`: check before MCP attestation/consensus processing
-  - `qos_service.rs`: check before dividing CU limits
-- Do NOT modify `ShredVariant`, `ShredCommonHeader`, or existing shred pipeline types.
-- MCP shreds use their own wire format and dedicated column families, separate from Agave shreds.
+- Reuse existing TPU/TVU pipelines, sigverify, `window_service`, blockstore, replay stage, and execution paths.
+- No new stage types. Only add small targeted modules where no equivalent exists.
+- All MCP behavior is gated by `feature_set::mcp_protocol_v1::id()`.
+- Do **not** modify `ShredVariant`, `ShredCommonHeader`, or existing Agave shred pipeline types.
+- MCP shreds use a separate wire format and dedicated column families.
+- Invalid MCP messages are dropped and MUST NOT advance protocol state.
 
-## Agave Reuse Map
+## Release Blockers (`UNVERIFIED` until resolved)
 
-| MCP concept | Agave component | Reusable? | Key location |
-|---|---|---|---|
-| Schedule generation algo | `stake_weighted_slot_leaders()` | YES | `leader_schedule.rs:72` — same ChaChaRng/WeightedIndex pattern, different seed |
-| Schedule cache pattern | `LeaderScheduleCache` | YES | `leader_schedule_cache.rs:30` — add parallel caches for proposer/relay |
-| Column trait | `Column` trait | YES | `column.rs:308` — 3-tuple index supported (`AlternateShredData` at `column.rs:174`) |
-| Blockstore struct pattern | `Blockstore` | YES | `blockstore.rs:252` — add `LedgerColumn` fields; register in `cf_descriptors()` at `blockstore_db.rs:171` |
-| Window service `run_insert()` | `run_insert()` | YES | `window_service.rs:190` — partition MCP before Agave deserialization at line 220 |
-| Replay main loop | `ReplayStage` | YES | `replay_stage.rs:823` — add `mcp_attestation_receiver` + `mcp_consensus_block_receiver` to `ReplayReceivers` at line 330 |
-| confirm_slot pipeline | `confirm_slot()` | PARTIAL | `blockstore_processor.rs:1485` — reuse `process_entries()` for Phase B with fee bypass |
-| validate_fee_payer | `validate_fee_payer()` | PARTIAL | `account_loader.rs:370` — receives pre-calculated `fee: u64`; bypass by zeroing fee at calculation layer |
-| Voting path | `Tower::record_vote()` | YES | `consensus.rs:717` — unchanged |
-| Gossip sockets | `SOCKET_TAG_*` constants | YES | `contact_info.rs:34-47` — 14 tags (0-13), cache size 14 |
-| CRDS data | `CrdsData` enum | YES | `crds_data.rs:44-65` — 14 variants, last: `RestartHeaviestFork` at line 64 |
-| TVU sockets | `TvuSockets` | YES | `tvu.rs:110-116` — fetch, repair, retransmit, ancestor_hashes, alpenglow_quic |
-| TPU pipeline | `Tpu` | YES | `tpu.rs:71-82` — TpuSockets struct, FetchStage -> SigVerify -> BankingStage -> Broadcast |
-| Forwarding stage | `ForwardingStage` | YES | `forwarding_stage.rs:106` — `next_leaders()` address resolution; change to proposer addresses |
-| Compute budget extraction | `process_compute_budget_instructions()` | YES | `compute-budget-instruction/src/instructions_processor.rs:13` — extracts `compute_unit_price` |
-| Sigverify split pattern | `TransactionSigVerifier::send_packets()` | YES | `ed25519_sigverifier.rs:56-74` — already clones to banking + forwarding; add MCP proposer sink |
+- `B1` Transaction payload format:
+  - Spec §3.1/§7.1 requires MCP payload tx bytes to use the §7.1 Transaction format.
+  - If Agave keeps legacy Solana tx bytes, this is spec-non-compliant and must be explicitly amended.
+- `B2` `ordering_fee` direction:
+  - Spec §3.6 says “order by ordering_fee” but does not define ascending/descending.
+- `B3` `block_id` encoding in `consensus_meta`:
+  - Spec §3.4/§7.5 defers to underlying consensus/ledger rules.
+  - No local placeholder hash is allowed in production.
+- `B4` `delayed_bankhash` delayed-slot rule:
+  - Spec §3.5 says delayed slot is defined by consensus protocol.
+  - No implicit fallback (for example `Hash::default()`) unless consensus defines it.
 
-**NOT reusable (MCP must implement its own):**
+---
 
-| Agave component | Location | Why not reusable |
+## Reuse Map (Agave)
+
+| MCP area | Reuse target | Integration point |
 |---|---|---|
-| `MerkleTree` | `merkle_tree.rs:37` | `pub(crate)`; Agave uses 28-byte domain-separated prefixes (`\x00SOLANA_MERKLE_SHREDS_LEAF`), MCP spec section 6 uses 1-byte `0x00`/`0x01` prefixes; Agave `MerkleProofEntry` is 20 bytes, MCP needs 32-byte witness entries; `join_nodes()` at line 100 truncates to 20 bytes |
-| `get_merkle_root()` | `merkle_tree.rs:108` | Uses 20-byte `MerkleProofEntry`, incompatible with MCP 32-byte entries |
-| `MERKLE_HASH_PREFIX_*` | `merkle_tree.rs:17-18` | Agave: `b"\x00SOLANA_MERKLE_SHREDS_LEAF"` (28 bytes); MCP: `0x00` (1 byte) |
-| `ReedSolomonCache::get()` | `shredder.rs:276` | `pub(crate)` methods but struct is `pub`; MCP modules in `ledger/` CAN reuse it — use `ReedSolomonCache::get(40, 160)` instead of raw `ReedSolomon::new()` |
+| Schedules | Existing leader-schedule algorithm and cache pattern | `ledger/src/leader_schedule.rs`, `ledger/src/leader_schedule_cache.rs`, `ledger/src/leader_schedule_utils.rs` |
+| Shred ingestion | Existing sigverify + window_service flow | `turbine/src/sigverify_shreds.rs`, `core/src/window_service.rs` |
+| Storage | Existing blockstore column registration + purge plumbing | `ledger/src/blockstore/column.rs`, `ledger/src/blockstore_db.rs`, `ledger/src/blockstore.rs`, `ledger/src/blockstore/blockstore_purge.rs` |
+| Replay integration | Existing replay main loop and receivers | `core/src/replay_stage.rs` |
+| Transaction forwarding | Existing forwarding stage and clients | `core/src/forwarding_stage.rs`, `core/src/next_leader.rs` |
+| QUIC patterns | Existing `quinn` endpoint patterns (not streamer packet path) | `turbine/src/quic_endpoint.rs`, `core/src/repair/quic_endpoint.rs` |
+| Fee deduction primitives | Existing fee-payer and withdrawal behavior | `svm/src/account_loader.rs`, `runtime/src/bank.rs` |
+
+Non-reusable for MCP wire correctness:
+- Agave shred Merkle implementation uses different domain separation and proof entry width than MCP (`ledger/src/shred/merkle_tree.rs`).
 
 ---
 
 ## Pass 1 — Feature Gate + Constants + Wire Types
 
-**Goal:** MCP types compile and serialize. No behavioral change.
+**Goal:** MCP types compile, serialize, and validate strictly. No behavior changes.
 
 ### 1.1 Feature gate
 
-`feature-set/src/lib.rs` — model after existing feature declarations.
+- `feature-set/src/lib.rs`:
+  - Add `pub mod mcp_protocol_v1 { declare_id!("..."); }`.
+  - Register in `FEATURE_NAMES`.
 
-- Declare `pub mod mcp_protocol_v1 { declare_id!("..."); }`.
-- Register in `FEATURE_NAMES` map.
+### 1.2 MCP constants and wire types
 
-### 1.2 Constants and wire types
+- Add `ledger/src/mcp.rs`:
+  - Constants:
+    - `NUM_PROPOSERS = 16`
+    - `NUM_RELAYS = 200`
+    - `DATA_SHREDS_PER_FEC_BLOCK = 40`
+    - `CODING_SHREDS_PER_FEC_BLOCK = 160`
+    - `SHRED_DATA_BYTES = 863`
+    - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
+    - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
+    - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520`
+  - Types:
+    - `McpPayload`
+    - `RelayAttestation`
+    - `AggregateAttestation`
+    - `ConsensusBlock`
+  - Common parser invariants:
+    - reject unknown version
+    - reject out-of-range indices
+    - enforce sortedness/uniqueness per spec for attestation entries
 
-Create `ledger/src/mcp.rs`. Spec section 4, section 3.1, section 7.3-7.5, section 8.
+### 1.3 MCP Merkle
 
-Constants:
-```
-NUM_PROPOSERS = 16        NUM_RELAYS = 200
-DATA_SHREDS   = 40        CODING_SHREDS = 160
-SHRED_DATA_BYTES = 863    // derived: PACKET_DATA_SIZE(1232) - shred_overhead(369) = 863
-                          // shred_overhead = slot(8) + proposer_index(4) + shred_index(4)
-                          //   + commitment(32) + witness_len(1) + witness(32*8) + proposer_sig(64)
-                          //   = 369 bytes (witness_len=8 for ceil(log2(200)) proof entries)
-ATTESTATION_THRESHOLD  = 0.60  -> ceil = 120 relays
-INCLUSION_THRESHOLD    = 0.40  -> ceil =  80 relays
-RECONSTRUCTION_THRESHOLD = 0.20 -> ceil = 40 relays (= DATA_SHREDS)
-MAX_PROPOSER_PAYLOAD = DATA_SHREDS * SHRED_DATA_BYTES  // 40 * 863 = 34,520 bytes per proposer
-                                                        // only data shreds carry payload; coding shreds are parity
-MCP_DELAY_SLOTS = 32      // consensus parameter for delayed_bankhash verification
-                          // matches typical optimistic confirmation latency (~12.8 seconds)
-// NOTE: Spec section 3.2 states "MUST NOT exceed NUM_RELAYS * SHRED_DATA_BYTES" (172,600).
-// That bound is a loose upper bound; with RS(40,160), only 40 data shreds carry payload.
-// The actual capacity is 34,520. The spec bound is always satisfied. Spec clarification filed.
-```
-
-**SPEC AMENDMENT REQUIREMENT — Transaction Wire Format:**
-Spec section 3.1 requires "each transaction bytes value is a Transaction message as defined in Section 7.1." Section 7.1 defines a NEW format: VersionByte + LegacyHeader + TransactionConfigMask(u32) + LifetimeSpecifier([u8;32]) + ... with explicit ordering_fee/inclusion_fee/target_proposer fields in ConfigValues. This is NOT the standard Solana wire format. Implementing section 7.1 requires:
-- New SDK transaction builder APIs
-- Client wallet changes to produce section 7.1 format
-- Backward-incompatible wire format change
-
-**This plan uses standard Solana transactions pending a formal spec amendment.** The spec must be amended to either: (a) allow standard Solana transactions for MCP v1 bootstrapping with section 7.1 deferred to MCP v2, or (b) define a version negotiation mechanism. Until the amendment is approved, this implementation is spec-non-compliant on transaction format.
-
-Types (all with serialize/deserialize/sign/verify):
-- `McpPayload` — `tx_count:u32 + [tx_len:u32, tx_bytes]...` (section 3.1). **PENDING SPEC AMENDMENT:** Each `tx_bytes` is a standard Solana wire-format transaction. See SPEC AMENDMENT REQUIREMENT above. ordering_fee is derived from compute_unit_price. Trailing zero padding ignored.
-- `RelayAttestation` — version:1 + slot:8 + relay_index:4 + entries_len:1 + entries[proposer_index:4 + commitment:32 + proposer_sig:64] + relay_sig:64 (section 7.3). **Parse-time validation:** entries MUST be sorted by proposer_index ascending with no duplicates (spec §7.3). Reject on deserialization if unsorted or contains duplicate proposer_index values.
-- `AggregateAttestation` — version:1 + slot:8 + leader_index:4 + relays_len:2 + relay_entries sorted by relay_index (section 7.4). **Parse-time validation:** relay entries MUST be sorted by relay_index ascending; entries within each relay entry MUST be sorted by proposer_index ascending with no duplicates (spec §7.4). Reject on deserialization if unsorted or contains duplicates.
-- `ConsensusBlock` — version:1 + slot:8 + leader_index:4 + aggregate_len:4 + aggregate + consensus_meta_len:4 + consensus_meta + delayed_bankhash:32 + leader_sig:64 (section 7.5).
-- `reconstruct_batch()` — RS decode via `ReedSolomonCache::get(40, 160)` from `ledger/src/shredder.rs:276`, re-encode, verify commitment matches (section 3.6).
-- `order_transactions()` — concat by proposer_index ascending, sort by ordering_fee desc, ties broken by position in concatenated list (section 3.6). Ordering_fee is derived from the transaction's `compute_unit_price` (see section 5.3).
-
-### 1.3 MCP Merkle tree
-
-Create `ledger/src/mcp_merkle.rs`. Spec section 6.
-
-MCP uses a different Merkle construction than Agave's shred Merkle tree and CANNOT reuse it:
-- Agave uses 28-byte domain-separated prefixes (`b"\x00SOLANA_MERKLE_SHREDS_LEAF"`) and 20-byte proof entries (`MerkleProofEntry = [u8; 20]`), with `join_nodes()` truncating to 20 bytes before hashing.
-- MCP spec section 6 defines: leaf = `SHA-256(0x00 || slot || proposer_index || shred_index || shred_data)`, internal = `SHA-256(0x01 || left || right)`, with 32-byte witness entries.
-
-Implement:
-```
-pub const MCP_MERKLE_LEAF_PREFIX: u8 = 0x00;
-pub const MCP_MERKLE_NODE_PREFIX: u8 = 0x01;
-pub type McpMerkleProofEntry = [u8; 32];
-
-pub fn mcp_leaf_hash(slot: u64, proposer_index: u32, shred_index: u32, shred_data: &[u8]) -> Hash
-pub fn mcp_node_hash(left: &[u8; 32], right: &[u8; 32]) -> Hash
-pub fn mcp_merkle_tree(leaves: &[Hash]) -> Vec<Hash>   // returns flat array, root is last element
-// When a level has an odd number of nodes, the last node is paired with itself (spec section 6).
-pub fn mcp_merkle_proof(tree: &[Hash], num_leaves: usize, leaf_index: usize) -> Vec<McpMerkleProofEntry>
-pub fn mcp_verify_proof(leaf: Hash, index: usize, proof: &[McpMerkleProofEntry], expected_root: &Hash) -> bool
-```
+- Add `ledger/src/mcp_merkle.rs`:
+  - leaf hash: `SHA-256(0x00 || slot || proposer_index || shred_index || shred_data)`
+  - node hash: `SHA-256(0x01 || left || right)`
+  - witness entries are 32 bytes
+  - odd-node rule pairs with self
 
 ### 1.4 MCP shred wire format
 
-Create `ledger/src/shred/mcp_shred.rs`. Spec section 7.2.
+- Add `ledger/src/shred/mcp_shred.rs`:
+  - Format: `slot:u64 + proposer_index:u32 + shred_index:u32 + commitment:[u8;32] + shred_data + witness_len:u8 + witness + proposer_sig:[u8;64]`
+  - `is_mcp_shred_packet(packet)` classifier
+  - strict parse + verify helpers
+  - enforce `witness_len == ceil(log2(NUM_RELAYS))`
 
-MCP shred format (separate from ShredVariant — do NOT touch `shred.rs:227`):
-```
-slot:8 + proposer_index:4 + shred_index:4 + commitment:32
-+ shred_data:SHRED_DATA_BYTES + witness_len:1 + witness:32*witness_len
-+ proposer_sig:64
-```
+### 1.5 Reed-Solomon helper visibility
 
-Total shred size with witness_len=8: 369 + 863 = 1,232 bytes = PACKET_DATA_SIZE. Fits exactly in one UDP packet.
+- Keep RS internals in `ledger` crate.
+- Add ledger-level MCP helpers for encode/decode/reconstruct so `core` code does not call `pub(crate)` RS APIs directly.
 
-Functions:
-- `is_mcp_shred_packet(packet) -> bool` — detect MCP shred by size/header pattern, distinguishing from Agave shreds which start with 64-byte signature then variant byte at offset 64.
-- `McpShred::from_bytes(data) -> Result<McpShred>` — parse and validate field ranges. MUST enforce `witness_len == ceil(log2(NUM_RELAYS))` (= 8 for NUM_RELAYS=200) at parse time per spec §7.2. Reject shreds with any other witness_len.
-- `McpShred::to_bytes(&self) -> Vec<u8>` — serialize.
-- `McpShred::verify_signature(&self, proposer_pubkey) -> bool` — verify proposer_sig over commitment.
-- `McpShred::verify_witness(&self) -> bool` — compute leaf hash via `mcp_leaf_hash()` from `mcp_merkle.rs`, walk witness via `mcp_verify_proof()`, compare with commitment. Uses MCP-specific 32-byte proof entries and 1-byte prefixes (NOT Agave's `MERKLE_HASH_PREFIX_*`).
+### 1.6 Tests
 
-All wire types MUST reject messages with unknown `version` values (spec section 7). Parsers check version == 1 at deserialization time.
-
-### 1.5 Tests
-
-- Round-trip serialization of every wire type.
-- MCP Merkle tree: leaf hash matches spec section 6 construction.
-- MCP Merkle tree: proof generation and verification round-trip for various tree sizes.
-- MCP Merkle tree: wrong leaf/index fails verification.
-- `is_mcp_shred_packet()` correctly distinguishes MCP from Agave shreds.
-- MCP shred total size = PACKET_DATA_SIZE (1,232 bytes) with witness_len=8.
-- SHRED_DATA_BYTES derivation: 1232 - 369 = 863.
+- Round-trip serde for all MCP wire types.
+- Merkle construction/proof vectors.
+- Unknown version rejection.
+- Attestation sorting/duplicate rejection.
+- `witness_len` enforcement.
+- MCP shred packet size and classifier tests.
 
 ---
 
 ## Pass 2 — Schedules
 
-**Goal:** Given a slot, any node can deterministically derive `Proposers[s]`, `Relays[s]`.
+**Goal:** deterministic `Proposers[s]` and `Relays[s]`, including duplicate identities.
 
-### 2.1 Domain-separated schedule generation
+### 2.1 Domain-separated schedules
 
-`ledger/src/leader_schedule.rs` — add alongside `stake_weighted_slot_leaders()` at line 72:
+- `ledger/src/leader_schedule.rs`:
+  - Add helper that reuses stake-weighted leader sampling with domain-separated seed.
+  - Domains:
+    - proposer: `b"mcp:proposer"`
+    - relay: `b"mcp:relay"`
 
-```
-fn stake_weighted_slot_schedule(keyed_stakes, epoch, len, domain: &[u8]) -> Vec<Pubkey>
-```
+### 2.2 Stake source parity with leader schedule
 
-Same algorithm (sort, WeightedIndex, ChaChaRng) but seed = `SHA-256(domain || epoch.to_le_bytes())`, `repeat = 1`. Domains: `b"mcp:proposer"`, `b"mcp:relay"` (spec section 5).
+- `ledger/src/leader_schedule_utils.rs`:
+  - Add `mcp_proposer_schedule(epoch, bank)`.
+  - Add `mcp_relay_schedule(epoch, bank)`.
+  - Mirror existing vote-keyed vs identity-keyed leader-schedule feature behavior.
 
-**Vote-keyed vs identity-keyed stake selection:** MCP schedules MUST use the same feature-gated stake selection as leader schedules (`leader_schedule_utils.rs:12-33`). When `enable_vote_address_leader_schedule` feature is active, use `bank.epoch_vote_accounts(epoch)` (vote-keyed). Otherwise, use `bank.epoch_staked_nodes(epoch)` (identity-keyed). The `mcp_proposer_schedule()` and `mcp_relay_schedule()` functions must check `bank.should_use_vote_keyed_leader_schedule(epoch)` and branch accordingly, passing the appropriate `keyed_stakes` to `stake_weighted_slot_schedule()`.
+### 2.3 Cache and lookup APIs
 
-Per spec section 5: `Proposers[s]` = sliding window of 16 entries at slot index within epoch with wrap. `Relays[s]` = sliding window of 200 entries with wrap.
-
-### 2.2 Schedule cache
-
-`ledger/src/leader_schedule_cache.rs` — add fields alongside `cached_schedules` at line 32:
-
-```
-cached_proposer_schedules: RwLock<(HashMap<Epoch, Arc<Vec<Pubkey>>>, VecDeque<Epoch>)>
-cached_relay_schedules:    RwLock<(HashMap<Epoch, Arc<Vec<Pubkey>>>, VecDeque<Epoch>)>
-```
-
-Query methods mirroring `slot_leader_at()` at line 95:
-- `proposers_at_slot(slot, bank) -> Option<Vec<Pubkey>>` — returns 16-element window.
-- `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` — returns 200-element window.
-- `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u8>` — lookup by identity. Returns ALL indices where this pubkey appears (spec section 5 allows duplicates). Empty vec if not a proposer.
-- `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u16>` — lookup by identity. Returns ALL indices where this pubkey appears. Empty vec if not a relay.
-
-**Duplicate identity handling (spec section 5):** "Proposers[s] and Relays[s] MAY contain duplicate identities." A validator appearing N times in Relays[s] acts as N separate relays, each with its own index. Each index receives one shred from proposers, stores it, and attests independently. The `relay_indices_at_slot()` function returns all such indices.
-
-### 2.3 Schedule utils
-
-`ledger/src/leader_schedule_utils.rs` — add:
-- `mcp_proposer_schedule(epoch, bank) -> Option<Arc<Vec<Pubkey>>>`
-- `mcp_relay_schedule(epoch, bank) -> Option<Arc<Vec<Pubkey>>>`
+- `ledger/src/leader_schedule_cache.rs`:
+  - Add proposer/relay schedule caches.
+  - Add:
+    - `proposers_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=16)
+    - `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=200)
+    - `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u8>`
+    - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u16>`
+  - Duplicate identities return all indices (spec §5).
 
 ### 2.4 Tests
 
-- Domain separation produces different schedules from leader schedule for same epoch.
-- `proposers_at_slot()` returns 16-element window.
-- `relays_at_slot()` returns 200-element window.
-- Wrap-around at epoch boundary.
+- Deterministic derivation for same epoch/stake set.
+- Domain separation vs leader schedule.
+- Window wrap-around across epoch boundary.
+- Duplicate-identity index lookup returns all indices.
 
 ---
 
-## Pass 3 — Storage + Sigverify
+## Pass 3 — Storage + Sigverify Partition
 
-**Goal:** MCP shreds can be stored in blockstore and verified by sigverify. No pipeline wiring yet.
+**Goal:** MCP shreds are preserved through sigverify and stored in MCP CFs.
 
 ### 3.1 MCP column families
 
-`ledger/src/blockstore/column.rs` — add new column types after existing definitions:
+- `ledger/src/blockstore/column.rs`:
+  - Add `McpShredData` with index `(Slot, u8 proposer_index, u32 shred_index)`.
+  - Add `McpRelayAttestation` with index `(Slot, u16 relay_index)`.
+- `ledger/src/blockstore_db.rs`:
+  - Register CF descriptors.
+  - Add names to `columns()` list.
+- `ledger/src/blockstore/blockstore_purge.rs`:
+  - Add both MCP CFs to `purge_range()` and `purge_files_in_range()`.
 
-- `McpShredData` — index: `(Slot, u8, u32)` (slot, proposer_index, shred_index), value: `Vec<u8>`, name: `"mcp_data_shred"`. Wire format uses `u32` for `proposer_index`; `McpShred::from_bytes()` MUST validate `proposer_index < NUM_PROPOSERS` (16) before casting to `u8` for storage. Reject shreds with out-of-range values.
-- `McpRelayAttestation` — index: `(Slot, u16)` (slot, relay_index), value: `Vec<u8>`, name: `"mcp_relay_attestation"`. Wire format uses `u32` for `relay_index`; MUST validate `relay_index < NUM_RELAYS` (200) before casting to `u16` for storage.
+### 3.2 Blockstore APIs
 
-For `McpShredData` (3-tuple index), follow the `AlternateShredData` pattern (`column.rs:174`). For `McpRelayAttestation` (2-tuple index), follow the standard SlotColumn pattern (`column.rs:353`).
+- `ledger/src/blockstore.rs`:
+  - Add CF handles to `Blockstore`.
+  - Add MCP put/get APIs.
+  - Conflict rule for same key with different bytes:
+    - do not silently overwrite
+    - surface deterministic conflict marker (equivocation evidence) for replay logic
 
-Additionally, register CFs in:
-- `blockstore_db.rs` `cf_descriptors()` at line 171: add `new_cf_descriptor::<columns::McpShredData>(...)` and `new_cf_descriptor::<columns::McpRelayAttestation>(...)`.
-- `blockstore_db.rs` `columns()` const array at line 252: add both CF names to the array and increment the array size.
-- `blockstore_purge.rs` `purge_range()` and `purge_files_in_range()`: add both CFs to the purge enumeration. **Missing this causes permanent data leaks** — old slots never cleaned from MCP CFs.
+### 3.3 Sigverify integration (critical partition)
 
-### 3.2 Blockstore MCP APIs
-
-`ledger/src/blockstore.rs` — add fields to `Blockstore` struct after line 261:
-
-```
-mcp_data_shred_cf: LedgerColumn<cf::McpShredData>,
-mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
-```
-
-Initialize in `do_open()` method (around line 430) via `db.column()`, add to struct constructor.
-
-Add methods:
-- `put_mcp_data_shred(slot, proposer_index, shred_index, data) -> Result<()>`
-- `get_mcp_data_shreds_for_proposer(slot, proposer_index) -> Result<Vec<(u32, Vec<u8>)>>`
-- `put_mcp_relay_attestation(slot, relay_index, data) -> Result<()>`
-- `get_mcp_relay_attestations(slot) -> Result<Vec<(u16, Vec<u8>)>>`
-
-### 3.3 Sigverify integration
-
-`turbine/src/sigverify_shreds.rs` — modify `run_shred_sigverify()`.
-
-**Critical:** The sigverify pipeline has THREE stages that assume Agave shred binary layout. MCP shreds must be partitioned before ALL of them:
-
-1. **Dedup (lines 190-203):** Calls `shred::wire::get_shred()` at line 196 which checks `ShredVariant` at byte offset 64. MCP shreds fail this check — `get_shred()` returns `None`, `.map()` returns `None`, `.unwrap_or(true)` returns `true`, causing the packet to be selected by the filter and **marked as discard** (`set_discard(true)` at line 201). **MCP shreds are discarded here.** They also fail:
-
-2. **GPU verify (lines 208-216 calling `verify_packets()` at line 423):** Calls `get_slot_leaders()` which extracts slot from hardcoded offset 65 via `shred::layout::get_slot()`. MCP shreds with slot at offset 0 will extract garbage slot values, look up wrong leaders, and be marked as discard. **This silently drops MCP shreds.**
-
-3. **Resign (lines 220-242):** Calls `get_shred()` at line 325 and `is_retransmitter_signed_variant()` at line 326, both requiring Agave variant byte at offset 64. MCP shreds fail and are discarded.
-
-**Fix:** Partition at packet receipt (line 162, `shred_fetch_receiver.recv_timeout()`), BEFORE dedup at line 190:
-1. After `recv_timeout()`, scan each packet in the received batches with `is_mcp_shred_packet()` and extract MCP packets to a separate buffer.
-2. Agave packets proceed through existing pipeline (dedup -> GPU verify -> resign -> verified_sender).
-3. MCP packets go through a **CPU-only** verification path:
-   - Parse via `McpShred::from_bytes()`.
-   - Look up proposer pubkey via `leader_schedule_cache.proposers_at_slot(slot)[proposer_index]` (requires Pass 2 schedule cache).
-   - Verify `proposer_signature` (Ed25519 over commitment).
-   - Verify `witness` (Merkle proof via `mcp_verify_proof()` using `shred_index` from the packet header as the leaf position, proving the shred belongs at that index in the committed Merkle tree).
-   - Discard on any failure.
-4. Send both Agave-verified and MCP-verified packets into the same `verified_sender` channel.
+- `turbine/src/sigverify_shreds.rs`:
+  - Partition MCP packets before Agave dedup/GPU/resign code paths.
+  - Agave packets: unchanged existing path.
+  - MCP packets: CPU verification path only:
+    - parse MCP shred
+    - lookup proposer pubkey from MCP schedule for slot
+    - verify proposer signature
+    - verify Merkle witness
+  - Forward verified MCP packets through existing `verified_sender` channel.
 
 ### 3.4 Tests
 
-- MCP shred stored and retrieved from blockstore via MCP CFs.
-- Sigverify accepts valid MCP shred, rejects bad signature, rejects bad witness.
-- MCP shreds correctly partitioned before dedup/GPU/resign (no silent drops from Agave layout assumptions).
+- MCP shreds survive partition and are not dropped by Agave layout assumptions.
+- Valid MCP shred passes, bad signature/proof fails.
+- MCP CF put/get + purge behavior.
 
 ---
 
-## Pass 4 — Window Service + Relay Attestations + Retransmit
+## Pass 4 — Window Service + Relay Attestations + MCP Transport
 
-**Goal:** MCP shreds flow through window_service, are stored, tracked, relays produce attestations and retransmit shreds to all validators.
+**Goal:** MCP shreds flow through `window_service`, relay attestations are emitted correctly, and MCP control messages are transported reliably.
 
-### 4.1 MCP shred handling in window_service
+### 4.1 Window-service MCP partition
 
-`core/src/window_service.rs` — modify `run_insert()` at line 190.
+- `core/src/window_service.rs` (`run_insert`):
+  - Partition on raw payload bytes before `Shred::new_from_serialized_shred`.
+  - MCP payload path:
+    - parse + validate MCP shred
+    - store via MCP blockstore APIs
+    - feed relay-attestation tracker
+  - Non-MCP path remains unchanged.
 
-**Critical:** The partition MUST happen at the raw `Payload` byte level, BEFORE Agave deserialization at line 220 (`Shred::new_from_serialized_shred(shred).ok()?`). MCP shreds fail the `ShredVariant` check at byte 64 and are silently discarded by `.ok()?`.
+### 4.2 Relay attestation semantics
 
-Fix: At line 213 (the `handle_shred` closure that receives raw `(shred::Payload, bool, BlockLocation)` tuples before calling `Shred::new_from_serialized_shred`):
-1. Examine raw `Payload` bytes with `is_mcp_shred_packet()`.
-2. MCP payloads: route to separate MCP handling path using `McpShred::from_bytes()`.
-3. Non-MCP payloads: proceed through existing Agave path (deserialization at line 220, blockstore insert at line 233).
+- Track attestation state by `(slot, relay_index, proposer_index)`.
+- Relay self-check:
+  - if node owns relay indices `R = relay_indices_at_slot(...)`, accept only shreds with `shred_index in R` for relay-attest path.
+- Equivocation:
+  - conflicting commitments for same `(slot, relay_index, proposer_index)` => no attestation entry for that tuple.
+- Cardinality:
+  - at most one `RelayAttestation` per `(slot, relay_index)`.
+  - if a validator owns multiple relay indices, it may emit multiple attestations (one per index).
 
-MCP handling path:
-- Parse via `McpShred::from_bytes()`.
-- Store via `blockstore.put_mcp_data_shred()`.
-- Track per-(slot, proposer_index) shred counts for reconstruction readiness.
-- Record for relay attestation (see 4.2).
+### 4.3 MCP QUIC transport
 
-### 4.2 Relay attestation tracking
+- Need dedicated MCP QUIC stream server (standard streamer path enforces 1232-byte packet limit).
+- Add one socket tag in contact info for MCP endpoint:
+  - `gossip/src/contact_info.rs`
+  - `gossip/src/node.rs`
+  - `gossip/src/cluster_info.rs`
+  - `core/src/validator.rs` wiring
+- `core/src/tvu.rs`:
+  - spawn MCP QUIC service (small helper module, for example `core/src/mcp_quic.rs`).
+  - stream framing: 1-byte message type prefix + payload.
+  - message types:
+    - `0x01` RelayAttestation
+    - `0x02` ConsensusBlock
+  - reject unknown type and oversize frame.
 
-Add attestation state to `run_insert()` or a small helper struct:
+### 4.4 Relay shred broadcast
 
-Per-slot `HashMap<u8, (Hash, Signature)>`: `proposer_index -> (commitment, proposer_sig)`.
-- **Relay self-check (spec section 3.3):** When this node is a relay, only accept shreds where `shred_index` is in this node's relay indices (`relay_indices_at_slot(slot, &my_pubkey)` returns Vec<u16>). For each relay index I own, only accept shreds with `shred_index == I`. The spec requires "the witness verifies against the commitment for the relay's own index." Non-relay validators accept any valid shred_index.
-- If a proposer sends conflicting commitments -> mark equivocation, do not attest (spec section 3.3).
-- At most one entry per proposer per slot.
-
-**Rayon note:** Existing `run_insert()` processes shreds in a Rayon parallel loop (lines 224-233). Per-slot attestation state must be collected OUTSIDE the parallel loop, or use `Mutex`/atomic state inside the loop. Recommended: collect MCP shred metadata into a `Vec` inside the parallel loop (lock-free), then process attestation state sequentially after the loop completes.
-
-**Timing parameters (implementation-defined, configurable):**
-- `MCP_RELAY_DEADLINE_MS: u64 = 200` — relay deadline offset from slot start
-- `MCP_AGGREGATION_DEADLINE_MS: u64 = 300` — leader aggregation deadline offset from slot start
-
-At relay deadline for slot s (slot_start + MCP_RELAY_DEADLINE_MS):
-1. Look up `relay_indices_at_slot(slot, &my_pubkey)` -> Vec<u16>.
-2. If this node is a relay: collect non-equivocating entries sorted by proposer_index.
-3. Build + sign `RelayAttestation` (from `ledger/src/mcp.rs`).
-4. Send to Leader[s] via QUIC (see 4.3).
-5. At most one attestation per slot.
-
-### 4.3 MCP transport via single QUIC socket
-
-**Critical:** A `RelayAttestation` with 16 proposer entries is 1+8+4+1+16*(4+32+64)+64 = 1,678 bytes. This exceeds `PACKET_DATA_SIZE` (1,232 bytes) and UDP MTU (1,280 bytes). UDP transport will silently drop these packets.
-
-Fix: Use QUIC for all MCP transport. Use a **single multiplexed socket** (not two separate sockets) to minimize contact_info churn.
-
-`gossip/src/contact_info.rs` — add ONE new socket tag:
-- Define `SOCKET_TAG_MCP: u8 = 14` after `SOCKET_TAG_ALPENGLOW = 13` at line 47.
-- Update `SOCKET_CACHE_SIZE` from 14 to 15.
-- Add getter/setter/remover macros (follow `alpenglow()` pattern at lines 273-317).
-- Update `test_round_trip()` assertions.
-
-`gossip/src/node.rs` — bind the MCP socket:
-- Bind socket in port range (follow alpenglow pattern at line 256-258).
-- Publish in ContactInfo via setter.
-- Add to `Sockets` struct in `gossip/src/cluster_info.rs` (lines 2371-2409).
-
-**Message type multiplexing:** All MCP QUIC messages start with a 1-byte type prefix:
-- `0x01` = RelayAttestation (relay → leader)
-- `0x02` = ConsensusBlock (leader → validators)
-- `0x03` = ConsensusBlockRequest { slot: u64 } (validator → peer)
-- `0x04` = ConsensusBlockResponse (peer → validator, contains ConsensusBlock or empty)
-
-`core/src/tvu.rs` — spawn single "solMcp" QUIC endpoint:
-
-**Critical: Do NOT reuse the standard QUIC streamer (`streamer/src/nonblocking/quic.rs`).** The standard streamer enforces `PACKET_DATA_SIZE` (1,232 bytes) as the maximum stream size (`handle_chunks()` at `streamer/src/nonblocking/quic.rs:1294`). MCP messages exceed this: RelayAttestation ~1,678 bytes, ConsensusBlock ~334KB. The standard streamer will reject these with `CONNECTION_CLOSE_CODE_INVALID_STREAM` and terminate the connection.
-
-**Fix:** Implement a dedicated MCP QUIC server using `quinn` directly (same as alpenglow QUIC at `tvu.rs:258`). Accept bidirectional streams, read the full stream into a buffer with a max size of 512KB (sufficient for worst-case ConsensusBlock), parse the 1-byte type prefix, and dispatch.
-
-- RelayAttestation messages → send to replay_stage via `mcp_attestation_receiver` channel.
-- ConsensusBlock messages → send to replay_stage via `mcp_consensus_block_receiver` channel.
-- ConsensusBlockRequest messages → respond with cached ConsensusBlock for that slot if available.
-- Attestation sender (relay side in 4.2) connects to Leader[s]'s MCP QUIC endpoint to send `RelayAttestation`.
-- ConsensusBlock sender (leader side in 6.4) connects to each validator's MCP QUIC endpoint to send `ConsensusBlock`.
-
-### 4.4 MCP shred retransmit
-
-**Critical:** Spec section 3.3 requires relays to broadcast the same Shred message to all validators. The plan must specify how.
-
-Fix: After a relay receives and verifies MCP shreds from a proposer:
-1. Relay looks up all validator TVU addresses via `ClusterInfo`.
-2. Relay broadcasts each verified MCP shred to all validators via their TVU fetch sockets (existing UDP infrastructure). Each MCP shred is exactly 1,232 bytes = PACKET_DATA_SIZE, fitting in one UDP packet.
-3. This is simpler than adapting turbine trees (which are slot-leader-specific) and matches the spec's "relay MUST broadcast" requirement. Existing `retransmit_stage.rs` is NOT used — it assumes Agave shred layout in `get_shred_id()` at lines 463-477 for dedup/peer selection.
-4. Duplicate shred detection at receivers: `blockstore.put_mcp_data_shred()` is idempotent (same key overwrites with same data).
+- Relay retransmits verified MCP shreds to validators over existing TVU fetch UDP sockets.
+- Do not use existing retransmit-stage shred-id logic for MCP bytes.
 
 ### 4.5 Tests
 
-- MCP shreds stored via window_service path (partition before deserialization).
-- Relay attests to valid single-commitment proposers.
-- Relay does not attest to equivocating proposer.
-- Relay only attests to shreds where shred_index matches own relay index.
-- One attestation per slot enforced.
-- Attestation serialized size fits QUIC (no PACKET_DATA_SIZE limit).
-- Retransmit path sends to all validators.
-- Attestation tracking correct despite Rayon parallelism.
+- Window-service partition before Agave shred deserialize.
+- Duplicate relay-index behavior (one attestation per relay index).
+- Equivocation suppression.
+- QUIC payload >1232B accepted by MCP transport path.
 
 ---
 
-## Pass 5 — Proposer Pipeline + Transaction Forwarding
+## Pass 5 — Proposer Pipeline + Forwarding
 
-**Goal:** A proposer node collects sig-verified txs, encodes MCP shreds, sends one per relay. Bankless. Non-proposer validators forward transactions to proposers.
+**Goal:** proposer nodes build MCP shred sets from verified transactions; non-proposers forward txs to proposers.
 
-### 5.1 Transaction forwarding to proposers
+### 5.1 Sigverify clone path and Vortexor parity
 
-`core/src/forwarding_stage.rs` — when `mcp_protocol_v1` active, modify transaction forwarding to route to proposers instead of the leader.
+- `core/src/ed25519_sigverifier.rs`:
+  - add optional MCP proposer sender clone.
+- `core/src/vortexor_receiver_adapter.rs`:
+  - add same clone behavior, or hard-disable MCP when Vortexor is enabled.
 
-Currently `get_non_vote_forwarding_addresses()` at line 106 calls `next_leaders()` which resolves leader TPU forward addresses via `PohRecorder`. With MCP active:
-1. Replace leader lookup with proposer lookup. The forwarding stage currently accesses schedules through `PohRecorder` + `next_leaders()` helper (`core/src/next_leader.rs`), using `FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET` (line 27) to forward to upcoming leaders. For MCP, use the same slot offset logic but resolve proposer addresses via `LeaderScheduleCache::proposers_at_slot()` instead of `slot_leader_at()`. Pass `LeaderScheduleCache` reference to `ForwardingStage` (or the `ForwardAddressGetter`).
-2. Forward transactions to all 16 proposers' TPU forward addresses (or a subset based on target_proposer hint if present).
-3. Use existing `ForwardingStage` connection infrastructure (ConnectionCache or TpuClientNext) — only the address resolution changes.
+### 5.2 TPU proposer worker
 
-### 5.2 Clone sender in sigverify
+- `core/src/tpu.rs`:
+  - create MCP proposer receiver and worker when feature active.
+  - derive current slot from `tick_height()/ticks_per_slot()` (no `PohRecorder::slot()`).
+  - proposer activation: node is proposer for current slot if own pubkey appears in proposer indices.
+- Worker steps:
+  1. drain verified tx packets from MCP channel.
+  2. parse ordering key according to resolved `B1/B2` rules.
+  3. optional local admission control with `CostModel` + local `CostTracker` budgeted per proposer.
+  4. order transactions deterministically.
+  5. serialize payload and enforce max payload bound.
+  6. call ledger MCP encode helper -> 200 shreds + witnesses.
+  7. send shred `i` to relay index `i` address.
 
-`core/src/tpu.rs` — add an optional `Sender<(BankingPacketBatch, bool)>` for MCP proposer packets.
+### 5.3 Forwarding stage changes
 
-`core/src/ed25519_sigverifier.rs` — extend `TransactionSigVerifier` to clone to an MCP proposer channel. The split point is `send_packets()` at lines 56-74, which already clones `BankingPacketBatch` to both `banking_stage_sender` and `forward_stage_sender`. Add a third optional sender:
+- `core/src/forwarding_stage.rs` + `core/src/next_leader.rs`:
+  - MCP mode resolves proposer forward addresses using schedule cache and same lookahead slot-offset policy used today.
+  - implement fanout behavior for both forwarding clients:
+    - `ConnectionCacheClient`
+    - `TpuClientNext`
+  - preserve non-MCP behavior unchanged.
 
-**Vortexor compatibility:** When Vortexor is enabled (`tpu.rs:271-294`), `TransactionSigVerifier` is bypassed entirely — `VortexorReceiverAdapter` sends pre-verified packets directly to banking stage. MCP proposer clone MUST be added to `VortexorReceiverAdapter::run()` as well (`core/src/vortexor_receiver_adapter.rs`), or MCP MUST be disabled when Vortexor is active (simpler for v1).
-1. Add `mcp_proposer_sender: Option<Sender<(BankingPacketBatch, bool)>>` field to `TransactionSigVerifier`.
-2. In `send_packets()`, clone `banking_packet_batch` and `try_send()` to the MCP sender (same pattern as `forward_stage_sender` at lines 63-66).
-3. Wire in `tpu.rs` alongside `forward_stage_sender` channel creation (around line 270).
+### 5.4 Explicit non-change
 
-When `mcp_protocol_v1` active and `leader_schedule_cache.proposers_at_slot(slot)` includes this node's pubkey, the MCP proposer thread consumes from `mcp_proposer_receiver`.
-
-### 5.3 Proposer loop
-
-`core/src/tpu.rs` — add an MCP proposer thread.
-
-**Slot and FeatureSet source:** The proposer thread obtains the current slot from `PohRecorder::slot()` (same mechanism used by BankingStage). For `FeatureSet` (needed by `CostModel::calculate_cost()`), clone `Arc<FeatureSet>` from the most recent root bank via `BankForks::root_bank().feature_set.clone()` at thread start and refresh periodically (e.g., every epoch). This is advisory — stale feature set only affects admission control accuracy, not consensus.
-
-1. Receive cloned packets from 5.2.
-2. Deserialize each transaction and extract ordering_fee via `process_compute_budget_instructions()` from `compute-budget-instruction/src/instructions_processor.rs:13`. This reuses the same extraction logic as BankingStage's `ImmutableDeserializedPacket` (`core/src/banking_stage/immutable_deserialized_packet.rs:61-96`).
-
-   **MCP transaction format note (PENDING SPEC AMENDMENT):** See SPEC AMENDMENT REQUIREMENT in section 1.2. McpPayload carries standard Solana wire-format transactions. The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`.
-
-3. **Admission control (CU tracking):** For each transaction, compute cost via `CostModel::calculate_cost()` (`cost-model/src/cost_model.rs:37`) and track via a local `CostTracker` (`cost-model/src/cost_tracker.rs:176`) initialized with 1/NUM_PROPOSERS of block-level limits:
-   - `block_cost_limit / 16`
-   - `account_cost_limit / 16`
-   - `loaded_accounts_data_size_limit / 16`
-
-   Call `cost_tracker.try_add(&cost)` and drop transactions that exceed limits. This is **advisory admission control only** — validators will independently verify at replay time. Transactions dropped here may have been valid on the eventual fork (liveness trade-off, not consensus-critical).
-
-4. Sort by ordering_fee descending, ties by position.
-5. Serialize to `McpPayload` (max `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes). Only 40 data shreds carry payload; the remaining 160 are RS parity.
-6. RS encode via `ReedSolomonCache::get(40, 160)` from `ledger/src/shredder.rs:276` (the cache's `pub(crate)` methods are accessible within the `ledger` crate where MCP modules live). Share one `ReedSolomonCache` instance across the proposer thread.
-7. Compute Merkle commitment per spec section 6 using `mcp_merkle_tree()` from `mcp_merkle.rs`. The tree has 200 leaves (40 data + 160 coding shreds).
-8. Build `McpShred` for each relay index (0..199) with witness from `mcp_merkle_proof()` + proposer_signature.
-9. Look up relay addresses via `relays_at_slot()` + `ClusterInfo::lookup_contact_info()`.
-10. Send one shred per relay to their TVU address.
-
-No bank, no PoH — this is bankless per spec section 9.
-
-**BankingStage interaction:** When `mcp_protocol_v1` is active for a slot, BankingStage continues to run normally — it processes transactions for the current leader's block (which may be a different slot). MCP proposer batches are built independently via this proposer loop. BankingStage is NOT disabled; the two systems produce output for different purposes (leader block vs. MCP proposer batch).
-
-**PENDING SPEC AMENDMENT — ordering_fee sort direction:** Spec §3.6 says "order them by ordering_fee" without specifying ascending or descending. This plan uses **descending** (higher fee = higher priority). Spec amendment should clarify direction.
-
-### 5.4 Per-proposer CU budgets
-
-`core/src/banking_stage/qos_service.rs` — when `mcp_protocol_v1` active, divide block-level limits by `NUM_PROPOSERS` (16) per spec §3.2 ("Global block-level constraints on compute units (CU) and loaded account data are divided evenly among the proposers"):
-- `block_cost_limit /= 16`
-- `account_cost_limit /= 16`
-- `loaded_accounts_data_size_limit /= 16`
-
-**Purpose:** QosService runs in the BankingStage leader path (not replay). This change ensures that when a validator is BOTH the slot leader AND an MCP proposer, BankingStage respects per-proposer CU limits for Agave block production. On the replay side, per-proposer CU enforcement happens via the Bank's built-in cost tracker during `process_entries()` — no separate QoS change is needed for replay.
+- Do not globally divide BankingStage QoS limits in `core/src/banking_stage/qos_service.rs` in v1.
+- Per-proposer limits are handled by proposer admission and replay validation paths.
 
 ### 5.5 Tests
 
-- Proposer produces 200 shreds (one per relay).
-- Payload size within `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes.
-- RS encode -> decode round-trip.
-- CU budget enforcement at 1/16th.
-- ordering_fee correctly extracted from compute_unit_price.
-- Transactions without SetComputeUnitPrice get ordering_fee=0.
-- Forwarding stage routes to proposers when MCP active.
-- TransactionSigVerifier clones to MCP proposer channel.
+- MCP clone path in normal sigverify and Vortexor modes.
+- Proposer worker emits exactly one shred per relay index.
+- Payload bound enforcement.
+- Forwarding routes to proposer addresses in MCP mode for both forwarding clients.
 
 ---
 
 ## Pass 6 — Leader Aggregation + ConsensusBlock
 
-**Goal:** The leader collects relay attestations, builds the aggregate, broadcasts ConsensusBlock.
+**Goal:** aggregate relay attestations and distribute leader-signed `ConsensusBlock`.
 
-### 6.1 Receive attestations
+### 6.1 Replay receivers
 
-MCP attestation packets arrive via the "solMcpAttest" QUIC thread from Pass 4.3. MCP consensus blocks arrive via the "solMcpConsensus" QUIC thread from Pass 4.3. Add both to `ReplayReceivers` at `replay_stage.rs:330`:
-- `mcp_attestation_receiver: Receiver<RelayAttestation>`
-- `mcp_consensus_block_receiver: Receiver<ConsensusBlock>`
+- `core/src/replay_stage.rs`:
+  - extend `ReplayReceivers` with MCP attestation and consensus-block channels.
+  - keep replay-loop diff minimal by delegating MCP logic to helper module.
 
-### 6.2 Verify and aggregate
+### 6.2 MCP replay helper
 
-Create `core/src/mcp_replay.rs` — all MCP-specific replay logic lives here to keep replay_stage diff minimal (~20 lines). `replay_stage.rs` main loop at line 823 calls `mcp_replay::drain_attestations()` and `mcp_replay::process_consensus_block()` as entry points. Drain attestations each iteration:
+- Add `core/src/mcp_replay.rs`:
+  - drain and validate relay attestations.
+  - maintain per-slot aggregate state.
+  - expose entrypoints called by replay loop.
 
-1. Verify relay_signature; discard message if invalid (spec section 3.4).
-2. Verify each proposer_signature against commitment; drop invalid entries.
-3. Accumulate into per-slot `AggregateAttestation`.
+Validation rules:
+- invalid relay signature => drop relay message
+- invalid proposer signature inside relay entry => drop that entry, keep other valid entries
+- canonical aggregate ordering by `relay_index`
 
-### 6.3 Build ConsensusBlock
+### 6.3 Leader finalization
 
-When this node is Leader[s] and aggregation deadline is reached (slot_start + MCP_AGGREGATION_DEADLINE_MS):
+When this node is leader for slot `s` at aggregation deadline:
+1. filter invalid entries as above
+2. if valid relay entries < 120 -> submit empty result
+3. build `AggregateAttestation`
+4. construct/sign `ConsensusBlock` with:
+   - `consensus_meta` and `block_id` from consensus adapter (`B3`)
+   - `delayed_bankhash` per consensus delayed-slot rule (`B4`)
 
-1. If relay count < 120 (ATTESTATION_THRESHOLD) -> submit empty result (spec section 3.4).
-2. Build AggregateAttestation with relay entries sorted by relay_index.
-3. Construct ConsensusBlock with aggregate + consensus_meta + delayed_bankhash:
-   - **`consensus_meta`**: Per spec section 3.4: "The leader MUST compute the block commitment used as block_id according to the underlying ledger rules, and MUST include that commitment in consensus_meta." For MCP standalone (before Alpenglow integration): consensus_meta contains a single 32-byte `block_id` computed as `SHA-256(slot || leader_index || aggregate_hash)` where aggregate_hash is the hash of the serialized AggregateAttestation. After Alpenglow integration, consensus_meta becomes opaque pass-through from Alpenglow containing additional consensus metadata.
-   - **`delayed_bankhash`**: Per spec section 3.5: "verify delayed_bankhash against the local bank hash for the delayed slot defined by the consensus protocol." Define constant `MCP_DELAY_SLOTS: u64 = 32` (consistent with typical optimistic confirmation latency). The leader fetches the frozen bank hash for `slot - MCP_DELAY_SLOTS` via `Bank::hash()` on the frozen bank at that slot (accessible via `BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())`). Validators verify this matches their locally computed bank hash for the same delayed slot. If the delayed slot is not yet frozen (e.g., at genesis or after restart), use Hash::default() and validators accept it during the warmup period.
-4. Sign the ConsensusBlock.
+### 6.4 Distribution
 
-### 6.4 ConsensusBlock distribution
-
-**Primary mechanism: direct broadcast via QUIC.**
-Leader broadcasts the full `ConsensusBlock` to all validators via the "solMcp" QUIC endpoint (set up in Pass 4.3, message type `0x02`). Validators receive it through `mcp_consensus_block_receiver` in `ReplayReceivers`. ConsensusBlocks can be large (aggregate with 120+ relay entries), so QUIC is required to avoid UDP size limits.
-
-**Missed block recovery (QUIC peer-to-peer, NO gossip changes):**
-Validators that miss the direct broadcast request ConsensusBlocks from ANY peer via the "solMcp" QUIC endpoint:
-- Send `ConsensusBlockRequest { slot: u64 }` (message type `0x03`) to multiple peers via ClusterInfo.
-- Peers respond with `ConsensusBlockResponse` (message type `0x04`) containing the cached `ConsensusBlock` for that slot, or empty if not available.
-- ConsensusBlocks are leader-signed, so any peer can serve them — no trust required beyond signature verification.
-- Peers cache recent ConsensusBlocks (last 32 slots) for serving requests.
-- Retry with exponential backoff to different peers if no response.
-
-**Rationale for no gossip:** Gossip is unnecessary because (a) the spec does not mandate gossip discovery, (b) peer-to-peer QUIC request/response is sufficient for recovery, (c) ConsensusBlocks are leader-signed so any peer can serve them, and (d) avoiding gossip stack changes (CrdsData, CrdsValue, CrdsCountsArray) reduces diff by 4 files.
+- Leader broadcasts `ConsensusBlock` directly to validators over MCP QUIC.
+- Optional pull-recovery protocol is deferred unless required by loss testing.
 
 ### 6.5 Tests
 
-- Threshold enforcement: <120 relays -> empty.
-- Invalid relay sig -> entire message dropped.
-- Invalid proposer sig -> entry dropped, rest kept.
-- ConsensusBlock signature verifies.
-- Direct broadcast delivers to all validators.
-- Peer-to-peer recovery: missed ConsensusBlock retrieved via QUIC request/response.
+- threshold behavior (`<120` => empty)
+- relay/proposer filtering semantics
+- canonical aggregate ordering
+- direct QUIC block distribution
 
 ---
 
-## Pass 7 — Vote Gate + Reconstruct + Replay
+## Pass 7 — Vote Gate + Reconstruct + Replay + Fees
 
-**Goal:** Validators verify ConsensusBlock, reconstruct batches, execute with two-phase fees, and vote.
+**Goal:** deterministic vote gate, reconstruction, and two-phase fee-safe execution.
 
-### 7.1 ConsensusBlock validation (vote gate)
+### 7.1 Vote gate on `ConsensusBlock`
 
-`core/src/replay_stage.rs` — on receiving ConsensusBlock for slot s (spec section 3.5):
+- `core/src/mcp_replay.rs` (called from replay loop):
+  1. verify leader signature and leader index for slot
+  2. verify delayed bankhash by consensus-defined delayed slot (`B4`)
+  3. verify relay/proposer signatures and ignore invalid entries
+  4. enforce global relay threshold after filtering (`>=120`)
+  5. implied proposer rules:
+     - multiple commitments => exclude
+     - one commitment with `>=80` relay attestations => include
+  6. local availability check:
+     - count only locally stored shreds whose witness validates against included commitment
+     - require `>=40` per included proposer
 
-1. Verify leader_signature, leader_index matches Leader[s].
-2. Verify delayed_bankhash against local bank hash for `slot - MCP_DELAY_SLOTS` via `BankForks.get(slot - MCP_DELAY_SLOTS).map(|b| b.hash())`. Accept Hash::default() during warmup period (first MCP_DELAY_SLOTS slots after genesis or restart).
-3. Verify every relay_signature and proposer_signature in aggregate. **Per spec section 3.5:** ignore individual relay entries that fail signature verification — do not reject the entire block. Keep valid relay entries and discard invalid ones, then proceed with the valid set.
-4. **Global relay-count threshold (spec section 3.4):** Count total valid relay entries remaining after step 3. If count < 120 (ATTESTATION_THRESHOLD = ceil(0.6 * 200)), reject the block as invalid. This is separate from the leader-side check in §6.3 — validators MUST independently enforce this threshold.
-5. Compute implied proposers:
-   - 2+ distinct commitments -> equivocating -> exclude.
-   - 1 commitment with >=80 relay attestations (INCLUSION_THRESHOLD) -> include.
-6. For each included proposer: count locally stored shreds whose witness verifies against **the included commitment** (not just any valid witness) >=40 (RECONSTRUCTION_THRESHOLD). Per spec §3.5: "the validator counts the number of locally stored shreds that pass witness verification for that commitment."
-7. Any included proposer below 40 -> do not vote.
+### 7.2 Reconstruction
 
-### 7.2 Reconstruct
+- For each included proposer:
+  - load shreds from MCP CF
+  - decode + re-encode + recompute commitment via ledger helper
+  - discard proposer batch on commitment mismatch
+  - decode payload tx list
 
-For each included proposer:
+### 7.3 Ordering and execution
 
-1. Gather >=40 MCP shreds from blockstore via `get_mcp_data_shreds_for_proposer()`.
-2. `reconstruct_batch()` from `ledger/src/mcp.rs` — RS decode via `ReedSolomonCache::get(40, 160)` from `ledger/src/shredder.rs:276`. Re-encode, recompute commitment via `mcp_merkle_tree()`. Discard if mismatch (spec section 3.6).
-3. Parse `McpPayload` -> transactions (standard Solana wire-format, see SPEC AMENDMENT REQUIREMENT in section 1.2).
+- Deterministic order:
+  - concat by proposer index
+  - apply `ordering_fee` ordering per resolved `B2` rule
+  - stable tie-break by concatenated position
 
-### 7.3 Order and execute
+- `ledger/src/blockstore_processor.rs`:
+  - add `confirm_slot_mcp()` that bypasses PoH checks and reuses transaction verification + execution pipeline.
 
-1. `order_transactions()` from `ledger/src/mcp.rs` — concat by proposer_index ascending, sort by ordering_fee desc (where ordering_fee = compute_unit_price), ties by position.
-2. Two-phase execution via new `confirm_slot_mcp()` in `ledger/src/blockstore_processor.rs`.
+Two-phase fee handling (spec §8):
+- Phase A (fee commitment):
+  - per-transaction checks for signature/basic validity
+  - per-slot cumulative payer map in memory
+  - required debit:
+    - standard tx: `base_fee * NUM_PROPOSERS`
+    - nonce tx: `base_fee * NUM_PROPOSERS + nonce_min_rent`
+  - use `Bank::withdraw()` for debit
+  - drop only failing transaction; continue others
+- Phase B (execution):
+  - execute filtered tx list with fee deduction disabled
+  - no second fee charge
 
-**PoH bypass:** MCP has no PoH chain. The production `confirm_slot_entries` path verifies PoH via `entries.start_verify()` and tick counts via `verify_ticks()`. MCP cannot use this path. Instead, `confirm_slot_mcp()` follows the `process_entries_for_tests` pattern (`blockstore_processor.rs:599-647`):
+Implementation wiring:
+- add explicit fee-mode control in SVM validation path (for example `skip_fee_deduction` in processing environment)
+- plumb through bank execution API via MCP-specific execution entrypoint; default path unchanged
 
-**Entry construction:**
-```rust
-// For each batch of transactions from ordered proposer batches:
-let entries: Vec<Entry> = transaction_batches.iter().map(|txs| Entry {
-    num_hashes: 0,        // Dummy - ignored since PoH verification skipped
-    hash: Hash::default(), // Dummy - ignored since PoH verification skipped
-    transactions: txs.clone(),
-}).collect();
-```
+### 7.4 Bank/block ID and vote
 
-**ReplayEntry construction:**
-- Call `entry::verify_transactions(entries, &thread_pool, Arc::new(verify_fn))` (`entry/src/entry.rs:392`) to verify transaction signatures. The `verify_fn` closure takes a `VersionedTransaction` and returns `Result<Tx>` — use the same verification function as `confirm_slot_entries()` (`blockstore_processor.rs:615-619`). Returns `Vec<EntryType<Tx>>` with `EntryType::Transactions(verified_txs)`.
-- PoH verification is skipped by NOT calling `start_verify_transactions()` or `verify_ticks()`.
+- set `bank.block_id()` from consensus-meta-derived `block_id` (`B3`).
+- underlying vote wire format remains unchanged.
 
-**Execution path:**
-```rust
-// In confirm_slot_mcp():
-let replay_entries = entry::verify_transactions(&entries, /*skip_verification=*/false, ...)?;
-// replay_entries now contains signature-verified transactions
-// Pass directly to process_entries() with skip_fee_deduction=true environment
-process_entries(bank, replay_entries, processing_environment, ...)?;
-```
+### 7.5 Empty result
 
-The key insight: `entry::verify_transactions()` does signature verification independent of PoH. The dummy `hash` and `num_hashes` fields are never checked because we skip the PoH verification path.
-
-**Phase A (fees):** Pre-process fee deduction on the Bank per-transaction, BEFORE entering Phase B.
-
-**Per-transaction granularity (spec section 8 requirement):**
-Spec §8: "validators MUST deduct fees for all transactions that pass signature and basic validity checks." This requires **per-transaction** processing, NOT per-proposer-batch atomicity. If tx #3 in proposer P's batch fails fee validation, txs #1 and #2 are still fee-deducted and proceed to Phase B. Only the individual failing transaction is dropped.
-
-**Cumulative tracking:**
-- Per-payer cumulative tracking uses an **in-memory `HashMap<Pubkey, u64>`** for the slot duration only. No persistence needed since replay is deterministic from ConsensusBlock.
-- The HashMap is cleared at slot boundary.
-
-**Per-transaction processing:**
-- Validate fee payer can cover `fee * NUM_PROPOSERS` (spec section 8). For nonce transactions, payer must cover `fee * NUM_PROPOSERS + minimum_rent` per spec section 8.
-- Check `cumulative_fees[payer] + fee * NUM_PROPOSERS <= payer_balance`. If not, **drop this transaction only** — other transactions in the same proposer's batch proceed normally.
-- Update `cumulative_fees[payer] += fee * NUM_PROPOSERS`.
-- Debit fee via `Bank::withdraw(&self, pubkey, lamports)` (`runtime/src/bank.rs:6076`). This is a public production method that handles minimum balance checks for nonce accounts, validates sufficient funds, and properly stores the modified account.
-- Collect the list of fee-valid transactions for Phase B.
-
-**Phase B (execution):** Skip fee re-charging. The fee is computed as `signature_count * lamports_per_signature` in `calculate_fee_details()` at `fee/src/lib.rs:44-63`, using `Bank.fee_structure.lamports_per_signature` (called from `runtime/src/bank/check_transactions.rs:106-112`). To zero the fee:
-
-Add `skip_fee_deduction: bool` to `TransactionProcessingEnvironment` at `svm/src/transaction_processor.rs:124`. In `check_transactions()` at `runtime/src/bank/check_transactions.rs:106`, when `skip_fee_deduction` is true, call `calculate_fee_details()` with `zero_fees_for_test: true` (existing parameter that returns `FeeDetails::default()` i.e. zero fee). This means `validate_fee_payer()` at `account_loader.rs:370` naturally receives `fee=0` and skips deduction.
-
-This requires 3 changes:
-1. Add `skip_fee_deduction: bool` to `TransactionProcessingEnvironment` at `svm/src/transaction_processor.rs:124`.
-2. In `check_transactions()` at `runtime/src/bank/check_transactions.rs:106`: when `processing_environment.skip_fee_deduction`, pass `zero_fees_for_test: true` to `calculate_fee_details()`.
-3. `confirm_slot_mcp()` constructs the environment with `skip_fee_deduction: true` before calling `process_entries()`.
-
-**Note:** Setting `blockhash_lamports_per_signature = 0` in the environment does NOT work — that field is only used for nonce account state advancement, not fee calculation. The fee calculation uses `Bank.fee_structure.lamports_per_signature` separately.
-
-3. Freeze bank. Set `bank.block_id()` from ConsensusBlock.
-
-### 7.4 Vote
-
-Existing consensus voting path — unchanged. MCP does not modify vote wire format or voting logic. The spec section 7.6 Vote format defines `block_hash = block_id` from the ConsensusBlock; the underlying consensus protocol (Alpenglow/Tower) handles the vote mechanism.
-
-### 7.5 Empty slot
-
-Consensus outputs empty result -> freeze bank with no transactions.
+- if consensus outputs empty result for slot, freeze bank with no transactions.
 
 ### 7.6 Tests
 
-- Vote gate rejects: bad leader sig, bad bankhash, equivocating proposer, insufficient shreds, global relay count < 120 after filtering invalid entries.
-- Reconstruction round-trip: shred -> reconstruct -> verify commitment.
-- Ordering: ordering_fee sort is deterministic.
-- Fee multiplier: payer needs 16x balance.
-- Phase B correctly skips fee re-deduction via zero_fees_for_test path.
-- **Per-transaction fee granularity:** tx #3 fails fee validation -> txs #1, #2 still fee-deducted and executed. NOT per-batch.
-- **Cross-proposer cumulative fees:** same payer in proposer P0 and P3, cumulative tracking catches over-commitment.
-- **Phase A→B state handoff:** fee-deducted accounts in Phase A are visible to Phase B execution with correct balances.
-- **RelayAttestation with unsorted/duplicate entries:** rejected at parse time.
-- End-to-end in `core/tests/mcp_integration.rs`.
+- vote-gate rejections: bad leader sig/index, bad delayed bankhash, equivocation, insufficient local valid shreds, global threshold failure
+- reconstruction mismatch rejection
+- deterministic ordering behavior
+- two-phase fees:
+  - per-transaction granularity
+  - cross-proposer cumulative payer accounting
+  - nonce minimum-rent edge case
+  - phase-B no re-deduction
+- end-to-end integration: small deterministic MCP slot flow
 
 ---
 
-## New Files
+## Modified Files (expected)
 
-| File | Contents |
-|---|---|
-| `ledger/src/mcp.rs` | Constants (SHRED_DATA_BYTES=863, MAX_PROPOSER_PAYLOAD=34520), wire types (McpPayload, RelayAttestation, AggregateAttestation, ConsensusBlock), reconstruct_batch(), order_transactions() |
-| `ledger/src/mcp_merkle.rs` | MCP-specific Merkle tree with 1-byte prefixes (0x00/0x01) and 32-byte proof entries per spec section 6 |
-| `ledger/src/shred/mcp_shred.rs` | MCP shred wire format, parse/serialize, is_mcp_shred_packet(), verify signature + witness |
-| `core/src/mcp_replay.rs` | MCP replay logic: attestation aggregation, ConsensusBlock validation, vote gate, reconstruction, two-phase execution. Called from replay_stage main loop. |
+New files:
+- `ledger/src/mcp.rs`
+- `ledger/src/mcp_merkle.rs`
+- `ledger/src/shred/mcp_shred.rs`
+- `core/src/mcp_replay.rs`
+- `core/src/mcp_quic.rs` (or equivalent small helper)
 
-## Modified Files
+Modified files:
+- `feature-set/src/lib.rs`
+- `ledger/src/leader_schedule.rs`
+- `ledger/src/leader_schedule_cache.rs`
+- `ledger/src/leader_schedule_utils.rs`
+- `ledger/src/blockstore/column.rs`
+- `ledger/src/blockstore_db.rs`
+- `ledger/src/blockstore.rs`
+- `ledger/src/blockstore/blockstore_purge.rs`
+- `turbine/src/sigverify_shreds.rs`
+- `core/src/window_service.rs`
+- `core/src/ed25519_sigverifier.rs`
+- `core/src/vortexor_receiver_adapter.rs`
+- `core/src/forwarding_stage.rs`
+- `core/src/next_leader.rs`
+- `gossip/src/contact_info.rs`
+- `gossip/src/node.rs`
+- `gossip/src/cluster_info.rs`
+- `core/src/tvu.rs`
+- `core/src/tpu.rs`
+- `core/src/replay_stage.rs`
+- `ledger/src/blockstore_processor.rs`
+- `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
+- `svm/src/transaction_processor.rs` (fee-mode plumbing)
+- `core/src/validator.rs` (socket wiring)
 
-| File | Change |
-|---|---|
-| `feature-set/src/lib.rs` | `mcp_protocol_v1` feature ID + FEATURE_NAMES |
-| `ledger/src/leader_schedule.rs` | `stake_weighted_slot_schedule()` with domain-separated seed |
-| `ledger/src/leader_schedule_cache.rs` | proposer/relay schedule caches + query methods |
-| `ledger/src/leader_schedule_utils.rs` | `mcp_proposer_schedule()`, `mcp_relay_schedule()` |
-| `ledger/src/blockstore/column.rs` | `McpShredData`, `McpRelayAttestation` column types |
-| `ledger/src/blockstore_db.rs` | Register MCP CFs in `cf_descriptors()` and `columns()` array |
-| `ledger/src/blockstore.rs` | MCP column fields, `do_open()` init, put/get APIs |
-| `ledger/src/blockstore/blockstore_purge.rs` | Add MCP CFs to `purge_range()` and `purge_files_in_range()` (prevents data leaks) |
-| `turbine/src/sigverify_shreds.rs` | Partition MCP packets at receipt (line 162) BEFORE dedup (line 190), GPU verify (line 437), and resign (line 220); CPU-only MCP verification path |
-| `core/src/window_service.rs` | Partition at raw Payload bytes (line 213 handle_shred closure) BEFORE Agave deserialization at line 220; MCP storage + tracking; Rayon-safe attestation collection |
-| `core/src/ed25519_sigverifier.rs` | Add `mcp_proposer_sender` to `TransactionSigVerifier`; clone in `send_packets()` at line 56. Note: Vortexor adapter also needs clone or MCP disabled when Vortexor active |
-| `core/src/forwarding_stage.rs` | Route transactions to proposers instead of leader when MCP active; add `LeaderScheduleCache` access for `proposers_at_slot()` |
-| `gossip/src/contact_info.rs` | `SOCKET_TAG_MCP = 14`, bump cache size to 15, getter/setter/remover macros |
-| `gossip/src/node.rs` | Bind MCP socket, publish in ContactInfo, add to Sockets |
-| `gossip/src/cluster_info.rs` | Add MCP socket to `Sockets` struct |
-| `core/src/tvu.rs` | Single "solMcp" QUIC endpoint with message type multiplexing (attestations, ConsensusBlocks, requests/responses) + channels to replay |
-| `core/src/tpu.rs` | MCP proposer channel creation + proposer loop thread |
-| `core/src/banking_stage/qos_service.rs` | CU limits / NUM_PROPOSERS |
-| `core/src/replay_stage.rs` | `mcp_attestation_receiver` + `mcp_consensus_block_receiver` in ReplayReceivers; calls `mcp_replay::drain_attestations()` and `mcp_replay::process_consensus_block()` (~20 lines diff) |
-| `ledger/src/blockstore_processor.rs` | `confirm_slot_mcp()` with two-phase fee execution (Phase A per-tx fee debit via store_account + Phase B with zero_fees_for_test) |
-| `runtime/src/bank/check_transactions.rs` | Check `skip_fee_deduction` flag, pass `zero_fees_for_test: true` to `calculate_fee_details()` |
-| `svm/src/transaction_processor.rs` | Add `skip_fee_deduction: bool` to `TransactionProcessingEnvironment` |
-| `validator/src/commands/run/execute.rs` | Wire MCP attestation + consensus sockets from `Node` through to `TvuSockets` / `Tvu::new()` |
+---
 
-## Dependency Graph
+## Dependency Order
 
-```
-Pass 1 (types+merkle) ──┐
-Pass 2 (schedules)  ────┤── can parallelize
-Pass 3.1-3.2 (storage)──┘
-       │
-Pass 3.3 (sigverify) ── depends on Pass 1 + Pass 2 (needs schedule cache for proposer pubkey lookup)
-       │
-Pass 4 (window+relay+retransmit) -> Pass 5 (proposer+forwarding) -> Pass 6 (leader) -> Pass 7 (vote+replay)
-```
+- Passes 1, 2, and 3.1/3.2 can proceed in parallel.
+- Pass 3.3 depends on 1 + 2.
+- Pass 4 depends on 1 + 2 + 3.
+- Pass 5 depends on 1 + 2 + 4.
+- Pass 6 depends on 1 + 2 + 4.
+- Pass 7 depends on 1 + 2 + 3 + 6.
 
-Note: Pass 3 is split. Storage (3.1-3.2) can parallelize with Pass 1 and 2. Sigverify (3.3) depends on both Pass 1 (MCP types + Merkle verification) and Pass 2 (schedule cache for `proposers_at_slot()` lookup).
+## Acceptance Invariants
+
+- No MCP packet is parsed by Agave shred wire parsers.
+- No MCP state transition occurs without feature gate active.
+- All threshold checks use ceil-threshold logic with `NUM_RELAYS=200`.
+- Replay and vote gate use the same attestation filtering rules.
+- Unknown versions, unsorted entries, duplicate entries, invalid signatures/proofs are rejected deterministically.
