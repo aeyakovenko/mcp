@@ -1,8 +1,4 @@
-use {
-    crate::mcp,
-    reed_solomon_erasure::galois_8::ReedSolomon,
-    solana_sha256_hasher::hashv,
-};
+use {crate::mcp, reed_solomon_erasure::galois_8::ReedSolomon, solana_sha256_hasher::hashv};
 
 pub const MCP_RECON_DATA_SHREDS: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
 pub const MCP_RECON_CODING_SHREDS: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
@@ -24,6 +20,8 @@ pub enum McpReconstructionError {
     ConflictingShard(usize),
     #[error("commitment mismatch")]
     CommitmentMismatch,
+    #[error("reconstruction state is poisoned after commitment mismatch")]
+    PoisonedState,
     #[error("commitment root requires at least one shred")]
     EmptyShredSet,
     #[error("too many shreds for u32 indices: {0}")]
@@ -45,6 +43,7 @@ pub struct McpReconstructionState {
     payload_len: usize,
     expected_commitment: [u8; 32],
     shards: Vec<Option<[u8; MCP_RECON_SHRED_BYTES]>>,
+    poisoned: bool,
 }
 
 impl McpReconstructionState {
@@ -63,6 +62,7 @@ impl McpReconstructionState {
             payload_len,
             expected_commitment,
             shards: vec![None; MCP_RECON_NUM_SHREDS],
+            poisoned: false,
         })
     }
 
@@ -75,6 +75,9 @@ impl McpReconstructionState {
         shred_index: usize,
         shred_data: [u8; MCP_RECON_SHRED_BYTES],
     ) -> Result<(), McpReconstructionError> {
+        if self.poisoned {
+            return Err(McpReconstructionError::PoisonedState);
+        }
         if shred_index >= MCP_RECON_NUM_SHREDS {
             return Err(McpReconstructionError::InvalidShredIndex(shred_index));
         }
@@ -91,6 +94,9 @@ impl McpReconstructionState {
     }
 
     pub fn try_reconstruct(&mut self) -> Result<McpReconstructionAttempt, McpReconstructionError> {
+        if self.poisoned {
+            return Err(McpReconstructionError::PoisonedState);
+        }
         let present = self.present_shards();
         if present < MCP_RECON_DATA_SHREDS {
             return Ok(McpReconstructionAttempt::Pending {
@@ -99,13 +105,20 @@ impl McpReconstructionState {
             });
         }
 
-        let payload = reconstruct_payload(
+        let payload = match reconstruct_payload(
             self.slot,
             self.proposer_index,
             self.payload_len,
             self.expected_commitment,
             &mut self.shards,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(McpReconstructionError::CommitmentMismatch) => {
+                self.poisoned = true;
+                return Err(McpReconstructionError::CommitmentMismatch);
+            }
+            Err(err) => return Err(err),
+        };
         Ok(McpReconstructionAttempt::Reconstructed(payload))
     }
 
@@ -144,10 +157,8 @@ pub fn reconstruct_payload(
         });
     }
 
-    let mut rs_shards: Vec<Option<Vec<u8>>> = shards
-        .iter()
-        .map(|shard| shard.map(Vec::from))
-        .collect();
+    let mut rs_shards: Vec<Option<Vec<u8>>> =
+        shards.iter().map(|shard| shard.map(Vec::from)).collect();
     ReedSolomon::new(MCP_RECON_DATA_SHREDS, MCP_RECON_CODING_SHREDS)
         .map_err(|err| McpReconstructionError::ReedSolomon(err.to_string()))?
         .reconstruct(&mut rs_shards)
@@ -397,8 +408,37 @@ mod tests {
 
         let first = state.try_reconstruct().unwrap();
         let second = state.try_reconstruct().unwrap();
-        assert_eq!(first, McpReconstructionAttempt::Reconstructed(payload.clone()));
+        assert_eq!(
+            first,
+            McpReconstructionAttempt::Reconstructed(payload.clone())
+        );
         assert_eq!(second, McpReconstructionAttempt::Reconstructed(payload));
+    }
+
+    #[test]
+    fn test_state_is_poisoned_after_commitment_mismatch() {
+        let payload: Vec<u8> = (0..4_000).map(|i| (i % 256) as u8).collect();
+        let mut shreds = encode_payload(&payload);
+        let root = commitment_root(31, 2, &shreds).unwrap();
+        shreds[0][0] ^= 1;
+
+        let mut state = McpReconstructionState::new(31, 2, payload.len(), root).unwrap();
+        for i in 0..MCP_RECON_DATA_SHREDS {
+            state.insert_shard(i, shreds[i]).unwrap();
+        }
+
+        assert_eq!(
+            state.try_reconstruct().unwrap_err(),
+            McpReconstructionError::CommitmentMismatch
+        );
+        assert_eq!(
+            state.try_reconstruct().unwrap_err(),
+            McpReconstructionError::PoisonedState
+        );
+        assert_eq!(
+            state.insert_shard(0, shreds[0]).unwrap_err(),
+            McpReconstructionError::PoisonedState
+        );
     }
 
     #[test]
