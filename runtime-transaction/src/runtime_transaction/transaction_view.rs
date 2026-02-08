@@ -6,6 +6,7 @@ use {
         transaction_with_meta::TransactionWithMeta,
     },
     agave_transaction_view::{
+        mcp_transaction::McpTransaction,
         resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
     },
@@ -64,6 +65,14 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
         );
         let compute_budget_instruction_details =
             ComputeBudgetInstructionDetails::try_from(transaction.program_instructions_iter())?;
+        let mcp_fee_components = McpTransaction::from_bytes_compat(transaction.data())
+            .ok()
+            .map(|mcp_tx| {
+                (
+                    u64::from(mcp_tx.inclusion_fee().unwrap_or_default()),
+                    u64::from(mcp_tx.ordering_fee().unwrap_or_default()),
+                )
+            });
 
         Ok(Self {
             transaction,
@@ -73,6 +82,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
                 signature_details,
                 compute_budget_instruction_details,
                 instruction_data_len,
+                mcp_fee_components,
             },
         })
     }

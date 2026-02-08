@@ -1,5 +1,6 @@
 use {solana_pubkey::Pubkey, solana_signature::Signature};
 
+pub const MCP_TX_LATEST_VERSION: u8 = 1;
 pub const MCP_TX_CONFIG_BIT_INCLUSION_FEE: u8 = 0;
 pub const MCP_TX_CONFIG_BIT_ORDERING_FEE: u8 = 1;
 pub const MCP_TX_CONFIG_BIT_COMPUTE_UNIT_LIMIT: u8 = 2;
@@ -52,9 +53,24 @@ pub enum McpTransactionParseError {
 
 impl McpTransaction {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
-        let mut offset = 0usize;
+        Self::parse_inner(bytes, true)
+    }
 
-        let version = take_u8(bytes, &mut offset)?;
+    pub fn from_legacy_bytes(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
+        Self::parse_inner(bytes, false)
+    }
+
+    pub fn from_bytes_compat(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
+        Self::from_bytes(bytes).or_else(|_| Self::from_legacy_bytes(bytes))
+    }
+
+    fn parse_inner(bytes: &[u8], has_version_prefix: bool) -> Result<Self, McpTransactionParseError> {
+        let mut offset = 0usize;
+        let version = if has_version_prefix {
+            take_u8(bytes, &mut offset)?
+        } else {
+            MCP_TX_LATEST_VERSION
+        };
         let num_required_signatures = take_u8(bytes, &mut offset)?;
         let num_readonly_signed = take_u8(bytes, &mut offset)?;
         let num_readonly_unsigned = take_u8(bytes, &mut offset)?;
@@ -129,7 +145,8 @@ impl McpTransaction {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(self.version);
+        // Always emit latest format on serialization.
+        bytes.push(MCP_TX_LATEST_VERSION);
         bytes.push(self.legacy_header.num_required_signatures);
         bytes.push(self.legacy_header.num_readonly_signed);
         bytes.push(self.legacy_header.num_readonly_unsigned);
@@ -229,7 +246,7 @@ mod tests {
             | (1u32 << MCP_TX_CONFIG_BIT_ORDERING_FEE)
             | (1u32 << MCP_TX_CONFIG_BIT_TARGET_PROPOSER);
         McpTransaction {
-            version: 1,
+            version: MCP_TX_LATEST_VERSION,
             legacy_header: LegacyHeader {
                 num_required_signatures: 2,
                 num_readonly_signed: 0,
@@ -296,5 +313,20 @@ mod tests {
             McpTransaction::from_bytes(&bytes),
             Err(McpTransactionParseError::TrailingBytes)
         );
+    }
+
+    #[test]
+    fn test_legacy_parse_is_accepted_and_serialized_as_latest() {
+        let tx = sample_transaction();
+        let latest = tx.to_bytes();
+        // Legacy encoding omits version prefix.
+        let legacy = latest[1..].to_vec();
+
+        let parsed = McpTransaction::from_bytes_compat(&legacy).unwrap();
+        assert_eq!(parsed.version, MCP_TX_LATEST_VERSION);
+        assert_eq!(parsed.inclusion_fee(), Some(7));
+        assert_eq!(parsed.ordering_fee(), Some(11));
+        assert_eq!(parsed.target_proposer(), Some(42));
+        assert_eq!(parsed.to_bytes(), latest);
     }
 }

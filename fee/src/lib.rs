@@ -89,8 +89,18 @@ pub fn apply_mcp_fee_components(
         return base;
     };
 
-    let inclusion_fee = u64::from(mcp_transaction.inclusion_fee().unwrap_or_default());
-    let ordering_fee = u64::from(mcp_transaction.ordering_fee().unwrap_or_default());
+    apply_mcp_fee_component_values(
+        base,
+        u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
+        u64::from(mcp_transaction.ordering_fee().unwrap_or_default()),
+    )
+}
+
+pub fn apply_mcp_fee_component_values(
+    base: FeeDetails,
+    inclusion_fee: u64,
+    ordering_fee: u64,
+) -> FeeDetails {
     FeeDetails::new(
         base.transaction_fee().saturating_add(inclusion_fee),
         base.prioritization_fee().saturating_add(ordering_fee),
@@ -238,5 +248,14 @@ mod tests {
     fn test_apply_mcp_fee_components_is_noop_without_mcp_tx() {
         let base = FeeDetails::new(55, 44);
         assert_eq!(apply_mcp_fee_components(base, None), base);
+    }
+
+    #[test]
+    fn test_apply_mcp_fee_component_values_adds_fee_components() {
+        let base = FeeDetails::new(9, 4);
+        let updated = apply_mcp_fee_component_values(base, 6, 2);
+        assert_eq!(updated.transaction_fee(), 15);
+        assert_eq!(updated.prioritization_fee(), 6);
+        assert_eq!(updated.total_fee(), 21);
     }
 }

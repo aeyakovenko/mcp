@@ -3,7 +3,7 @@ use {
     crate::bank::CollectorFeeDetails,
     log::debug,
     solana_account::{ReadableAccount, WritableAccount},
-    solana_fee::FeeFeatures,
+    solana_fee::{apply_mcp_fee_component_values, FeeFeatures},
     solana_fee_structure::FeeBudgetLimits,
     solana_pubkey::Pubkey,
     solana_reward_info::{RewardInfo, RewardType},
@@ -75,6 +75,11 @@ impl Bank {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(self.feature_set.as_ref()),
         );
+        let fee_details = transaction
+            .mcp_fee_components()
+            .map_or(fee_details, |(inclusion_fee, ordering_fee)| {
+                apply_mcp_fee_component_values(fee_details, inclusion_fee, ordering_fee)
+            });
         let FeeDistribution {
             deposit: reward,
             burn: _,

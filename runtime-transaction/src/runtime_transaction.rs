@@ -57,6 +57,9 @@ impl<T> StaticMeta for RuntimeTransaction<T> {
     fn instruction_data_len(&self) -> u16 {
         self.meta.instruction_data_len
     }
+    fn mcp_fee_components(&self) -> Option<(u64, u64)> {
+        self.meta.mcp_fee_components
+    }
 }
 
 impl<T: SVMMessage> DynamicMeta for RuntimeTransaction<T> {}
