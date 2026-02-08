@@ -73,8 +73,6 @@ impl LeaderScheduleCache {
             .get_leader_schedule_epoch(root_bank.slot());
         for epoch in 0..leader_schedule_epoch {
             cache.compute_epoch_schedule(epoch, root_bank);
-            cache.compute_epoch_mcp_schedule(epoch, root_bank, McpScheduleKind::Proposer);
-            cache.compute_epoch_mcp_schedule(epoch, root_bank, McpScheduleKind::Relay);
         }
         cache
     }
@@ -104,8 +102,6 @@ impl LeaderScheduleCache {
         // Calculate the epoch as soon as it's rooted
         if new_max_epoch > old_max_epoch {
             self.compute_epoch_schedule(new_max_epoch, root_bank);
-            self.compute_epoch_mcp_schedule(new_max_epoch, root_bank, McpScheduleKind::Proposer);
-            self.compute_epoch_mcp_schedule(new_max_epoch, root_bank, McpScheduleKind::Relay);
         }
     }
 

@@ -53,6 +53,7 @@ pub struct StandardBroadcastRun {
     reed_solomon_cache: Arc<ReedSolomonCache>,
     migration_status: Arc<MigrationStatus>,
     mcp_dispatch_state: Arc<Mutex<HashMap<Slot, McpSlotDispatchState>>>,
+    mcp_leader_schedule_cache: Arc<Mutex<Option<LeaderScheduleCache>>>,
 }
 
 #[derive(Debug)]
@@ -64,8 +65,11 @@ enum BroadcastError {
 struct McpSlotDispatchState {
     seen_batches: usize,
     expected_batches: Option<usize>,
-    shred_payloads: Vec<[u8; mcp_proposer::MCP_SHRED_DATA_BYTES]>,
+    payload_bytes: Vec<u8>,
 }
+
+const MCP_DISPATCH_STATE_MAX_SLOTS: usize = 1024;
+const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
 
 impl StandardBroadcastRun {
     pub(super) fn new(shred_version: u16, migration_status: Arc<MigrationStatus>) -> Self {
@@ -94,6 +98,7 @@ impl StandardBroadcastRun {
             reed_solomon_cache: Arc::<ReedSolomonCache>::default(),
             migration_status,
             mcp_dispatch_state: Arc::default(),
+            mcp_leader_schedule_cache: Arc::default(),
         }
     }
 
@@ -580,7 +585,7 @@ impl StandardBroadcastRun {
             return;
         };
         let slot = batch_info.slot;
-        let (feature_active, working_bank) = {
+        let (feature_active, working_bank, root_slot) = {
             let bank_forks = bank_forks.read().unwrap();
             let bank = bank_forks
                 .get(slot)
@@ -588,63 +593,82 @@ impl StandardBroadcastRun {
             let feature_active = bank
                 .feature_set
                 .is_active(&feature_set::mcp_protocol_v1::id());
-            (feature_active, bank)
+            (feature_active, bank, bank_forks.root())
         };
         if !feature_active {
             return;
         }
 
-        let maybe_shred_payloads = {
+        let maybe_payload_bytes = {
             let mut state = self.mcp_dispatch_state.lock().unwrap();
+            let min_retained_slot = root_slot.saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
+            state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
+            if state.len() >= MCP_DISPATCH_STATE_MAX_SLOTS && !state.contains_key(&slot) {
+                if let Some(oldest_slot) = state.keys().min().copied() {
+                    state.remove(&oldest_slot);
+                }
+            }
             let slot_state = state.entry(slot).or_default();
             slot_state.seen_batches = slot_state.seen_batches.saturating_add(1);
             if let Some(num_expected_batches) = batch_info.num_expected_batches {
                 slot_state.expected_batches = Some(num_expected_batches);
             }
             for shred in shreds {
-                if slot_state.shred_payloads.len() == mcp_proposer::MCP_NUM_RELAYS {
+                if shred.shred_type() != ShredType::Data {
+                    continue;
+                }
+                let remaining =
+                    mcp_proposer::MCP_MAX_PAYLOAD_SIZE.saturating_sub(slot_state.payload_bytes.len());
+                if remaining == 0 {
                     break;
                 }
+                let shred_payload = shred.payload().as_ref();
+                let copy_len = remaining.min(shred_payload.len());
                 slot_state
-                    .shred_payloads
-                    .push(mcp_proposer::payload_to_mcp_shred_data(
-                        shred.payload().as_ref(),
-                    ));
+                    .payload_bytes
+                    .extend_from_slice(&shred_payload[..copy_len]);
             }
             let is_slot_complete = slot_state
                 .expected_batches
                 .map(|num_expected_batches| slot_state.seen_batches >= num_expected_batches)
                 .unwrap_or(false);
             if is_slot_complete {
-                state
-                    .remove(&slot)
-                    .map(|slot_state| slot_state.shred_payloads)
+                state.remove(&slot).map(|slot_state| slot_state.payload_bytes)
             } else {
                 None
             }
         };
-        let Some(shred_payloads) = maybe_shred_payloads else {
+        let Some(payload_bytes) = maybe_payload_bytes else {
             return;
         };
-        if shred_payloads.len() != mcp_proposer::MCP_NUM_RELAYS {
-            warn!(
-                "MCP proposer dispatch skipped for slot {}: expected {} shreds, collected {}",
-                slot,
-                mcp_proposer::MCP_NUM_RELAYS,
-                shred_payloads.len(),
-            );
+        if payload_bytes.is_empty() {
+            warn!("MCP proposer dispatch skipped for slot {slot}: empty payload");
             return;
         }
+        let shred_payloads = match mcp_proposer::encode_payload_to_mcp_shreds(&payload_bytes) {
+            Ok(shreds) => shreds,
+            Err(err) => {
+                warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
+                return;
+            }
+        };
 
         let identity = cluster_info.id();
-        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&working_bank);
-        let proposer_indices =
-            leader_schedule_cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank));
+        let (proposer_indices, relay_schedule) = {
+            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
+            let cache = cache
+                .get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&working_bank));
+            cache.set_root(&working_bank);
+            (
+                cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
+                cache.relays_at_slot(slot, Some(&working_bank)),
+            )
+        };
         if proposer_indices.is_empty() {
             return;
         }
 
-        let relay_schedule = match leader_schedule_cache.relays_at_slot(slot, Some(&working_bank)) {
+        let relay_schedule = match relay_schedule {
             Some(relays) => relays,
             None => {
                 warn!("MCP proposer dispatch skipped for slot {slot}: relay schedule unavailable");
@@ -669,17 +693,23 @@ impl StandardBroadcastRun {
                     .flatten()
             })
             .collect();
-        if relay_addrs.iter().any(Option::is_none) {
-            let available = relay_addrs.iter().filter(|addr| addr.is_some()).count();
+        let available = relay_addrs.iter().filter(|addr| addr.is_some()).count();
+        if available == 0 {
             warn!(
-                "MCP proposer dispatch skipped for slot {}: only {} of {} scheduled relays have QUIC addresses",
+                "MCP proposer dispatch skipped for slot {}: none of {} scheduled relays have QUIC addresses",
                 slot,
-                available,
                 mcp_proposer::MCP_NUM_RELAYS,
             );
             return;
         }
-        let relay_addrs: Vec<_> = relay_addrs.into_iter().flatten().collect();
+        if available < mcp_proposer::MCP_NUM_RELAYS {
+            warn!(
+                "MCP proposer dispatch slot {}: {} of {} scheduled relays have QUIC addresses",
+                slot,
+                available,
+                mcp_proposer::MCP_NUM_RELAYS,
+            );
+        }
 
         let proposer_keypair = {
             let keypair = cluster_info.keypair();
@@ -699,8 +729,11 @@ impl StandardBroadcastRun {
                 }
             };
             for (relay_addr, message) in relay_addrs.iter().zip(messages.iter()) {
+                let Some(relay_addr) = relay_addr else {
+                    continue;
+                };
                 if quic_endpoint_sender
-                    .blocking_send((*relay_addr, Bytes::copy_from_slice(message)))
+                    .try_send((*relay_addr, Bytes::copy_from_slice(message)))
                     .is_err()
                 {
                     warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");

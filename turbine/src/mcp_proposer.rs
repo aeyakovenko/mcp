@@ -1,4 +1,8 @@
 use {
+    solana_ledger::{
+        mcp,
+        mcp_erasure::{encode_fec_set, McpErasureError, MCP_MAX_PAYLOAD_BYTES},
+    },
     solana_clock::Slot,
     solana_keypair::Keypair,
     solana_sha256_hasher::hashv,
@@ -7,9 +11,10 @@ use {
     thiserror::Error,
 };
 
-pub(crate) const MCP_NUM_RELAYS: usize = 200;
-pub(crate) const MCP_SHRED_DATA_BYTES: usize = 863;
-pub(crate) const MCP_WITNESS_LEN: usize = mcp_witness_len(MCP_NUM_RELAYS);
+pub(crate) const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
+pub(crate) const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
+pub(crate) const MCP_WITNESS_LEN: usize = mcp::MCP_WITNESS_LEN;
+pub(crate) const MCP_MAX_PAYLOAD_SIZE: usize = MCP_MAX_PAYLOAD_BYTES;
 pub(crate) const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
     + std::mem::size_of::<u32>() // proposer_index
     + std::mem::size_of::<u32>() // shred_index
@@ -22,27 +27,18 @@ pub(crate) const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
 const LEAF_DOMAIN: [u8; 1] = [0x00];
 const NODE_DOMAIN: [u8; 1] = [0x01];
 
-const fn mcp_witness_len(num_relays: usize) -> usize {
-    let mut width = 1usize;
-    let mut depth = 0usize;
-    while width < num_relays {
-        width <<= 1;
-        depth += 1;
-    }
-    depth
-}
-
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum McpProposerError {
     #[error("shred list size mismatch: expected {expected}, got {actual}")]
     ShredCountMismatch { expected: usize, actual: usize },
+    #[error("failed to encode MCP RS shreds: {0}")]
+    Erasure(McpErasureError),
 }
 
-pub(crate) fn payload_to_mcp_shred_data(payload: &[u8]) -> [u8; MCP_SHRED_DATA_BYTES] {
-    let mut shred_data = [0u8; MCP_SHRED_DATA_BYTES];
-    let copy_len = payload.len().min(MCP_SHRED_DATA_BYTES);
-    shred_data[..copy_len].copy_from_slice(&payload[..copy_len]);
-    shred_data
+pub(crate) fn encode_payload_to_mcp_shreds(
+    payload: &[u8],
+) -> Result<Vec<[u8; MCP_SHRED_DATA_BYTES]>, McpProposerError> {
+    encode_fec_set(payload).map_err(McpProposerError::Erasure)
 }
 
 pub(crate) fn build_shred_messages(
@@ -274,10 +270,10 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_to_mcp_shred_data_is_fixed_width() {
-        let payload = vec![9u8; MCP_SHRED_DATA_BYTES + 50];
-        let shred_data = payload_to_mcp_shred_data(&payload);
-        assert_eq!(shred_data.len(), MCP_SHRED_DATA_BYTES);
-        assert!(shred_data.iter().all(|byte| *byte == 9));
+    fn test_encode_payload_to_mcp_shreds_emits_200_shards() {
+        let payload = vec![9u8; MCP_MAX_PAYLOAD_SIZE];
+        let shreds = encode_payload_to_mcp_shreds(&payload).unwrap();
+        assert_eq!(shreds.len(), MCP_NUM_RELAYS);
+        assert!(shreds.iter().all(|shred| shred.len() == MCP_SHRED_DATA_BYTES));
     }
 }
