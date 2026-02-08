@@ -1,4 +1,4 @@
-use {crate::mcp, reed_solomon_erasure::galois_8::ReedSolomon, solana_sha256_hasher::hashv};
+use {crate::{mcp, mcp_merkle}, reed_solomon_erasure::galois_8::ReedSolomon};
 
 pub const MCP_RECON_DATA_SHREDS: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
 pub const MCP_RECON_CODING_SHREDS: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
@@ -200,40 +200,19 @@ pub fn commitment_root(
     proposer_index: u32,
     shreds: &[[u8; MCP_RECON_SHRED_BYTES]],
 ) -> Result<[u8; 32], McpReconstructionError> {
-    if shreds.is_empty() {
-        return Err(McpReconstructionError::EmptyShredSet);
-    }
-    if shreds.len() > u32::MAX as usize {
-        return Err(McpReconstructionError::TooManyShreds(shreds.len()));
-    }
-    let mut level: Vec<[u8; 32]> = shreds
-        .iter()
-        .enumerate()
-        .map(|(shred_index, shred_data)| {
-            let shred_index = u32::try_from(shred_index)
-                .map_err(|_| McpReconstructionError::TooManyShreds(shreds.len()))?;
-            Ok(hashv(&[
-                &[0x00],
-                &slot.to_le_bytes(),
-                &proposer_index.to_le_bytes(),
-                &shred_index.to_le_bytes(),
-                shred_data,
-            ])
-            .to_bytes())
-        })
-        .collect::<Result<Vec<_>, McpReconstructionError>>()?;
+    mcp_merkle::commitment_root(slot, proposer_index, shreds).map_err(map_merkle_error)
+}
 
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(left);
-            next.push(hashv(&[&[0x01], &left, &right]).to_bytes());
+fn map_merkle_error(err: mcp_merkle::McpMerkleError) -> McpReconstructionError {
+    match err {
+        mcp_merkle::McpMerkleError::EmptyShredSet => McpReconstructionError::EmptyShredSet,
+        mcp_merkle::McpMerkleError::TooManyShreds(count) => {
+            McpReconstructionError::TooManyShreds(count)
         }
-        level = next;
+        mcp_merkle::McpMerkleError::InvalidWitnessLength { .. } => {
+            unreachable!("reconstruction commitment_root does not verify witnesses")
+        }
     }
-
-    Ok(level[0])
 }
 
 #[cfg(test)]
