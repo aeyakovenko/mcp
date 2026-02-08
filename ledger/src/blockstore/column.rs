@@ -174,6 +174,16 @@ pub mod columns {
     pub struct AlternateShredData;
 
     #[derive(Debug)]
+    /// The MCP execution output column.
+    ///
+    /// Stores ordered MCP execution output bytes for each slot. Empty output is
+    /// represented by an empty byte vector.
+    ///
+    /// * index type: `u64` (see [`SlotColumn`])
+    /// * value type: [`Vec<u8>`]
+    pub struct McpExecutionOutput;
+
+    #[derive(Debug)]
     /// The transaction status column
     ///
     /// * index type: `(`[`Signature`]`, `[`Slot`])`
@@ -770,6 +780,11 @@ impl Column for columns::AlternateShredData {
 }
 impl ColumnName for columns::AlternateShredData {
     const NAME: &'static str = "alt_data_shred";
+}
+
+impl SlotColumn for columns::McpExecutionOutput {}
+impl ColumnName for columns::McpExecutionOutput {
+    const NAME: &'static str = "mcp_execution_output";
 }
 
 impl SlotColumn for columns::Index {}
