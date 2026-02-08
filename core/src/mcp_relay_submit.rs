@@ -3,7 +3,17 @@ use {
     bytes::Bytes,
     solana_clock::Slot,
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
-    solana_ledger::{leader_schedule_cache::LeaderScheduleCache, mcp},
+    solana_hash::Hash,
+    solana_ledger::{
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp,
+        mcp_relay_attestation::{
+            RelayAttestation as LedgerRelayAttestation,
+            RelayAttestationEntry as LedgerRelayAttestationEntry,
+            RelayAttestationError as LedgerRelayAttestationError,
+            RELAY_ATTESTATION_V1,
+        },
+    },
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
@@ -13,7 +23,7 @@ use {
 };
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
-pub const RELAY_ATTESTATION_VERSION_V1: u8 = 1;
+pub const RELAY_ATTESTATION_VERSION_V1: u8 = RELAY_ATTESTATION_V1;
 pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
     + 8
     + 4
@@ -103,111 +113,24 @@ impl RelayAttestationV1 {
     }
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, RelaySubmitError> {
-        Self::validate_entries(&self.entries)?;
-        let mut bytes =
-            Vec::with_capacity(1 + 8 + 4 + 1 + self.entries.len() * (4 + 32 + SIGNATURE_BYTES));
-        bytes.push(RELAY_ATTESTATION_VERSION_V1);
-        bytes.extend_from_slice(&self.slot.to_le_bytes());
-        bytes.extend_from_slice(&self.relay_index.to_le_bytes());
-        bytes.push(self.entries.len() as u8);
-        for entry in &self.entries {
-            bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
-            bytes.extend_from_slice(&entry.commitment);
-            bytes.extend_from_slice(entry.proposer_signature.as_ref());
-        }
-        Ok(bytes)
+        self.as_ledger()?.signing_bytes().map_err(map_ledger_error)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, RelaySubmitError> {
-        let mut bytes = self.signing_bytes()?;
-        bytes.extend_from_slice(self.relay_signature.as_ref());
-        Ok(bytes)
+        self.as_ledger()?.to_wire_bytes().map_err(map_ledger_error)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, RelaySubmitError> {
-        if bytes.len() < 1 + 8 + 4 + 1 + SIGNATURE_BYTES {
-            return Err(RelaySubmitError::PayloadTooShort);
-        }
-
-        let mut offset = 0usize;
-        let version = bytes[offset];
-        offset += 1;
-        if version != RELAY_ATTESTATION_VERSION_V1 {
-            return Err(RelaySubmitError::InvalidVersion(version));
-        }
-
-        let slot = Slot::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-        let relay_index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        offset += 4;
-        let entries_len = bytes[offset] as usize;
-        offset += 1;
-        if entries_len == 0 {
-            return Err(RelaySubmitError::EmptyEntries);
-        }
-        if entries_len > mcp::NUM_PROPOSERS {
-            return Err(RelaySubmitError::TooManyEntries {
-                actual: entries_len,
-                max: mcp::NUM_PROPOSERS,
-            });
-        }
-
-        let mut entries = Vec::with_capacity(entries_len);
-        let mut prev_index = None;
-        for _ in 0..entries_len {
-            if bytes.len() < offset + 4 + 32 + SIGNATURE_BYTES {
-                return Err(RelaySubmitError::PayloadTooShort);
-            }
-            let proposer_index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-            offset += 4;
-            if proposer_index as usize >= mcp::NUM_PROPOSERS {
-                return Err(RelaySubmitError::ProposerIndexOutOfRange(proposer_index));
-            }
-            if prev_index.is_some_and(|prev| proposer_index <= prev) {
-                return Err(RelaySubmitError::UnsortedOrDuplicateEntries);
-            }
-            prev_index = Some(proposer_index);
-
-            let mut commitment = [0u8; 32];
-            commitment.copy_from_slice(&bytes[offset..offset + 32]);
-            offset += 32;
-            let proposer_signature = Signature::from(
-                <[u8; SIGNATURE_BYTES]>::try_from(
-                    &bytes[offset..offset + SIGNATURE_BYTES],
-                )
-                .unwrap(),
-            );
-            offset += SIGNATURE_BYTES;
-
-            entries.push(RelayAttestationEntry {
-                proposer_index,
-                commitment,
-                proposer_signature,
-            });
-        }
-
-        if bytes.len() < offset + SIGNATURE_BYTES {
-            return Err(RelaySubmitError::PayloadTooShort);
-        }
-        let relay_signature =
-            Signature::from(<[u8; SIGNATURE_BYTES]>::try_from(&bytes[offset..offset + SIGNATURE_BYTES]).unwrap());
-        offset += SIGNATURE_BYTES;
-
-        if offset != bytes.len() {
-            return Err(RelaySubmitError::TrailingBytes);
-        }
-
-        Ok(Self {
-            slot,
-            relay_index,
-            entries,
-            relay_signature,
-        })
+        let attestation =
+            LedgerRelayAttestation::from_wire_bytes(bytes).map_err(map_ledger_error)?;
+        let out = Self::from_ledger(attestation);
+        Self::validate_entries(&out.entries)?;
+        Ok(out)
     }
 
     pub fn verify_relay_signature(&self, relay_pubkey: &Pubkey) -> bool {
-        self.signing_bytes()
-            .map(|bytes| self.relay_signature.verify(relay_pubkey.as_ref(), &bytes))
+        self.as_ledger()
+            .map(|attestation| attestation.verify_relay_signature(relay_pubkey))
             .unwrap_or(false)
     }
 
@@ -226,6 +149,59 @@ impl RelayAttestationV1 {
             })
             .cloned()
             .collect()
+    }
+
+    fn as_ledger(&self) -> Result<LedgerRelayAttestation, RelaySubmitError> {
+        Self::validate_entries(&self.entries)?;
+        Ok(LedgerRelayAttestation {
+            version: RELAY_ATTESTATION_VERSION_V1,
+            slot: self.slot,
+            relay_index: self.relay_index,
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| LedgerRelayAttestationEntry {
+                    proposer_index: entry.proposer_index,
+                    commitment: Hash::new_from_array(entry.commitment),
+                    proposer_signature: entry.proposer_signature,
+                })
+                .collect(),
+            relay_signature: self.relay_signature,
+        })
+    }
+
+    fn from_ledger(attestation: LedgerRelayAttestation) -> Self {
+        Self {
+            slot: attestation.slot,
+            relay_index: attestation.relay_index,
+            entries: attestation
+                .entries
+                .into_iter()
+                .map(|entry| RelayAttestationEntry {
+                    proposer_index: entry.proposer_index,
+                    commitment: entry.commitment.to_bytes(),
+                    proposer_signature: entry.proposer_signature,
+                })
+                .collect(),
+            relay_signature: attestation.relay_signature,
+        }
+    }
+}
+
+fn map_ledger_error(err: LedgerRelayAttestationError) -> RelaySubmitError {
+    match err {
+        LedgerRelayAttestationError::UnknownVersion(version) => {
+            RelaySubmitError::InvalidVersion(version)
+        }
+        LedgerRelayAttestationError::TooManyEntries(actual) => RelaySubmitError::TooManyEntries {
+            actual,
+            max: mcp::NUM_PROPOSERS,
+        },
+        LedgerRelayAttestationError::EntriesNotStrictlySorted => {
+            RelaySubmitError::UnsortedOrDuplicateEntries
+        }
+        LedgerRelayAttestationError::Truncated => RelaySubmitError::PayloadTooShort,
+        LedgerRelayAttestationError::TrailingBytes => RelaySubmitError::TrailingBytes,
     }
 }
 
