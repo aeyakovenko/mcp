@@ -11924,6 +11924,7 @@ dependencies = [
 name = "solana-votor"
 version = "3.1.0"
 dependencies = [
+ "agave-feature-set",
  "agave-logger",
  "anyhow",
  "bincode",
