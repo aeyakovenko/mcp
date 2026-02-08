@@ -85,7 +85,7 @@ Non-reusable for MCP wire correctness:
     - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
     - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
-    - `MAX_PROPOSER_PAYLOAD = min(NUM_RELAYS * SHRED_DATA_BYTES, DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES) = 34_520`
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (this is always `<= NUM_RELAYS * SHRED_DATA_BYTES` because `DATA_SHREDS_PER_FEC_BLOCK <= NUM_RELAYS`)
   - Types:
     - `McpPayload`
     - `RelayAttestation`
@@ -192,6 +192,7 @@ Non-reusable for MCP wire correctness:
 - `ledger/src/blockstore.rs`:
   - Add CF handles to `Blockstore`.
   - Add MCP put/get APIs.
+  - Use a dedicated MCP write lock for MCP CF read-modify-write paths (do not serialize on `insert_shreds_lock`).
   - Conflict rule for same key with different bytes:
     - do not silently overwrite
     - surface deterministic conflict marker (equivocation evidence) for replay logic
@@ -343,6 +344,7 @@ Validation rules:
 - invalid relay signature => drop relay message
 - invalid proposer signature inside relay entry => drop that entry, keep other valid entries
 - canonical aggregate ordering by `relay_index`
+- enforce aggregate and consensus wire-size upper bounds before decode
 - threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation; proposer-entry filtering does not change this relay count
 
 ### 6.3 Leader finalization
@@ -386,6 +388,9 @@ When this node is leader for slot `s` at aggregation deadline:
   6. local availability check:
      - count only locally stored shreds whose witness validates against included commitment
      - require `>= REQUIRED_RECONSTRUCTION` per included proposer
+
+Staged rollout guard:
+- replay-stage vote-gate lookups must be non-consuming; repeated evaluations for the same slot must see identical gate input.
 
 ### 7.2 Reconstruction
 
