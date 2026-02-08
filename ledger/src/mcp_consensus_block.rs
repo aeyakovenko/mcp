@@ -12,6 +12,8 @@ const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
 const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
     1 + 8 + 4 + 2 + (200 * (4 + 1 + (16 * (4 + HASH_BYTES + SIGNATURE_BYTES)) + SIGNATURE_BYTES));
 const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
+const MAX_CONSENSUS_BLOCK_WIRE_BYTES: usize =
+    HEADER_LEN + MAX_AGGREGATE_ATTESTATION_BYTES + MAX_CONSENSUS_META_BYTES + TRAILER_LEN;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBlock {
@@ -40,6 +42,8 @@ pub enum ConsensusBlockError {
     Truncated,
     #[error("consensus block has trailing bytes")]
     TrailingBytes,
+    #[error("consensus block exceeds protocol maximum: {actual} > {max}")]
+    WireBytesTooLarge { actual: usize, max: usize },
 }
 
 impl ConsensusBlock {
@@ -129,10 +133,22 @@ impl ConsensusBlock {
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
         let mut bytes = self.wire_body_bytes()?;
         bytes.extend_from_slice(self.leader_signature.as_ref());
+        if bytes.len() > MAX_CONSENSUS_BLOCK_WIRE_BYTES {
+            return Err(ConsensusBlockError::WireBytesTooLarge {
+                actual: bytes.len(),
+                max: MAX_CONSENSUS_BLOCK_WIRE_BYTES,
+            });
+        }
         Ok(bytes)
     }
 
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, ConsensusBlockError> {
+        if bytes.len() > MAX_CONSENSUS_BLOCK_WIRE_BYTES {
+            return Err(ConsensusBlockError::WireBytesTooLarge {
+                actual: bytes.len(),
+                max: MAX_CONSENSUS_BLOCK_WIRE_BYTES,
+            });
+        }
         if bytes.len() < HEADER_LEN + TRAILER_LEN {
             return Err(ConsensusBlockError::Truncated);
         }
@@ -364,6 +380,18 @@ mod tests {
             ConsensusBlockError::ConsensusMetaTooLarge {
                 actual: MAX_CONSENSUS_META_BYTES + 1,
                 max: MAX_CONSENSUS_META_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_wire_bytes_rejects_oversized_wire() {
+        let bytes = vec![0u8; MAX_CONSENSUS_BLOCK_WIRE_BYTES + 1];
+        assert_eq!(
+            ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
+            ConsensusBlockError::WireBytesTooLarge {
+                actual: MAX_CONSENSUS_BLOCK_WIRE_BYTES + 1,
+                max: MAX_CONSENSUS_BLOCK_WIRE_BYTES,
             }
         );
     }
