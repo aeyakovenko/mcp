@@ -3220,6 +3220,7 @@ impl Bank {
                     enable_return_data_recording: true,
                     enable_transaction_balance_recording: true,
                 },
+                skip_fee_collection: false,
             },
         );
 
@@ -3465,6 +3466,56 @@ impl Bank {
             processed_counts,
             balance_collector: sanitized_output.balance_collector,
         }
+    }
+
+    /// MCP fee-only pass: validate nonce/fee payer and collect fees without
+    /// executing instructions.
+    pub fn collect_fees_only_for_transactions(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Vec<Result<FeeDetails>> {
+        let sanitized_txs = batch.sanitized_transactions();
+        let check_results =
+            self.check_transactions(sanitized_txs, batch.lock_results(), max_age, error_counters);
+
+        let (blockhash, blockhash_lamports_per_signature) =
+            self.last_blockhash_and_lamports_per_signature();
+        let processing_environment = TransactionProcessingEnvironment {
+            blockhash,
+            blockhash_lamports_per_signature,
+            epoch_total_stake: self.get_current_epoch_total_stake(),
+            feature_set: self.feature_set.runtime_features(),
+            rent: self.rent_collector.rent.clone(),
+        };
+
+        self.transaction_processor
+            .collect_fees_only_sanitized_transactions(
+                self,
+                sanitized_txs,
+                check_results,
+                &processing_environment,
+            )
+    }
+
+    /// MCP second-pass helper: execute transactions without fee re-deduction.
+    pub fn load_and_execute_transactions_skip_fee_collection(
+        &self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        timings: &mut ExecuteTimings,
+        error_counters: &mut TransactionErrorMetrics,
+        mut processing_config: TransactionProcessingConfig,
+    ) -> LoadAndExecuteTransactionsOutput {
+        processing_config.skip_fee_collection = true;
+        self.load_and_execute_transactions(
+            batch,
+            max_age,
+            timings,
+            error_counters,
+            processing_config,
+        )
     }
 
     fn collect_logs(
@@ -3940,6 +3991,7 @@ impl Bank {
                 log_messages_bytes_limit,
                 limit_to_load_programs: false,
                 recording_config,
+                skip_fee_collection: false,
             },
         );
 
