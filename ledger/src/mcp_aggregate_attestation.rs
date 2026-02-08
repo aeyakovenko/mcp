@@ -1,4 +1,5 @@
 use {
+    crate::mcp,
     solana_clock::Slot,
     solana_hash::{Hash, HASH_BYTES},
     solana_pubkey::Pubkey,
@@ -61,7 +62,7 @@ impl AggregateAttestation {
         leader_index: u32,
         mut relay_entries: Vec<AggregateRelayEntry>,
     ) -> Result<Self, AggregateAttestationError> {
-        if relay_entries.len() > u16::MAX as usize {
+        if relay_entries.len() > mcp::NUM_RELAYS {
             return Err(AggregateAttestationError::TooManyRelayEntries(
                 relay_entries.len(),
             ));
@@ -69,7 +70,7 @@ impl AggregateAttestation {
 
         relay_entries.sort_unstable_by_key(|entry| entry.relay_index);
         for relay_entry in &mut relay_entries {
-            if relay_entry.entries.len() > u8::MAX as usize {
+            if relay_entry.entries.len() > mcp::NUM_PROPOSERS {
                 return Err(AggregateAttestationError::TooManyProposerEntries {
                     relay_index: relay_entry.relay_index,
                     entries_len: relay_entry.entries.len(),
@@ -137,11 +138,20 @@ impl AggregateAttestation {
         let slot = read_u64_le(bytes, &mut cursor)?;
         let leader_index = read_u32_le(bytes, &mut cursor)?;
         let relays_len = read_u16_le(bytes, &mut cursor)? as usize;
+        if relays_len > mcp::NUM_RELAYS {
+            return Err(AggregateAttestationError::TooManyRelayEntries(relays_len));
+        }
 
         let mut relay_entries = Vec::with_capacity(relays_len);
         for _ in 0..relays_len {
             let relay_index = read_u32_le(bytes, &mut cursor)?;
             let entries_len = read_u8(bytes, &mut cursor)? as usize;
+            if entries_len > mcp::NUM_PROPOSERS {
+                return Err(AggregateAttestationError::TooManyProposerEntries {
+                    relay_index,
+                    entries_len,
+                });
+            }
 
             let mut entries = Vec::with_capacity(entries_len);
             for _ in 0..entries_len {
@@ -199,27 +209,18 @@ impl AggregateAttestation {
                 if !relay_entry.verify_relay_signature(self.version, self.slot, &relay_pubkey) {
                     return None;
                 }
-
-                let entries = relay_entry
-                    .entries
-                    .iter()
-                    .filter(|entry| {
-                        proposer_pubkey_for_index(entry.proposer_index).is_some_and(
-                            |proposer_pubkey| {
-                                entry
-                                    .proposer_signature
-                                    .verify(proposer_pubkey.as_ref(), entry.commitment.as_ref())
-                            },
-                        )
+                let all_proposers_valid = relay_entry.entries.iter().all(|entry| {
+                    proposer_pubkey_for_index(entry.proposer_index).is_some_and(|proposer_pubkey| {
+                        entry
+                            .proposer_signature
+                            .verify(proposer_pubkey.as_ref(), entry.commitment.as_ref())
                     })
-                    .cloned()
-                    .collect();
+                });
+                if !all_proposers_valid || relay_entry.entries.is_empty() {
+                    return None;
+                }
 
-                Some(AggregateRelayEntry {
-                    relay_index: relay_entry.relay_index,
-                    entries,
-                    relay_signature: relay_entry.relay_signature,
-                })
+                Some(relay_entry.clone())
             })
             .collect()
     }
@@ -239,24 +240,25 @@ impl AggregateAttestation {
         let mut relay_entries =
             self.filtered_valid_entries(relay_pubkey_for_index, proposer_pubkey_for_index);
         let equivocating_proposers = collect_equivocating_proposers(&relay_entries);
-        for relay_entry in &mut relay_entries {
+        relay_entries.retain(|relay_entry| {
             relay_entry
                 .entries
-                .retain(|entry| !equivocating_proposers.contains(&entry.proposer_index));
-        }
+                .iter()
+                .all(|entry| !equivocating_proposers.contains(&entry.proposer_index))
+        });
 
         Self::new_canonical(self.slot, self.leader_index, relay_entries)
     }
 
     fn validate_for_serialize(&self) -> Result<(), AggregateAttestationError> {
-        if self.relay_entries.len() > u16::MAX as usize {
+        if self.relay_entries.len() > mcp::NUM_RELAYS {
             return Err(AggregateAttestationError::TooManyRelayEntries(
                 self.relay_entries.len(),
             ));
         }
         ensure_relay_entries_strictly_sorted(&self.relay_entries)?;
         for relay_entry in &self.relay_entries {
-            if relay_entry.entries.len() > u8::MAX as usize {
+            if relay_entry.entries.len() > mcp::NUM_PROPOSERS {
                 return Err(AggregateAttestationError::TooManyProposerEntries {
                     relay_index: relay_entry.relay_index,
                     entries_len: relay_entry.entries.len(),
@@ -269,15 +271,25 @@ impl AggregateAttestation {
 }
 
 impl AggregateRelayEntry {
-    pub fn sign<T: Signer>(&mut self, version: u8, slot: Slot, signer: &T) {
-        let signing_bytes = relay_signing_bytes(version, slot, self.relay_index, &self.entries);
+    pub fn sign<T: Signer>(
+        &mut self,
+        version: u8,
+        slot: Slot,
+        signer: &T,
+    ) -> Result<(), AggregateAttestationError> {
+        let signing_bytes =
+            relay_signing_bytes(version, slot, self.relay_index, &self.entries)?;
         self.relay_signature = signer.sign_message(&signing_bytes);
+        Ok(())
     }
 
     pub fn verify_relay_signature(&self, version: u8, slot: Slot, relay_pubkey: &Pubkey) -> bool {
-        let signing_bytes = relay_signing_bytes(version, slot, self.relay_index, &self.entries);
-        self.relay_signature
-            .verify(relay_pubkey.as_ref(), &signing_bytes)
+        relay_signing_bytes(version, slot, self.relay_index, &self.entries)
+            .map(|signing_bytes| {
+                self.relay_signature
+                    .verify(relay_pubkey.as_ref(), &signing_bytes)
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -286,7 +298,13 @@ fn relay_signing_bytes(
     slot: Slot,
     relay_index: u32,
     entries: &[AggregateProposerEntry],
-) -> Vec<u8> {
+) -> Result<Vec<u8>, AggregateAttestationError> {
+    if entries.len() > mcp::NUM_PROPOSERS {
+        return Err(AggregateAttestationError::TooManyProposerEntries {
+            relay_index,
+            entries_len: entries.len(),
+        });
+    }
     let mut out = Vec::with_capacity(1 + 8 + 4 + 1 + entries.len() * PROPOSER_ENTRY_LEN);
     out.push(version);
     out.extend_from_slice(&slot.to_le_bytes());
@@ -297,7 +315,7 @@ fn relay_signing_bytes(
         out.extend_from_slice(entry.commitment.as_ref());
         out.extend_from_slice(entry.proposer_signature.as_ref());
     }
-    out
+    Ok(out)
 }
 
 fn append_relay_entry_bytes(
@@ -425,7 +443,9 @@ mod tests {
             ],
             relay_signature: Signature::default(),
         };
-        relay_entry0.sign(AGGREGATE_ATTESTATION_V1, 55, &relay0);
+        relay_entry0
+            .sign(AGGREGATE_ATTESTATION_V1, 55, &relay0)
+            .unwrap();
 
         // Valid relay signature, but one invalid proposer signature in entries.
         let mut relay_entry1 = AggregateRelayEntry {
@@ -437,7 +457,9 @@ mod tests {
             }],
             relay_signature: Signature::default(),
         };
-        relay_entry1.sign(AGGREGATE_ATTESTATION_V1, 55, &relay1);
+        relay_entry1
+            .sign(AGGREGATE_ATTESTATION_V1, 55, &relay1)
+            .unwrap();
 
         let aggregate =
             AggregateAttestation::new_canonical(55, 3, vec![relay_entry1, relay_entry0]).unwrap();
@@ -460,11 +482,9 @@ mod tests {
             },
         );
 
-        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].relay_index, 4);
         assert_eq!(filtered[0].entries.len(), 2);
-        assert_eq!(filtered[1].relay_index, 9);
-        assert!(filtered[1].entries.is_empty());
     }
 
     #[test]
@@ -557,14 +577,18 @@ mod tests {
             entries: vec![proposer_entry.clone()],
             relay_signature: Signature::default(),
         };
-        relay_entry_a.sign(AGGREGATE_ATTESTATION_V1, 4, &relay);
+        relay_entry_a
+            .sign(AGGREGATE_ATTESTATION_V1, 4, &relay)
+            .unwrap();
 
         let mut relay_entry_b = AggregateRelayEntry {
             relay_index: 2,
             entries: vec![proposer_entry],
             relay_signature: Signature::default(),
         };
-        relay_entry_b.sign(AGGREGATE_ATTESTATION_V1, 4, &relay);
+        relay_entry_b
+            .sign(AGGREGATE_ATTESTATION_V1, 4, &relay)
+            .unwrap();
 
         let a = AggregateAttestation::new_canonical(4, 0, vec![relay_entry_a]).unwrap();
         let b = AggregateAttestation::new_canonical(4, 0, vec![relay_entry_b]).unwrap();
@@ -572,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_filtered_drops_equivocating_proposer_entries() {
+    fn test_canonical_filtered_drops_relays_with_equivocating_proposer_entries() {
         let relay0 = Keypair::new();
         let relay1 = Keypair::new();
         let proposer0 = Keypair::new();
@@ -598,7 +622,9 @@ mod tests {
             ],
             relay_signature: Signature::default(),
         };
-        relay_entry0.sign(AGGREGATE_ATTESTATION_V1, 42, &relay0);
+        relay_entry0
+            .sign(AGGREGATE_ATTESTATION_V1, 42, &relay0)
+            .unwrap();
 
         let mut relay_entry1 = AggregateRelayEntry {
             relay_index: 9,
@@ -616,7 +642,9 @@ mod tests {
             ],
             relay_signature: Signature::default(),
         };
-        relay_entry1.sign(AGGREGATE_ATTESTATION_V1, 42, &relay1);
+        relay_entry1
+            .sign(AGGREGATE_ATTESTATION_V1, 42, &relay1)
+            .unwrap();
 
         let aggregate =
             AggregateAttestation::new_canonical(42, 4, vec![relay_entry1, relay_entry0]).unwrap();
@@ -635,20 +663,50 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(filtered.relay_entries.len(), 2);
-        assert_eq!(filtered.relay_entries[0].relay_index, 2);
-        assert_eq!(filtered.relay_entries[1].relay_index, 9);
-        assert_eq!(filtered.relay_entries[0].entries.len(), 1);
-        assert_eq!(filtered.relay_entries[1].entries.len(), 1);
-        assert_eq!(filtered.relay_entries[0].entries[0].proposer_index, 1);
-        assert_eq!(filtered.relay_entries[1].entries[0].proposer_index, 1);
+        assert_eq!(filtered.relay_entries.len(), 0);
+    }
+
+    #[test]
+    fn test_from_wire_bytes_rejects_too_many_relays() {
+        let mut bytes = Vec::new();
+        bytes.push(AGGREGATE_ATTESTATION_V1);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&((mcp::NUM_RELAYS + 1) as u16).to_le_bytes());
+
         assert_eq!(
-            filtered.relay_entries[0].entries[0].commitment,
-            proposer1_commitment
+            AggregateAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            AggregateAttestationError::TooManyRelayEntries(mcp::NUM_RELAYS + 1)
         );
+    }
+
+    #[test]
+    fn test_sign_rejects_too_many_proposer_entries() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries = (0..=mcp::NUM_PROPOSERS as u32)
+            .map(|proposer_index| AggregateProposerEntry {
+                proposer_index,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            })
+            .collect();
+        let mut relay_entry = AggregateRelayEntry {
+            relay_index: 0,
+            entries,
+            relay_signature: Signature::default(),
+        };
+
+        let err = relay_entry
+            .sign(AGGREGATE_ATTESTATION_V1, 1, &relay)
+            .unwrap_err();
         assert_eq!(
-            filtered.relay_entries[1].entries[0].commitment,
-            proposer1_commitment
+            err,
+            AggregateAttestationError::TooManyProposerEntries {
+                relay_index: 0,
+                entries_len: mcp::NUM_PROPOSERS + 1,
+            }
         );
     }
 }
