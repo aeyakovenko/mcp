@@ -77,7 +77,7 @@ use {
     },
     solana_turbine::{retransmit_stage::RetransmitStage, xdp::XdpSender},
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
         sync::{atomic::AtomicBool, Arc, RwLock},
@@ -564,6 +564,15 @@ impl Tvu {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
+            leader_window_info_sender,
+            highest_parent_ready,
+            consensus_metrics_sender: consensus_metrics_sender.clone(),
+            consensus_metrics_receiver,
+            migration_status,
+            mcp_vote_gate_inputs: Arc::new(RwLock::new(HashMap::new())),
+            reward_votes_receiver,
+            build_reward_certs_receiver,
+            reward_certs_sender,
         };
 
         let voting_service = VotingService::new(
