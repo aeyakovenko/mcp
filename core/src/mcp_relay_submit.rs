@@ -1,8 +1,15 @@
 use {
+    agave_feature_set as feature_set,
+    bytes::Bytes,
     solana_clock::Slot,
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
+    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_pubkey::Pubkey,
+    solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
+    std::net::SocketAddr,
     thiserror::Error,
+    tokio::sync::mpsc::Sender as AsyncSender,
 };
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
@@ -44,6 +51,12 @@ pub enum RelaySubmitError {
     UnknownMessageType(u8),
     #[error("missing leader for slot {0}")]
     MissingLeader(Slot),
+    #[error("missing QUIC TVU address for leader {0}")]
+    MissingLeaderAddress(Pubkey),
+    #[error("MCP protocol v1 is not active for slot {slot}")]
+    FeatureNotActive { slot: Slot },
+    #[error("failed to send relay attestation frame")]
+    SendError,
 }
 
 impl RelayAttestationV1 {
@@ -188,9 +201,55 @@ where
     })
 }
 
+pub fn dispatch_relay_attestation_to_slot_leader(
+    attestation: &RelayAttestationV1,
+    leader_schedule_cache: &LeaderScheduleCache,
+    root_bank: &Bank,
+    cluster_info: &ClusterInfo,
+    quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+) -> Result<RelayAttestationDispatch, RelaySubmitError> {
+    if !root_bank
+        .feature_set
+        .is_active(&feature_set::mcp_protocol_v1::id())
+    {
+        return Err(RelaySubmitError::FeatureNotActive {
+            slot: attestation.slot,
+        });
+    }
+
+    let dispatch = build_relay_attestation_dispatch(attestation, |slot| {
+        leader_schedule_cache
+            .slot_leader_at(slot, Some(root_bank))
+            .or_else(|| leader_schedule_cache.slot_leader_at(slot, None))
+    })?;
+
+    let leader_addr = cluster_info
+        .lookup_contact_info(&dispatch.leader_pubkey, |node| node.tvu(Protocol::QUIC))
+        .flatten()
+        .ok_or(RelaySubmitError::MissingLeaderAddress(
+            dispatch.leader_pubkey,
+        ))?;
+    quic_endpoint_sender
+        .blocking_send((leader_addr, Bytes::from(dispatch.frame.clone())))
+        .map_err(|_| RelaySubmitError::SendError)?;
+
+    Ok(dispatch)
+}
+
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_keypair::Keypair, solana_signer::Signer, std::collections::HashMap};
+    use {
+        super::*,
+        solana_gossip::{cluster_info::ClusterInfo, node::Node},
+        solana_keypair::Keypair,
+        solana_ledger::{
+            genesis_utils::create_genesis_config, leader_schedule_cache::LeaderScheduleCache,
+        },
+        solana_runtime::bank::Bank,
+        solana_signer::Signer,
+        solana_streamer::socket::SocketAddrSpace,
+        std::{collections::HashMap, sync::Arc},
+    };
 
     fn signed_entry(
         proposer_index: u32,
@@ -298,5 +357,70 @@ mod tests {
     fn test_unknown_frame_type_rejected() {
         let err = decode_relay_attestation_frame(&[0x02, 0x00]).unwrap_err();
         assert_eq!(err, RelaySubmitError::UnknownMessageType(0x02));
+    }
+
+    #[test]
+    fn test_dispatch_relay_attestation_to_slot_leader_sends_quic_frame() {
+        let relay = Arc::new(Keypair::new());
+        let proposer = Keypair::new();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let mut root_bank = Bank::new_for_tests(&genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let leader_pubkey = leader_schedule_cache
+            .slot_leader_at(0, Some(&root_bank))
+            .unwrap();
+        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
+        let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
+        let cluster_info = ClusterInfo::new(relay_info, relay, SocketAddrSpace::Unspecified);
+        cluster_info.insert_info(leader_info.clone());
+
+        let attestation = signed_attestation(
+            0,
+            12,
+            vec![signed_entry(1, [7u8; 32], &proposer)],
+            &Keypair::new(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+
+        let dispatch = dispatch_relay_attestation_to_slot_leader(
+            &attestation,
+            &leader_schedule_cache,
+            &root_bank,
+            &cluster_info,
+            &sender,
+        )
+        .unwrap();
+
+        let expected_addr = leader_info.tvu(Protocol::QUIC).unwrap();
+        let (addr, frame) = receiver.try_recv().unwrap();
+        assert_eq!(addr, expected_addr);
+        assert_eq!(frame, Bytes::from(dispatch.frame.clone()));
+    }
+
+    #[test]
+    fn test_dispatch_relay_attestation_to_slot_leader_requires_feature_gate() {
+        let relay = Arc::new(Keypair::new());
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let mut root_bank = Bank::new_for_tests(&genesis_config);
+        root_bank.deactivate_feature(&feature_set::mcp_protocol_v1::id());
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let cluster_info = ClusterInfo::new(
+            Node::new_localhost_with_pubkey(&relay.pubkey()).info,
+            relay,
+            SocketAddrSpace::Unspecified,
+        );
+        let attestation = signed_attestation(0, 0, vec![], &Keypair::new());
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+
+        let err = dispatch_relay_attestation_to_slot_leader(
+            &attestation,
+            &leader_schedule_cache,
+            &root_bank,
+            &cluster_info,
+            &sender,
+        )
+        .unwrap_err();
+        assert_eq!(err, RelaySubmitError::FeatureNotActive { slot: 0 });
     }
 }
