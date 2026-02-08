@@ -69,6 +69,9 @@ pub enum PohRecorderError {
     #[error("bankless recording only allowed when no working bank is installed")]
     BanklessWorkingBankPresent,
 
+    #[error("bankless recording is disabled for this caller")]
+    BanklessRecordingDisabled,
+
     #[error("bankless recording slot mismatch: expected {expected}, got {actual}")]
     BanklessSlotMismatch { expected: Slot, actual: Slot },
 }
@@ -423,10 +426,14 @@ impl PohRecorder {
     /// requiring a working bank in PohRecorder.
     pub fn record_bankless(
         &mut self,
+        allow_bankless_recording: bool,
         slot: Slot,
         mixins: Vec<Hash>,
         transaction_batches: Vec<Vec<VersionedTransaction>>,
     ) -> Result<BanklessRecordSummary> {
+        if !allow_bankless_recording {
+            return Err(PohRecorderError::BanklessRecordingDisabled);
+        }
         if self.has_bank() {
             return Err(PohRecorderError::BanklessWorkingBankPresent);
         }
@@ -1379,6 +1386,7 @@ mod tests {
         assert!(!poh_recorder.has_bank());
         let summary = poh_recorder
             .record_bankless(
+                true,
                 bank.slot(),
                 vec![hash(&[1u8])],
                 vec![vec![test_tx().into()]],
@@ -1409,11 +1417,42 @@ mod tests {
 
         assert_matches!(
             poh_recorder.record_bankless(
+                true,
                 bank.slot().saturating_add(1),
                 vec![hash(&[1u8])],
                 vec![vec![test_tx().into()]],
             ),
             Err(PohRecorderError::BanklessSlotMismatch { .. })
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_when_disabled() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(
+                false,
+                bank.slot(),
+                vec![hash(&[1u8])],
+                vec![vec![test_tx().into()]],
+            ),
+            Err(PohRecorderError::BanklessRecordingDisabled)
         );
     }
 
