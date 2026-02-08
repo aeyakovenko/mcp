@@ -110,6 +110,7 @@ pub(crate) struct SanitizedTransactionReceiveAndBuffer {
     /// Packet/Transaction ingress.
     packet_receiver: PacketDeserializer,
     bank_forks: Arc<RwLock<BankForks>>,
+    mcp_fee_payer_tracker: McpFeePayerTracker,
 }
 
 impl ReceiveAndBuffer for SanitizedTransactionReceiveAndBuffer {
@@ -220,6 +221,7 @@ impl SanitizedTransactionReceiveAndBuffer {
         Self {
             packet_receiver,
             bank_forks,
+            mcp_fee_payer_tracker: McpFeePayerTracker::default(),
         }
     }
 
@@ -244,7 +246,7 @@ impl SanitizedTransactionReceiveAndBuffer {
         let mcp_enabled = working_bank
             .feature_set
             .is_active(&feature_set::mcp_protocol_v1::id());
-        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
+        let mcp_fee_payer_tracker = &mut self.mcp_fee_payer_tracker;
 
         const CHUNK_SIZE: usize = 128;
         let lock_results: [_; CHUNK_SIZE] = core::array::from_fn(|_| Ok(()));
@@ -335,7 +337,7 @@ impl SanitizedTransactionReceiveAndBuffer {
                     Consumer::check_fee_payer_unlocked_mcp(
                         &working_bank,
                         &transaction,
-                        &mut mcp_fee_payer_tracker,
+                        mcp_fee_payer_tracker,
                         &mut error_counts,
                     )
                 } else {
@@ -377,6 +379,7 @@ impl SanitizedTransactionReceiveAndBuffer {
 pub(crate) struct TransactionViewReceiveAndBuffer {
     pub receiver: BankingPacketReceiver,
     pub bank_forks: Arc<RwLock<BankForks>>,
+    pub mcp_fee_payer_tracker: McpFeePayerTracker,
 }
 
 impl ReceiveAndBuffer for TransactionViewReceiveAndBuffer {
@@ -526,7 +529,7 @@ impl TransactionViewReceiveAndBuffer {
         let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
         let lock_results: [_; EXTRA_CAPACITY] = core::array::from_fn(|_| Ok(()));
         let mut error_counters = TransactionErrorMetrics::default();
-        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
+        let mcp_fee_payer_tracker = &mut self.mcp_fee_payer_tracker;
         let mut num_dropped_on_age = 0;
         let mut num_dropped_on_already_processed = 0;
         let mut num_dropped_on_fee_payer = 0;
@@ -578,7 +581,7 @@ impl TransactionViewReceiveAndBuffer {
                         Consumer::check_fee_payer_unlocked_mcp(
                             working_bank,
                             transaction,
-                            &mut mcp_fee_payer_tracker,
+                            mcp_fee_payer_tracker,
                             &mut error_counters,
                         )
                     } else {
@@ -862,6 +865,7 @@ mod tests {
         let receive_and_buffer = SanitizedTransactionReceiveAndBuffer {
             packet_receiver: PacketDeserializer::new(receiver),
             bank_forks,
+            mcp_fee_payer_tracker: McpFeePayerTracker::default(),
         };
         let container = TransactionStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)
@@ -877,6 +881,7 @@ mod tests {
         let receive_and_buffer = TransactionViewReceiveAndBuffer {
             receiver,
             bank_forks,
+            mcp_fee_payer_tracker: McpFeePayerTracker::default(),
         };
         let container = TransactionViewStateContainer::with_capacity(TEST_CONTAINER_CAPACITY);
         (receive_and_buffer, container)

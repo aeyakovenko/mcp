@@ -426,6 +426,7 @@ mod tests {
         TransactionViewReceiveAndBuffer {
             receiver,
             bank_forks,
+            mcp_fee_payer_tracker: McpFeePayerTracker::default(),
         }
     }
 
