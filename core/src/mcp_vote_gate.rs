@@ -1,14 +1,14 @@
 use {
+    solana_ledger::mcp,
     std::collections::{BTreeMap, BTreeSet, HashMap},
     thiserror::Error,
 };
 
 pub type Commitment = [u8; 32];
 
-pub const MCP_NUM_RELAYS: usize = 200;
-pub const REQUIRED_ATTESTATIONS: usize = 120; // ceil(0.60 * 200)
-pub const REQUIRED_INCLUSIONS: usize = 80; // ceil(0.40 * 200)
-pub const REQUIRED_RECONSTRUCTION: usize = 40; // ceil(0.20 * 200)
+pub const REQUIRED_ATTESTATIONS: usize = mcp::REQUIRED_ATTESTATIONS;
+pub const REQUIRED_INCLUSIONS: usize = mcp::REQUIRED_INCLUSIONS;
+pub const REQUIRED_RECONSTRUCTION: usize = mcp::REQUIRED_RECONSTRUCTION;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayProposerEntry {
@@ -188,6 +188,16 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_when_delayed_bankhash_mismatches() {
+        let mut input = base_input(Vec::new());
+        input.delayed_bankhash_matches = false;
+        assert_eq!(
+            evaluate_vote_gate(&input),
+            VoteGateDecision::Reject(VoteGateRejection::DelayedBankhashMismatch)
+        );
+    }
+
+    #[test]
     fn test_rejects_on_invalid_leader_signature_or_index() {
         let mut input = base_input(Vec::new());
         input.leader_signature_valid = false;
@@ -271,6 +281,43 @@ mod tests {
                     relay(i as u32, true, vec![(0, commitment_b, true)])
                 }
             })
+            .collect();
+        let input = base_input(aggregate);
+
+        assert_eq!(
+            evaluate_vote_gate(&input),
+            VoteGateDecision::Vote {
+                included_proposers: BTreeMap::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_duplicate_relay_indices_do_not_double_count_threshold() {
+        let commitment = [4u8; 32];
+        let aggregate = (0..REQUIRED_ATTESTATIONS)
+            .map(|i| relay(i as u32, true, vec![(0, commitment, true)]))
+            .chain((0..REQUIRED_ATTESTATIONS).map(|i| {
+                // Duplicate relay indices should not increase global relay count.
+                relay(i as u32, true, vec![(0, commitment, true)])
+            }))
+            .collect();
+        let mut input = base_input(aggregate);
+        input.local_valid_shreds.insert(0, REQUIRED_RECONSTRUCTION);
+
+        assert_eq!(
+            evaluate_vote_gate(&input),
+            VoteGateDecision::Vote {
+                included_proposers: BTreeMap::from([(0, commitment)]),
+            }
+        );
+    }
+
+    #[test]
+    fn test_invalid_proposer_signatures_are_ignored() {
+        let commitment = [8u8; 32];
+        let aggregate = (0..REQUIRED_ATTESTATIONS)
+            .map(|i| relay(i as u32, true, vec![(0, commitment, false)]))
             .collect();
         let input = base_input(aggregate);
 
