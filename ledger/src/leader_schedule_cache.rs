@@ -108,7 +108,6 @@ impl LeaderScheduleCache {
         // Calculate the epoch as soon as it's rooted
         if new_max_epoch > old_max_epoch {
             self.compute_epoch_schedule(new_max_epoch, root_bank);
-<<<<<<< HEAD
             if root_bank
                 .feature_set
                 .is_active(&feature_set::mcp_protocol_v1::id())
