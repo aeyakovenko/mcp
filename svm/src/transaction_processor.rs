@@ -665,16 +665,19 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         update_rent_exempt_status_for_account(rent, &mut loaded_fee_payer.account);
 
         let fee_payer_index = 0;
-        if !skip_fee_collection {
-            validate_fee_payer(
-                fee_payer_address,
-                &mut loaded_fee_payer.account,
-                fee_payer_index,
-                error_counters,
-                rent,
-                compute_budget_and_limits.fee_details.total_fee(),
-            )?;
-        }
+        let required_fee = if skip_fee_collection {
+            0
+        } else {
+            compute_budget_and_limits.fee_details.total_fee()
+        };
+        validate_fee_payer(
+            fee_payer_address,
+            &mut loaded_fee_payer.account,
+            fee_payer_index,
+            error_counters,
+            rent,
+            required_fee,
+        )?;
 
         // Capture fee-subtracted fee payer account and next nonce account state
         // to commit if transaction execution fails.
@@ -2176,6 +2179,43 @@ mod tests {
             result.loaded_fee_payer_account.account.lamports(),
             starting_balance
         );
+    }
+
+    #[test]
+    fn test_validate_transaction_fee_payer_skip_fee_collection_still_validates_payer() {
+        let lamports_per_signature = 5_000;
+        let message = new_unchecked_sanitized_message(Message::new_with_blockhash(
+            &[],
+            Some(&Pubkey::new_unique()),
+            &Hash::new_unique(),
+        ));
+        let fee_payer_address = message.fee_payer();
+        let fee_payer_account = AccountSharedData::new(0, 0, &Pubkey::default());
+
+        let mut mock_accounts = HashMap::new();
+        mock_accounts.insert(*fee_payer_address, fee_payer_account);
+        let mock_bank = MockBankCallback {
+            account_shared_data: Arc::new(RwLock::new(mock_accounts)),
+            ..Default::default()
+        };
+        let mut account_loader = (&mock_bank).into();
+
+        let mut error_counters = TransactionErrorMetrics::default();
+        let compute_budget_and_limits = SVMTransactionExecutionAndFeeBudgetLimits::with_fee(
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+        );
+        let result =
+            TransactionBatchProcessor::<TestForkGraph>::validate_transaction_nonce_and_fee_payer(
+                &mut account_loader,
+                &message,
+                CheckedTransactionDetails::new(None, Ok(compute_budget_and_limits)),
+                &Hash::default(),
+                &Rent::default(),
+                &mut error_counters,
+                true,
+            );
+
+        assert_eq!(result, Err(TransactionError::AccountNotFound));
     }
 
     #[test]
