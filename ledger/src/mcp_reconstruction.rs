@@ -10,14 +10,105 @@ pub const MCP_RECON_MAX_PAYLOAD_BYTES: usize = MCP_RECON_DATA_SHREDS * MCP_RECON
 pub enum McpReconstructionError {
     #[error("invalid payload length: {0}")]
     InvalidPayloadLength(usize),
+    #[error("invalid shred index: {0}")]
+    InvalidShredIndex(usize),
     #[error("invalid shard layout: expected {expected}, got {actual}")]
     InvalidShardLayout { expected: usize, actual: usize },
     #[error("insufficient shards: present {present}, required {required}")]
     InsufficientShards { present: usize, required: usize },
+    #[error("conflicting shard for index {0}")]
+    ConflictingShard(usize),
     #[error("commitment mismatch")]
     CommitmentMismatch,
     #[error("reed-solomon error: {0}")]
     ReedSolomon(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpReconstructionAttempt {
+    Pending { present: usize, required: usize },
+    Reconstructed(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpReconstructionState {
+    slot: u64,
+    proposer_index: u32,
+    payload_len: usize,
+    expected_commitment: [u8; 32],
+    shards: Vec<Option<[u8; MCP_RECON_SHRED_BYTES]>>,
+}
+
+impl McpReconstructionState {
+    pub fn new(
+        slot: u64,
+        proposer_index: u32,
+        payload_len: usize,
+        expected_commitment: [u8; 32],
+    ) -> Result<Self, McpReconstructionError> {
+        if payload_len > MCP_RECON_MAX_PAYLOAD_BYTES {
+            return Err(McpReconstructionError::InvalidPayloadLength(payload_len));
+        }
+        Ok(Self {
+            slot,
+            proposer_index,
+            payload_len,
+            expected_commitment,
+            shards: vec![None; MCP_RECON_NUM_SHREDS],
+        })
+    }
+
+    pub fn present_shards(&self) -> usize {
+        self.shards.iter().filter(|shard| shard.is_some()).count()
+    }
+
+    pub fn insert_shard(
+        &mut self,
+        shred_index: usize,
+        shred_data: [u8; MCP_RECON_SHRED_BYTES],
+    ) -> Result<(), McpReconstructionError> {
+        if shred_index >= MCP_RECON_NUM_SHREDS {
+            return Err(McpReconstructionError::InvalidShredIndex(shred_index));
+        }
+
+        if let Some(existing) = self.shards[shred_index] {
+            if existing == shred_data {
+                return Ok(());
+            }
+            return Err(McpReconstructionError::ConflictingShard(shred_index));
+        }
+
+        self.shards[shred_index] = Some(shred_data);
+        Ok(())
+    }
+
+    pub fn try_reconstruct(&mut self) -> Result<McpReconstructionAttempt, McpReconstructionError> {
+        let present = self.present_shards();
+        if present < MCP_RECON_DATA_SHREDS {
+            return Ok(McpReconstructionAttempt::Pending {
+                present,
+                required: MCP_RECON_DATA_SHREDS,
+            });
+        }
+
+        let payload = reconstruct_payload(
+            self.slot,
+            self.proposer_index,
+            self.payload_len,
+            self.expected_commitment,
+            &mut self.shards,
+        )?;
+        Ok(McpReconstructionAttempt::Reconstructed(payload))
+    }
+
+    pub fn insert_and_try_reconstruct(
+        &mut self,
+        shred_index: usize,
+        shred_data: [u8; MCP_RECON_SHRED_BYTES],
+    ) -> Result<McpReconstructionAttempt, McpReconstructionError> {
+        self.insert_shard(shred_index, shred_data)?;
+        self.try_reconstruct()
+    }
 }
 
 pub fn reconstruct_payload(
@@ -199,6 +290,62 @@ mod tests {
                 present: 39,
                 required: MCP_RECON_DATA_SHREDS
             }
+        );
+    }
+
+    #[test]
+    fn test_state_reconstructs_once_threshold_is_met() {
+        let payload: Vec<u8> = (0..9_000).map(|i| (i % 255) as u8).collect();
+        let shreds = encode_payload(&payload);
+        let root = commitment_root(12, 4, &shreds);
+        let mut state = McpReconstructionState::new(12, 4, payload.len(), root).unwrap();
+
+        for i in 0..(MCP_RECON_DATA_SHREDS - 1) {
+            let attempt = state.insert_and_try_reconstruct(i, shreds[i]).unwrap();
+            assert_eq!(
+                attempt,
+                McpReconstructionAttempt::Pending {
+                    present: i + 1,
+                    required: MCP_RECON_DATA_SHREDS
+                }
+            );
+        }
+
+        let attempt = state
+            .insert_and_try_reconstruct(
+                MCP_RECON_DATA_SHREDS - 1,
+                shreds[MCP_RECON_DATA_SHREDS - 1],
+            )
+            .unwrap();
+        assert_eq!(attempt, McpReconstructionAttempt::Reconstructed(payload));
+    }
+
+    #[test]
+    fn test_state_rejects_conflicting_shard_at_same_index() {
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 255) as u8).collect();
+        let mut shreds = encode_payload(&payload);
+        let root = commitment_root(7, 1, &shreds);
+        let mut state = McpReconstructionState::new(7, 1, payload.len(), root).unwrap();
+
+        state.insert_shard(3, shreds[3]).unwrap();
+        shreds[3][0] ^= 1;
+        assert_eq!(
+            state.insert_shard(3, shreds[3]).unwrap_err(),
+            McpReconstructionError::ConflictingShard(3)
+        );
+    }
+
+    #[test]
+    fn test_state_rejects_out_of_bounds_shard_index() {
+        let payload = vec![1u8; 64];
+        let shreds = encode_payload(&payload);
+        let root = commitment_root(1, 1, &shreds);
+        let mut state = McpReconstructionState::new(1, 1, payload.len(), root).unwrap();
+        assert_eq!(
+            state
+                .insert_shard(MCP_RECON_NUM_SHREDS, shreds[0])
+                .unwrap_err(),
+            McpReconstructionError::InvalidShredIndex(MCP_RECON_NUM_SHREDS)
         );
     }
 }
