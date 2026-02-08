@@ -10,13 +10,14 @@ use {
     },
     crate::banking_stage::{
         consume_worker::ConsumeWorkerMetrics,
-        consumer::Consumer,
+        consumer::{Consumer, McpFeePayerTracker},
         decision_maker::{BufferedPacketsDecision, DecisionMaker},
         transaction_scheduler::{
             receive_and_buffer::ReceivingStats, transaction_state_container::StateContainer,
         },
         TOTAL_BUFFERED_PACKETS,
     },
+    agave_feature_set as feature_set,
     solana_clock::MAX_PROCESSING_AGE,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -188,6 +189,8 @@ where
         bank: &Bank,
         max_age: usize,
     ) {
+        let mcp_enabled = bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id());
+        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
         let lock_results = vec![Ok(()); transactions.len()];
         let mut error_counters = TransactionErrorMetrics::default();
         let check_results = bank.check_transactions::<R::Transaction>(
@@ -202,9 +205,17 @@ where
             .zip(transactions)
             .zip(results.iter_mut())
         {
-            *result = check_result
-                .and_then(|_| Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters))
-                .is_ok();
+            let fee_check_result = if mcp_enabled {
+                Consumer::check_fee_payer_unlocked_mcp(
+                    bank,
+                    *tx,
+                    &mut mcp_fee_payer_tracker,
+                    &mut error_counters,
+                )
+            } else {
+                Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters)
+            };
+            *result = check_result.and_then(|_| fee_check_result).is_ok();
         }
     }
 

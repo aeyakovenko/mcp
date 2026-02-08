@@ -10,11 +10,12 @@ use {
         },
     },
     crate::banking_stage::{
-        consumer::Consumer, decision_maker::BufferedPacketsDecision,
+        consumer::{Consumer, McpFeePayerTracker}, decision_maker::BufferedPacketsDecision,
         immutable_deserialized_packet::ImmutableDeserializedPacket,
         packet_deserializer::PacketDeserializer, scheduler_messages::MaxAge,
         TransactionStateContainer,
     },
+    agave_feature_set as feature_set,
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
     agave_transaction_view::{
         resolved_transaction_view::ResolvedTransactionView,
@@ -240,6 +241,10 @@ impl SanitizedTransactionReceiveAndBuffer {
         let sanitized_epoch = root_bank.epoch();
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
         let vote_only = working_bank.vote_only_bank();
+        let mcp_enabled = working_bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id());
+        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
 
         const CHUNK_SIZE: usize = 128;
         let lock_results: [_; CHUNK_SIZE] = core::array::from_fn(|_| Ok(()));
@@ -326,12 +331,21 @@ impl SanitizedTransactionReceiveAndBuffer {
                     }
                 }
 
-                if Consumer::check_fee_payer_unlocked(
-                    &working_bank,
-                    &transaction,
-                    &mut error_counts,
-                )
-                .is_err()
+                let fee_check_result = if mcp_enabled {
+                    Consumer::check_fee_payer_unlocked_mcp(
+                        &working_bank,
+                        &transaction,
+                        &mut mcp_fee_payer_tracker,
+                        &mut error_counts,
+                    )
+                } else {
+                    Consumer::check_fee_payer_unlocked(
+                        &working_bank,
+                        &transaction,
+                        &mut error_counts,
+                    )
+                };
+                if fee_check_result.is_err()
                 {
                     num_dropped_on_fee_payer += 1;
                     continue;
@@ -504,11 +518,15 @@ impl TransactionViewReceiveAndBuffer {
         let alt_resolved_slot = root_bank.slot();
         let sanitized_epoch = root_bank.epoch();
         let transaction_account_lock_limit = working_bank.get_transaction_account_lock_limit();
+        let mcp_enabled = working_bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id());
 
         // Create temporary batches of transactions to be age-checked.
         let mut transaction_priority_ids = ArrayVec::<_, EXTRA_CAPACITY>::new();
         let lock_results: [_; EXTRA_CAPACITY] = core::array::from_fn(|_| Ok(()));
         let mut error_counters = TransactionErrorMetrics::default();
+        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
         let mut num_dropped_on_age = 0;
         let mut num_dropped_on_already_processed = 0;
         let mut num_dropped_on_fee_payer = 0;
@@ -556,11 +574,21 @@ impl TransactionViewReceiveAndBuffer {
                     let transaction = container
                         .get_transaction(priority_id.id)
                         .expect("transaction must exist");
-                    if let Err(err) = Consumer::check_fee_payer_unlocked(
-                        working_bank,
-                        transaction,
-                        &mut error_counters,
-                    ) {
+                    let fee_check_result = if mcp_enabled {
+                        Consumer::check_fee_payer_unlocked_mcp(
+                            working_bank,
+                            transaction,
+                            &mut mcp_fee_payer_tracker,
+                            &mut error_counters,
+                        )
+                    } else {
+                        Consumer::check_fee_payer_unlocked(
+                            working_bank,
+                            transaction,
+                            &mut error_counters,
+                        )
+                    };
+                    if let Err(err) = fee_check_result {
                         *result = Err(err);
                         num_dropped_on_fee_payer += 1;
                         container.remove_by_id(priority_id.id);
