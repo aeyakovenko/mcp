@@ -1,4 +1,8 @@
-use {reed_solomon_erasure::galois_8::ReedSolomon, solana_sha256_hasher::hashv};
+use {
+    reed_solomon_erasure::galois_8::ReedSolomon,
+    solana_sha256_hasher::hashv,
+    std::sync::OnceLock,
+};
 
 pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = 40;
 pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = 160;
@@ -162,12 +166,18 @@ fn payload_to_data_shards(payload: &[u8]) -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
     shards
 }
 
-fn reed_solomon() -> Result<ReedSolomon, McpErasureError> {
-    ReedSolomon::new(
-        MCP_DATA_SHREDS_PER_FEC_BLOCK,
-        MCP_CODING_SHREDS_PER_FEC_BLOCK,
-    )
-    .map_err(|err| McpErasureError::ReedSolomon(err.to_string()))
+fn reed_solomon() -> Result<&'static ReedSolomon, McpErasureError> {
+    static REED_SOLOMON: OnceLock<Result<ReedSolomon, String>> = OnceLock::new();
+    match REED_SOLOMON.get_or_init(|| {
+        ReedSolomon::new(
+            MCP_DATA_SHREDS_PER_FEC_BLOCK,
+            MCP_CODING_SHREDS_PER_FEC_BLOCK,
+        )
+        .map_err(|err| err.to_string())
+    }) {
+        Ok(reed_solomon) => Ok(reed_solomon),
+        Err(err) => Err(McpErasureError::ReedSolomon(err.clone())),
+    }
 }
 
 #[cfg(test)]
