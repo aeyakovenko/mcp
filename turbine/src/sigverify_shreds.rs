@@ -15,6 +15,7 @@ use {
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{
+            mcp_shred::{is_mcp_shred_bytes, McpShred},
             self,
             layout::{get_shred, resign_packet},
             wire::is_retransmitter_signed_variant,
@@ -174,6 +175,12 @@ fn run_shred_sigverify<const K: usize>(
     stats.num_iters += 1;
     stats.num_batches += shred_buffer.len();
     stats.num_discards_pre += count_discards(shred_buffer);
+    let (working_bank, root_bank) = {
+        let bank_forks = bank_forks.read().unwrap();
+        (bank_forks.working_bank(), bank_forks.root_bank())
+    };
+    let mcp_packets =
+        partition_mcp_packets(shred_buffer, &root_bank, &feature_set::mcp_protocol_v1::id());
     // Repair shreds include a randomly generated u32 nonce, so it does not
     // make sense to deduplicate the entire packet payload (i.e. they are not
     // duplicate of any other packet.data(..)).
@@ -201,10 +208,6 @@ fn run_shred_sigverify<const K: usize>(
             .map(|mut packet| packet.meta_mut().set_discard(true))
             .count()
     });
-    let (working_bank, root_bank) = {
-        let bank_forks = bank_forks.read().unwrap();
-        (bank_forks.working_bank(), bank_forks.root_bank())
-    };
     verify_packets(
         thread_pool,
         &keypair.pubkey(),
@@ -276,10 +279,49 @@ fn run_shred_sigverify<const K: usize>(
     let shreds = shreds
         .into_iter()
         .map(|shred| (shred, /*is_repaired:*/ false, BlockLocation::Original));
-    verified_sender.send(shreds.chain(repairs).collect())?;
+    verified_sender.send(shreds.chain(repairs).chain(mcp_packets).collect())?;
     stats.elapsed_micros += now.elapsed().as_micros() as u64;
     shred_buffer.clear();
     Ok(())
+}
+
+fn partition_mcp_packets(
+    batches: &mut [PacketBatch],
+    root_bank: &Bank,
+    feature_id: &Pubkey,
+) -> Vec<(shred::Payload, bool, BlockLocation)> {
+    let mut mcp_packets = Vec::new();
+    for batch in batches {
+        for mut packet in batch.iter_mut() {
+            if packet.meta().discard() {
+                continue;
+            }
+            let Some((slot, payload)) = ({
+                let Some(data) = packet.data(..) else {
+                    continue;
+                };
+                if !is_mcp_shred_bytes(data) {
+                    continue;
+                }
+                let Ok(mcp_shred) = McpShred::from_bytes(data) else {
+                    continue;
+                };
+                Some((mcp_shred.slot, data.to_vec()))
+            }) else {
+                continue;
+            };
+            if !cluster_nodes::check_feature_activation(feature_id, slot, root_bank) {
+                continue;
+            }
+            packet.meta_mut().set_discard(true);
+            mcp_packets.push((
+                shred::Payload::from(payload),
+                /*is_repaired:*/ false,
+                BlockLocation::Original,
+            ));
+        }
+    }
+    mcp_packets
 }
 
 /// Extracts the shred and repair nonce for `packet`.

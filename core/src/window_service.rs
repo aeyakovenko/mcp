@@ -198,7 +198,7 @@ fn run_insert<F>(
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     blockstore: &Blockstore,
     bank_forks: &RwLock<BankForks>,
-    local_pubkey: &Pubkey,
+    _local_pubkey: &Pubkey,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
@@ -224,7 +224,6 @@ where
     let mut mcp_retransmit_batch = Vec::new();
     let mut mcp_shred_count = 0usize;
     let mut legacy_shreds = Vec::with_capacity(shreds.len());
-    let mut relay_indices_cache: HashMap<Slot, Vec<u32>> = HashMap::new();
     let mut proposer_pubkeys_cache: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
 
     for (shred, repair, block_location) in shreds {
@@ -253,22 +252,7 @@ where
             last_bank_refresh = Instant::now();
             root_bank = bank_forks.read().unwrap().root_bank();
             mcp_relay_processor.prune_below_slot(root_bank.slot());
-            relay_indices_cache.clear();
             proposer_pubkeys_cache.clear();
-        }
-
-        let relay_indices = relay_indices_cache
-            .entry(mcp_shred.slot)
-            .or_insert_with(|| {
-                leader_schedule_cache.relay_indices_at_slot(
-                    mcp_shred.slot,
-                    local_pubkey,
-                    Some(&root_bank),
-                )
-            });
-        if !relay_indices.contains(&mcp_shred.shred_index) {
-            legacy_shreds.push((shred, repair, block_location));
-            continue;
         }
 
         let proposer_pubkeys = proposer_pubkeys_cache
