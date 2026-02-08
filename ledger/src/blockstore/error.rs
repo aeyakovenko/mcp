@@ -64,5 +64,7 @@ pub enum BlockstoreError {
     UnexpectedBlockComponent,
     #[error("Block component mismatch slot {0}")]
     BlockComponentMismatch(Slot),
+    #[error("MCP execution output conflict for slot {0}")]
+    McpExecutionOutputConflict(Slot),
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
