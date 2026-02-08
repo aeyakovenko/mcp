@@ -14,6 +14,7 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore_meta::BlockLocation,
+        leader_schedule_cache::LeaderScheduleCache,
         shred::{
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
@@ -579,13 +580,15 @@ impl StandardBroadcastRun {
             return;
         };
         let slot = batch_info.slot;
-        let feature_active = {
+        let (feature_active, working_bank) = {
             let bank_forks = bank_forks.read().unwrap();
-            bank_forks
+            let bank = bank_forks
                 .get(slot)
-                .unwrap_or_else(|| bank_forks.root_bank())
+                .unwrap_or_else(|| bank_forks.root_bank());
+            let feature_active = bank
                 .feature_set
-                .is_active(&feature_set::mcp_protocol_v1::id())
+                .is_active(&feature_set::mcp_protocol_v1::id());
+            (feature_active, bank)
         };
         if !feature_active {
             return;
@@ -633,49 +636,75 @@ impl StandardBroadcastRun {
             return;
         }
 
-        let mut relay_addrs: Vec<_> = cluster_info
-            .tvu_peers(|node| node.tvu(Protocol::QUIC).map(|addr| (*node.pubkey(), addr)))
-            .into_iter()
-            .flatten()
-            .collect();
-        relay_addrs.sort_unstable_by_key(|(pubkey, _)| *pubkey);
-        relay_addrs.dedup_by_key(|(pubkey, _)| *pubkey);
-        if relay_addrs.len() < mcp_proposer::MCP_NUM_RELAYS {
+        let identity = cluster_info.id();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&working_bank);
+        let proposer_indices =
+            leader_schedule_cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank));
+        if proposer_indices.is_empty() {
+            return;
+        }
+
+        let relay_schedule = match leader_schedule_cache.relays_at_slot(slot, Some(&working_bank)) {
+            Some(relays) => relays,
+            None => {
+                warn!("MCP proposer dispatch skipped for slot {slot}: relay schedule unavailable");
+                return;
+            }
+        };
+        if relay_schedule.len() != mcp_proposer::MCP_NUM_RELAYS {
             warn!(
-                "MCP proposer dispatch skipped for slot {}: only {} QUIC relay peers available",
+                "MCP proposer dispatch skipped for slot {}: expected {} relay indices, got {}",
                 slot,
-                relay_addrs.len(),
+                mcp_proposer::MCP_NUM_RELAYS,
+                relay_schedule.len(),
             );
             return;
         }
-        relay_addrs.truncate(mcp_proposer::MCP_NUM_RELAYS);
 
-        // UNVERIFIED: proposer schedule index APIs are added in MCP schedule pass; until then use
-        // index 0 with our current identity key for proposer signature.
-        let proposer_index = 0u32;
+        let relay_addrs: Vec<_> = relay_schedule
+            .into_iter()
+            .map(|relay_pubkey| {
+                cluster_info
+                    .lookup_contact_info(&relay_pubkey, |node| node.tvu(Protocol::QUIC))
+                    .flatten()
+            })
+            .collect();
+        if relay_addrs.iter().any(Option::is_none) {
+            let available = relay_addrs.iter().filter(|addr| addr.is_some()).count();
+            warn!(
+                "MCP proposer dispatch skipped for slot {}: only {} of {} scheduled relays have QUIC addresses",
+                slot,
+                available,
+                mcp_proposer::MCP_NUM_RELAYS,
+            );
+            return;
+        }
+        let relay_addrs: Vec<_> = relay_addrs.into_iter().flatten().collect();
+
         let proposer_keypair = {
             let keypair = cluster_info.keypair();
             Arc::clone(&*keypair)
         };
-        let messages = match mcp_proposer::build_shred_messages(
-            slot,
-            proposer_index,
-            &shred_payloads,
-            proposer_keypair.as_ref(),
-        ) {
-            Ok(messages) => messages,
-            Err(err) => {
-                warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
-                return;
-            }
-        };
-
-        for ((_, relay_addr), message) in relay_addrs.into_iter().zip(messages) {
-            if quic_endpoint_sender
-                .blocking_send((relay_addr, Bytes::copy_from_slice(&message)))
-                .is_err()
-            {
-                warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
+        for proposer_index in proposer_indices {
+            let messages = match mcp_proposer::build_shred_messages(
+                slot,
+                proposer_index,
+                &shred_payloads,
+                proposer_keypair.as_ref(),
+            ) {
+                Ok(messages) => messages,
+                Err(err) => {
+                    warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
+                    return;
+                }
+            };
+            for (relay_addr, message) in relay_addrs.iter().zip(messages.iter()) {
+                if quic_endpoint_sender
+                    .blocking_send((*relay_addr, Bytes::copy_from_slice(message)))
+                    .is_err()
+                {
+                    warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
+                }
             }
         }
     }
