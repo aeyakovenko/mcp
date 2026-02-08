@@ -3548,13 +3548,31 @@ impl Bank {
             rent: self.rent_collector.rent.clone(),
         };
 
-        self.transaction_processor
+        let mut fee_results = self
+            .transaction_processor
             .collect_fees_only_sanitized_transactions(
                 self,
                 sanitized_txs,
                 check_results,
                 &processing_environment,
-            )
+            );
+
+        // Phase-A semantics: persist fee deductions for every transaction that
+        // passes signature/basic checks, even if execution later fails.
+        for (tx, fee_result) in sanitized_txs.iter().zip(fee_results.iter_mut()) {
+            let Ok(fee_details) = fee_result else {
+                continue;
+            };
+            let fee = fee_details.total_fee();
+            if fee == 0 {
+                continue;
+            }
+            if let Err(err) = self.withdraw(tx.fee_payer(), fee) {
+                *fee_result = Err(err);
+            }
+        }
+
+        fee_results
     }
 
     /// MCP second-pass helper: execute transactions without fee re-deduction.
@@ -3997,6 +4015,7 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             None::<fn(&mut _, &_) -> _>,
+            false,
         )
         .unwrap()
     }
@@ -4020,6 +4039,30 @@ impl Bank {
             timings,
             log_messages_bytes_limit,
             Some(pre_commit_callback),
+            false,
+        )
+    }
+
+    pub fn load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback<'a>(
+        &'a self,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        max_age: usize,
+        recording_config: ExecutionRecordingConfig,
+        timings: &mut ExecuteTimings,
+        log_messages_bytes_limit: Option<usize>,
+        pre_commit_callback: impl FnOnce(
+            &mut ExecuteTimings,
+            &[TransactionProcessingResult],
+        ) -> PreCommitResult<'a>,
+    ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
+        self.do_load_execute_and_commit_transactions_with_pre_commit_callback(
+            batch,
+            max_age,
+            recording_config,
+            timings,
+            log_messages_bytes_limit,
+            Some(pre_commit_callback),
+            true,
         )
     }
 
@@ -4033,6 +4076,7 @@ impl Bank {
         pre_commit_callback: Option<
             impl FnOnce(&mut ExecuteTimings, &[TransactionProcessingResult]) -> PreCommitResult<'a>,
         >,
+        skip_fee_collection: bool,
     ) -> Result<(Vec<TransactionCommitResult>, Option<BalanceCollector>)> {
         let LoadAndExecuteTransactionsOutput {
             processing_results,
@@ -4049,7 +4093,7 @@ impl Bank {
                 log_messages_bytes_limit,
                 limit_to_load_programs: false,
                 recording_config,
-                skip_fee_collection: false,
+                skip_fee_collection,
             },
         );
 
