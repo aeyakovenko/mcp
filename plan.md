@@ -95,6 +95,7 @@ Non-reusable for MCP wire correctness:
     - decode `tx_count + [tx_len, tx_bytes]` framing
     - for each `tx_bytes`, accept latest MCP §7.1 tx or legacy Solana tx
     - carry per-tx format tag for later ordering-key extraction and possible re-encoding
+    - after decoding `tx_count` entries, ignore trailing zero bytes and reject trailing non-zero bytes
   - Common parser invariants:
     - reject unknown version
     - reject out-of-range indices
@@ -239,6 +240,8 @@ Non-reusable for MCP wire correctness:
 - Cardinality:
   - at most one `RelayAttestation` per `(slot, relay_index)`.
   - if a validator owns multiple relay indices, it may emit multiple attestations (one per index).
+- Attestation encoding:
+  - `RelayAttestation.entries` MUST be sorted by `proposer_index` and deduplicated.
 
 ### 4.3 MCP QUIC transport
 
@@ -290,7 +293,7 @@ Non-reusable for MCP wire correctness:
 - Worker steps:
   1. drain verified tx packets from MCP channel.
   2. parse ordering key using dual-format rules from resolved `B1` and descending-fee policy from `B2`.
-  3. enforce per-proposer admission control with `CostModel` + local `CostTracker` budgeted per proposer (spec §3.2 resource partitioning).
+  3. enforce per-proposer admission control with `CostModel` + local `CostTracker` budgets for CU and loaded account data (spec §3.2 resource partitioning).
   4. order transactions deterministically.
   5. serialize payload and enforce `MAX_PROPOSER_PAYLOAD`; emit latest §7.1 format where available, otherwise legacy bytes.
   6. call ledger MCP encode helper -> 200 shreds + witnesses.
@@ -340,6 +343,7 @@ Validation rules:
 - invalid relay signature => drop relay message
 - invalid proposer signature inside relay entry => drop that entry, keep other valid entries
 - canonical aggregate ordering by `relay_index`
+- threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation; proposer-entry filtering does not change this relay count
 
 ### 6.3 Leader finalization
 
@@ -375,7 +379,7 @@ When this node is leader for slot `s` at aggregation deadline:
   1. verify leader signature and leader index for slot
   2. verify delayed bankhash by consensus-defined delayed slot; if local delayed bankhash is unavailable, do not vote and keep block pending
   3. verify relay/proposer signatures and ignore invalid entries
-  4. enforce global relay threshold after filtering (`>= REQUIRED_ATTESTATIONS`)
+  4. enforce global relay threshold using the same relay-count rule from Pass 6 (`>= REQUIRED_ATTESTATIONS`)
   5. implied proposer rules:
      - multiple commitments => exclude
      - one commitment with `>= REQUIRED_INCLUSIONS` relay attestations => include
