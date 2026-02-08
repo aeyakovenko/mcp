@@ -12,6 +12,9 @@ pub const AGGREGATE_ATTESTATION_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 2;
 const RELAY_ENTRY_HEADER_LEN: usize = 4 + 1;
 const PROPOSER_ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
+const MAX_AGGREGATE_WIRE_BYTES: usize = HEADER_LEN
+    + mcp::NUM_RELAYS
+        * (RELAY_ENTRY_HEADER_LEN + mcp::NUM_PROPOSERS * PROPOSER_ENTRY_LEN + SIGNATURE_BYTES);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateProposerEntry {
@@ -67,6 +70,8 @@ pub enum AggregateAttestationError {
     Truncated,
     #[error("aggregate attestation has trailing bytes")]
     TrailingBytes,
+    #[error("aggregate attestation exceeds protocol maximum: {actual} > {max}")]
+    WireBytesTooLarge { actual: usize, max: usize },
 }
 
 impl AggregateAttestation {
@@ -133,11 +138,23 @@ impl AggregateAttestation {
                 &relay_entry.relay_signature,
             )?;
         }
+        if out.len() > MAX_AGGREGATE_WIRE_BYTES {
+            return Err(AggregateAttestationError::WireBytesTooLarge {
+                actual: out.len(),
+                max: MAX_AGGREGATE_WIRE_BYTES,
+            });
+        }
 
         Ok(out)
     }
 
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self, AggregateAttestationError> {
+        if bytes.len() > MAX_AGGREGATE_WIRE_BYTES {
+            return Err(AggregateAttestationError::WireBytesTooLarge {
+                actual: bytes.len(),
+                max: MAX_AGGREGATE_WIRE_BYTES,
+            });
+        }
         if bytes.len() < HEADER_LEN {
             return Err(AggregateAttestationError::Truncated);
         }
@@ -721,6 +738,18 @@ mod tests {
         assert_eq!(
             AggregateAttestation::from_wire_bytes(&bytes).unwrap_err(),
             AggregateAttestationError::TooManyRelayEntries(mcp::NUM_RELAYS + 1)
+        );
+    }
+
+    #[test]
+    fn test_from_wire_bytes_rejects_oversized_wire() {
+        let bytes = vec![0u8; MAX_AGGREGATE_WIRE_BYTES + 1];
+        assert_eq!(
+            AggregateAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            AggregateAttestationError::WireBytesTooLarge {
+                actual: MAX_AGGREGATE_WIRE_BYTES + 1,
+                max: MAX_AGGREGATE_WIRE_BYTES,
+            }
         );
     }
 
