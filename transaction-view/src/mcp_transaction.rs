@@ -61,7 +61,18 @@ impl McpTransaction {
     }
 
     pub fn from_bytes_compat(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
-        Self::from_bytes(bytes).or_else(|_| Self::from_legacy_bytes(bytes))
+        let latest = Self::from_bytes(bytes).ok().filter(|parsed| parsed.to_bytes() == bytes);
+        if let Some(parsed) = latest {
+            return Ok(parsed);
+        }
+
+        let legacy = Self::from_legacy_bytes(bytes)?;
+        // Require canonical legacy layout to avoid accepting malformed payloads.
+        if legacy.to_bytes().get(1..) == Some(bytes) {
+            Ok(legacy)
+        } else {
+            Err(McpTransactionParseError::TrailingBytes)
+        }
     }
 
     fn parse_inner(bytes: &[u8], has_version_prefix: bool) -> Result<Self, McpTransactionParseError> {
@@ -327,6 +338,20 @@ mod tests {
         assert_eq!(parsed.inclusion_fee(), Some(7));
         assert_eq!(parsed.ordering_fee(), Some(11));
         assert_eq!(parsed.target_proposer(), Some(42));
+        assert_eq!(parsed.to_bytes(), latest);
+    }
+
+    #[test]
+    fn test_legacy_with_first_byte_one_prefers_legacy_layout() {
+        let mut tx = sample_transaction();
+        tx.legacy_header.num_required_signatures = 1;
+        tx.signatures.truncate(1);
+
+        let latest = tx.to_bytes();
+        let legacy = latest[1..].to_vec();
+        let parsed = McpTransaction::from_bytes_compat(&legacy).unwrap();
+
+        assert_eq!(parsed.legacy_header.num_required_signatures, 1);
         assert_eq!(parsed.to_bytes(), latest);
     }
 }
