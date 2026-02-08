@@ -221,6 +221,9 @@ impl McpShred {
 mod tests {
     use {
         super::*,
+        crate::shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
+        solana_entry::entry::create_ticks,
+        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_signer::Signer,
     };
@@ -382,5 +385,25 @@ mod tests {
             proposer_signature,
         };
         assert!(!is_mcp_shred_bytes(&shred.to_bytes()));
+    }
+
+    #[test]
+    fn test_classifier_rejects_legacy_merkle_shreds() {
+        let keypair = Keypair::new();
+        let entries = create_ticks(1, 0, Hash::new_unique());
+        let shredder = Shredder::new(1, 0, 1, 0).unwrap();
+        let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
+            &keypair,
+            &entries,
+            true,
+            Some(Hash::new_unique()),
+            0,
+            0,
+            &ReedSolomonCache::default(),
+            &mut ProcessShredsStats::default(),
+        );
+        for shred in data_shreds.into_iter().chain(coding_shreds) {
+            assert!(!is_mcp_shred_bytes(shred.payload()));
+        }
     }
 }
