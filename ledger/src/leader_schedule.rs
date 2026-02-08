@@ -3,6 +3,7 @@ use {
     rand_chacha::{rand_core::SeedableRng, ChaChaRng},
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
+    solana_sha256_hasher::hash,
     std::{collections::HashMap, convert::identity, ops::Index, sync::Arc},
 };
 
@@ -89,8 +90,10 @@ pub(crate) fn stake_weighted_slot_leaders_domain_separated(
 ) -> Vec<Pubkey> {
     let mut seed = [0u8; 32];
     seed[0..8].copy_from_slice(&epoch.to_le_bytes());
-    let copy_len = std::cmp::min(seed.len() - 8, domain.len());
-    seed[8..8 + copy_len].copy_from_slice(&domain[..copy_len]);
+    // Hash the entire domain so long strings are not silently truncated.
+    let domain_hash = hash(domain).to_bytes();
+    let domain_seed_len = seed.len() - 8;
+    seed[8..].copy_from_slice(&domain_hash[..domain_seed_len]);
     stake_weighted_slot_leaders_from_seed(keyed_stakes, len, repeat, seed)
 }
 
