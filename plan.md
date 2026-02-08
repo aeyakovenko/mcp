@@ -13,10 +13,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Release Blockers (`UNVERIFIED` until resolved)
 
-- `S1` payload bound wording mismatch in spec:
-  - Spec §3.2 says serialized batch MUST NOT exceed `NUM_RELAYS * SHRED_DATA_BYTES`.
-  - With §4 FEC parameters (`DATA_SHREDS_PER_FEC_BLOCK=40`, `NUM_RELAYS=200`), RS payload capacity is `DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES`.
-  - This plan uses the RS-capacity bound. Spec text should be clarified to avoid two incompatible interpretations.
+- none currently
 
 ## Resolved Policy Decisions
 
@@ -88,7 +85,7 @@ Non-reusable for MCP wire correctness:
     - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
     - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
-    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (see blocker `S1`)
+    - `MAX_PROPOSER_PAYLOAD = min(NUM_RELAYS * SHRED_DATA_BYTES, DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES) = 34_520`
   - Types:
     - `McpPayload`
     - `RelayAttestation`
@@ -295,7 +292,7 @@ Non-reusable for MCP wire correctness:
   2. parse ordering key using dual-format rules from resolved `B1` and descending-fee policy from `B2`.
   3. enforce per-proposer admission control with `CostModel` + local `CostTracker` budgeted per proposer (spec §3.2 resource partitioning).
   4. order transactions deterministically.
-  5. serialize payload and enforce max payload bound; emit latest §7.1 format where available, otherwise legacy bytes.
+  5. serialize payload and enforce `MAX_PROPOSER_PAYLOAD`; emit latest §7.1 format where available, otherwise legacy bytes.
   6. call ledger MCP encode helper -> 200 shreds + witnesses.
   7. send shred `i` to relay index `i` address.
 
