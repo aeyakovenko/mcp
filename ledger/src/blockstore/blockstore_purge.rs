@@ -335,6 +335,7 @@ impl Blockstore {
                 .alt_meta_cf
                 .delete_range_in_batch(write_batch, from_slot, to_slot)
                 .is_ok()
+<<<<<<< HEAD
                 & self
                     .alt_erasure_meta_cf
                     .delete_range_in_batch(write_batch, from_slot, to_slot)
