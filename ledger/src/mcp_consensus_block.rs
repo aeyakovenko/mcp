@@ -9,11 +9,19 @@ use {
 pub const CONSENSUS_BLOCK_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
+const MAX_QUIC_CONTROL_PAYLOAD_BYTES: usize = 512 * 1024;
 const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
     1 + 8 + 4 + 2 + (200 * (4 + 1 + (16 * (4 + HASH_BYTES + SIGNATURE_BYTES)) + SIGNATURE_BYTES));
 const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
-const MAX_CONSENSUS_BLOCK_WIRE_BYTES: usize =
+const MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES: usize =
     HEADER_LEN + MAX_AGGREGATE_ATTESTATION_BYTES + MAX_CONSENSUS_META_BYTES + TRAILER_LEN;
+const MAX_CONSENSUS_BLOCK_WIRE_BYTES: usize = if MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES
+    < MAX_QUIC_CONTROL_PAYLOAD_BYTES
+{
+    MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES
+} else {
+    MAX_QUIC_CONTROL_PAYLOAD_BYTES
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBlock {
@@ -394,5 +402,10 @@ mod tests {
                 max: MAX_CONSENSUS_BLOCK_WIRE_BYTES,
             }
         );
+    }
+
+    #[test]
+    fn test_max_wire_fits_quic_control_payload_bound() {
+        assert!(MAX_CONSENSUS_BLOCK_WIRE_BYTES <= MAX_QUIC_CONTROL_PAYLOAD_BYTES);
     }
 }
