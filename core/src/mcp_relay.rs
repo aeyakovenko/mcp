@@ -1,38 +1,17 @@
 use {
     solana_clock::Slot,
-    solana_ledger::mcp,
+    solana_ledger::{
+        mcp,
+        shred::mcp_shred::{McpShred, MCP_NUM_RELAYS},
+    },
     solana_pubkey::Pubkey,
-    solana_sha256_hasher::hashv,
-    solana_signature::{Signature, SIGNATURE_BYTES},
-    std::collections::HashMap,
-    thiserror::Error,
+    std::collections::BTreeMap,
 };
 
-pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
-pub const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
-pub const MCP_WITNESS_LEN: usize = mcp::MCP_WITNESS_LEN;
 pub const MCP_NUM_PROPOSERS: usize = mcp::NUM_PROPOSERS;
-pub const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
-    + std::mem::size_of::<u32>() // proposer_index
-    + std::mem::size_of::<u32>() // shred_index
-    + 32 // commitment
-    + MCP_SHRED_DATA_BYTES
-    + 1 // witness_len
-    + (32 * MCP_WITNESS_LEN)
-    + SIGNATURE_BYTES;
-
-const LEAF_DOMAIN: [u8; 1] = [0x00];
-const NODE_DOMAIN: [u8; 1] = [0x01];
+pub type McpShredMessage = McpShred;
 const MCP_RELAY_CACHE_MAX_ENTRIES: usize = MCP_NUM_RELAYS * MCP_NUM_PROPOSERS * 8;
 const MCP_RELAY_CACHE_SLOT_WINDOW: Slot = 64;
-
-#[derive(Debug, Error, Eq, PartialEq)]
-pub enum McpRelayError {
-    #[error("invalid MCP shred message size: expected {expected}, got {actual}")]
-    InvalidMessageSize { expected: usize, actual: usize },
-    #[error("invalid witness length: expected {expected}, got {actual}")]
-    InvalidWitnessLength { expected: usize, actual: usize },
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpDropReason {
@@ -55,149 +34,9 @@ pub enum McpRelayOutcome {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct McpShredMessage {
-    pub slot: Slot,
-    pub proposer_index: u32,
-    pub shred_index: u32,
-    pub commitment: [u8; 32],
-    pub shred_data: [u8; MCP_SHRED_DATA_BYTES],
-    pub witness: [[u8; 32]; MCP_WITNESS_LEN],
-    pub proposer_signature: Signature,
-}
-
-impl McpShredMessage {
-    pub fn to_bytes(&self) -> [u8; MCP_SHRED_MESSAGE_SIZE] {
-        let mut data = [0u8; MCP_SHRED_MESSAGE_SIZE];
-        let mut offset = 0usize;
-        data[offset..offset + std::mem::size_of::<Slot>()]
-            .copy_from_slice(&self.slot.to_le_bytes());
-        offset += std::mem::size_of::<Slot>();
-        data[offset..offset + std::mem::size_of::<u32>()]
-            .copy_from_slice(&self.proposer_index.to_le_bytes());
-        offset += std::mem::size_of::<u32>();
-        data[offset..offset + std::mem::size_of::<u32>()]
-            .copy_from_slice(&self.shred_index.to_le_bytes());
-        offset += std::mem::size_of::<u32>();
-        data[offset..offset + 32].copy_from_slice(&self.commitment);
-        offset += 32;
-        data[offset..offset + MCP_SHRED_DATA_BYTES].copy_from_slice(&self.shred_data);
-        offset += MCP_SHRED_DATA_BYTES;
-        data[offset] = MCP_WITNESS_LEN as u8;
-        offset += 1;
-        for sibling in &self.witness {
-            data[offset..offset + 32].copy_from_slice(sibling);
-            offset += 32;
-        }
-        data[offset..offset + SIGNATURE_BYTES].copy_from_slice(self.proposer_signature.as_ref());
-        data
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Result<Self, McpRelayError> {
-        if data.len() != MCP_SHRED_MESSAGE_SIZE {
-            return Err(McpRelayError::InvalidMessageSize {
-                expected: MCP_SHRED_MESSAGE_SIZE,
-                actual: data.len(),
-            });
-        }
-
-        let witness_len_offset = std::mem::size_of::<Slot>()
-            + std::mem::size_of::<u32>()
-            + std::mem::size_of::<u32>()
-            + 32
-            + MCP_SHRED_DATA_BYTES;
-        let witness_len = data[witness_len_offset] as usize;
-        if witness_len != MCP_WITNESS_LEN {
-            return Err(McpRelayError::InvalidWitnessLength {
-                expected: MCP_WITNESS_LEN,
-                actual: witness_len,
-            });
-        }
-
-        let mut offset = 0usize;
-        let slot = Slot::from_le_bytes(
-            data[offset..offset + std::mem::size_of::<Slot>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<Slot>();
-        let proposer_index = u32::from_le_bytes(
-            data[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<u32>();
-        let shred_index = u32::from_le_bytes(
-            data[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<u32>();
-
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&data[offset..offset + 32]);
-        offset += 32;
-
-        let mut shred_data = [0u8; MCP_SHRED_DATA_BYTES];
-        shred_data.copy_from_slice(&data[offset..offset + MCP_SHRED_DATA_BYTES]);
-        offset += MCP_SHRED_DATA_BYTES;
-
-        // witness_len already validated.
-        offset += 1;
-
-        let mut witness = [[0u8; 32]; MCP_WITNESS_LEN];
-        for sibling in &mut witness {
-            sibling.copy_from_slice(&data[offset..offset + 32]);
-            offset += 32;
-        }
-
-        let proposer_signature = Signature::from(
-            <[u8; SIGNATURE_BYTES]>::try_from(&data[offset..offset + SIGNATURE_BYTES]).unwrap(),
-        );
-
-        Ok(Self {
-            slot,
-            proposer_index,
-            shred_index,
-            commitment,
-            shred_data,
-            witness,
-            proposer_signature,
-        })
-    }
-
-    fn verify_signature(&self, proposer_pubkey: &Pubkey) -> bool {
-        self.proposer_signature
-            .verify(proposer_pubkey.as_ref(), &self.commitment)
-    }
-
-    fn verify_witness(&self) -> bool {
-        let leaf = hashv(&[
-            &LEAF_DOMAIN,
-            &self.slot.to_le_bytes(),
-            &self.proposer_index.to_le_bytes(),
-            &self.shred_index.to_le_bytes(),
-            &self.shred_data,
-        ])
-        .to_bytes();
-
-        let mut node = leaf;
-        let mut index = self.shred_index as usize;
-        for sibling in &self.witness {
-            node = if index & 1 == 0 {
-                hashv(&[&NODE_DOMAIN, &node, sibling]).to_bytes()
-            } else {
-                hashv(&[&NODE_DOMAIN, sibling, &node]).to_bytes()
-            };
-            index >>= 1;
-        }
-        node == self.commitment
-    }
-}
-
 #[derive(Default)]
 pub struct McpRelayProcessor {
-    shreds: HashMap<(Slot, u32, u32), Vec<u8>>,
+    shreds: BTreeMap<(Slot, u32, u32), Vec<u8>>,
     highest_slot_seen: Slot,
 }
 
@@ -211,7 +50,7 @@ impl McpRelayProcessor {
     }
 
     pub fn process_shred(&mut self, payload: &[u8], proposer_pubkey: &Pubkey) -> McpRelayOutcome {
-        let message = match McpShredMessage::from_bytes(payload) {
+        let message = match McpShred::from_bytes(payload) {
             Ok(message) => message,
             Err(_) => return McpRelayOutcome::Dropped(McpDropReason::DecodeError),
         };
@@ -238,7 +77,7 @@ impl McpRelayProcessor {
             return McpRelayOutcome::Dropped(McpDropReason::ConflictingShred);
         }
         if self.shreds.len() >= MCP_RELAY_CACHE_MAX_ENTRIES {
-            if let Some(oldest_key) = self.shreds.keys().min_by_key(|(slot, _, _)| *slot).copied() {
+            if let Some(oldest_key) = self.shreds.keys().next().copied() {
                 self.shreds.remove(&oldest_key);
             }
         }
@@ -256,7 +95,16 @@ impl McpRelayProcessor {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, solana_keypair::Keypair, solana_signer::Signer};
+    use {
+        super::*,
+        solana_keypair::Keypair,
+        solana_ledger::shred::mcp_shred::{McpShredError, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN},
+        solana_sha256_hasher::hashv,
+        solana_signer::Signer,
+    };
+
+    const LEAF_DOMAIN: [u8; 1] = [0x00];
+    const NODE_DOMAIN: [u8; 1] = [0x01];
 
     fn make_shreds() -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
         (0..MCP_NUM_RELAYS)
@@ -325,7 +173,7 @@ mod tests {
         witness: [[u8; 32]; MCP_WITNESS_LEN],
         signer: &Keypair,
     ) -> Vec<u8> {
-        McpShredMessage {
+        McpShred {
             slot,
             proposer_index,
             shred_index,
@@ -526,13 +374,13 @@ mod tests {
 
     #[test]
     fn test_from_bytes_rejects_wrong_size() {
-        let too_short = vec![0u8; MCP_SHRED_MESSAGE_SIZE - 1];
-        let err = McpShredMessage::from_bytes(&too_short).unwrap_err();
+        let too_short = vec![0u8; MCP_SHRED_WIRE_SIZE - 1];
+        let err = McpShred::from_bytes(&too_short).unwrap_err();
         assert_eq!(
             err,
-            McpRelayError::InvalidMessageSize {
-                expected: MCP_SHRED_MESSAGE_SIZE,
-                actual: MCP_SHRED_MESSAGE_SIZE - 1,
+            McpShredError::InvalidSize {
+                expected: MCP_SHRED_WIRE_SIZE,
+                actual: MCP_SHRED_WIRE_SIZE - 1,
             }
         );
     }
