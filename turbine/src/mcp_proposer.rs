@@ -2,11 +2,11 @@ use {
     solana_ledger::{
         mcp,
         mcp_erasure::{encode_fec_set, McpErasureError, MCP_MAX_PAYLOAD_BYTES},
+        shred::mcp_shred::{McpShred, MCP_SHRED_WIRE_SIZE},
     },
     solana_clock::Slot,
     solana_keypair::Keypair,
     solana_sha256_hasher::hashv,
-    solana_signature::{Signature, SIGNATURE_BYTES},
     solana_signer::Signer,
     thiserror::Error,
 };
@@ -15,14 +15,7 @@ pub(crate) const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
 pub(crate) const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
 pub(crate) const MCP_WITNESS_LEN: usize = mcp::MCP_WITNESS_LEN;
 pub(crate) const MCP_MAX_PAYLOAD_SIZE: usize = MCP_MAX_PAYLOAD_BYTES;
-pub(crate) const MCP_SHRED_MESSAGE_SIZE: usize = std::mem::size_of::<Slot>()
-    + std::mem::size_of::<u32>() // proposer_index
-    + std::mem::size_of::<u32>() // shred_index
-    + 32 // commitment
-    + MCP_SHRED_DATA_BYTES
-    + 1 // witness_len
-    + (32 * MCP_WITNESS_LEN)
-    + SIGNATURE_BYTES;
+pub(crate) const MCP_SHRED_MESSAGE_SIZE: usize = MCP_SHRED_WIRE_SIZE;
 
 const LEAF_DOMAIN: [u8; 1] = [0x00];
 const NODE_DOMAIN: [u8; 1] = [0x01];
@@ -59,15 +52,16 @@ pub(crate) fn build_shred_messages(
     let mut messages = Vec::with_capacity(MCP_NUM_RELAYS);
 
     for (relay_index, (shred_data, witness)) in shreds.iter().zip(witnesses).enumerate() {
-        let message = serialize_shred_message(
+        let message = McpShred {
             slot,
             proposer_index,
-            relay_index as u32,
+            shred_index: relay_index as u32,
             commitment,
-            *shred_data,
+            shred_data: *shred_data,
             witness,
             proposer_signature,
-        );
+        }
+        .to_bytes();
         messages.push(message);
     }
 
@@ -125,120 +119,18 @@ fn derive_commitment_and_witnesses(
     (commitment, witnesses)
 }
 
-fn serialize_shred_message(
-    slot: Slot,
-    proposer_index: u32,
-    shred_index: u32,
-    commitment: [u8; 32],
-    shred_data: [u8; MCP_SHRED_DATA_BYTES],
-    witness: [[u8; 32]; MCP_WITNESS_LEN],
-    proposer_signature: Signature,
-) -> [u8; MCP_SHRED_MESSAGE_SIZE] {
-    let mut data = [0u8; MCP_SHRED_MESSAGE_SIZE];
-    let mut offset = 0usize;
-
-    data[offset..offset + std::mem::size_of::<Slot>()].copy_from_slice(&slot.to_le_bytes());
-    offset += std::mem::size_of::<Slot>();
-    data[offset..offset + std::mem::size_of::<u32>()]
-        .copy_from_slice(&proposer_index.to_le_bytes());
-    offset += std::mem::size_of::<u32>();
-    data[offset..offset + std::mem::size_of::<u32>()].copy_from_slice(&shred_index.to_le_bytes());
-    offset += std::mem::size_of::<u32>();
-    data[offset..offset + 32].copy_from_slice(&commitment);
-    offset += 32;
-    data[offset..offset + MCP_SHRED_DATA_BYTES].copy_from_slice(&shred_data);
-    offset += MCP_SHRED_DATA_BYTES;
-    data[offset] = MCP_WITNESS_LEN as u8;
-    offset += 1;
-    for sibling in witness {
-        data[offset..offset + 32].copy_from_slice(&sibling);
-        offset += 32;
-    }
-    data[offset..offset + SIGNATURE_BYTES].copy_from_slice(proposer_signature.as_ref());
-    data
-}
-
 #[cfg(test)]
 mod tests {
     use {super::*, solana_pubkey::Pubkey};
 
     fn verify_message(message: &[u8], relay_index: u32, proposer_pubkey: &Pubkey) -> bool {
-        if message.len() != MCP_SHRED_MESSAGE_SIZE {
+        let Ok(shred) = McpShred::from_bytes(message) else {
+            return false;
+        };
+        if shred.shred_index != relay_index {
             return false;
         }
-        let mut offset = 0usize;
-
-        let slot = Slot::from_le_bytes(
-            message[offset..offset + std::mem::size_of::<Slot>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<Slot>();
-
-        let proposer_index = u32::from_le_bytes(
-            message[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<u32>();
-
-        let shred_index = u32::from_le_bytes(
-            message[offset..offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .unwrap(),
-        );
-        offset += std::mem::size_of::<u32>();
-
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&message[offset..offset + 32]);
-        offset += 32;
-
-        let mut shred_data = [0u8; MCP_SHRED_DATA_BYTES];
-        shred_data.copy_from_slice(&message[offset..offset + MCP_SHRED_DATA_BYTES]);
-        offset += MCP_SHRED_DATA_BYTES;
-
-        let witness_len = message[offset] as usize;
-        if witness_len != MCP_WITNESS_LEN {
-            return false;
-        }
-        offset += 1;
-
-        let mut witness = [[0u8; 32]; MCP_WITNESS_LEN];
-        for sibling in &mut witness {
-            sibling.copy_from_slice(&message[offset..offset + 32]);
-            offset += 32;
-        }
-
-        let proposer_signature = Signature::from(
-            <[u8; SIGNATURE_BYTES]>::try_from(&message[offset..offset + SIGNATURE_BYTES]).unwrap(),
-        );
-
-        if shred_index != relay_index {
-            return false;
-        }
-        if !proposer_signature.verify(proposer_pubkey.as_ref(), &commitment) {
-            return false;
-        }
-
-        let leaf = hashv(&[
-            &LEAF_DOMAIN,
-            &slot.to_le_bytes(),
-            &proposer_index.to_le_bytes(),
-            &shred_index.to_le_bytes(),
-            &shred_data,
-        ])
-        .to_bytes();
-        let mut node = leaf;
-        let mut index = shred_index as usize;
-        for sibling in &witness {
-            node = if index & 1 == 0 {
-                hashv(&[&NODE_DOMAIN, &node, sibling]).to_bytes()
-            } else {
-                hashv(&[&NODE_DOMAIN, sibling, &node]).to_bytes()
-            };
-            index >>= 1;
-        }
-        node == commitment
+        shred.verify_signature(proposer_pubkey) && shred.verify_witness()
     }
 
     fn make_shreds() -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
