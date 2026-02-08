@@ -1,6 +1,6 @@
 use {
-    solana_ledger::mcp,
     solana_clock::Slot,
+    solana_ledger::mcp,
     solana_pubkey::Pubkey,
     solana_sha256_hasher::hashv,
     solana_signature::{Signature, SIGNATURE_BYTES},
@@ -38,7 +38,6 @@ pub enum McpRelayError {
 pub enum McpDropReason {
     DecodeError,
     ProposerIndexOutOfRange,
-    WrongRelayIndex,
     InvalidProposerSignature,
     InvalidWitness,
     ConflictingShred,
@@ -211,12 +210,7 @@ impl McpRelayProcessor {
         self.shreds.retain(|(slot, _, _), _| *slot >= root_slot);
     }
 
-    pub fn process_shred(
-        &mut self,
-        payload: &[u8],
-        relay_index: u32,
-        proposer_pubkey: &Pubkey,
-    ) -> McpRelayOutcome {
+    pub fn process_shred(&mut self, payload: &[u8], proposer_pubkey: &Pubkey) -> McpRelayOutcome {
         let message = match McpShredMessage::from_bytes(payload) {
             Ok(message) => message,
             Err(_) => return McpRelayOutcome::Dropped(McpDropReason::DecodeError),
@@ -224,21 +218,17 @@ impl McpRelayProcessor {
         if message.proposer_index as usize >= MCP_NUM_PROPOSERS {
             return McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange);
         }
-        self.highest_slot_seen = self.highest_slot_seen.max(message.slot);
-        let min_slot = self
-            .highest_slot_seen
-            .saturating_sub(MCP_RELAY_CACHE_SLOT_WINDOW);
-        self.shreds.retain(|(slot, _, _), _| *slot >= min_slot);
-
-        if message.shred_index != relay_index {
-            return McpRelayOutcome::Dropped(McpDropReason::WrongRelayIndex);
-        }
         if !message.verify_signature(proposer_pubkey) {
             return McpRelayOutcome::Dropped(McpDropReason::InvalidProposerSignature);
         }
         if !message.verify_witness() {
             return McpRelayOutcome::Dropped(McpDropReason::InvalidWitness);
         }
+        self.highest_slot_seen = self.highest_slot_seen.max(message.slot);
+        let min_slot = self
+            .highest_slot_seen
+            .saturating_sub(MCP_RELAY_CACHE_SLOT_WINDOW);
+        self.shreds.retain(|(slot, _, _), _| *slot >= min_slot);
 
         let key = (message.slot, message.proposer_index, message.shred_index);
         if let Some(stored) = self.shreds.get(&key) {
@@ -248,8 +238,7 @@ impl McpRelayProcessor {
             return McpRelayOutcome::Dropped(McpDropReason::ConflictingShred);
         }
         if self.shreds.len() >= MCP_RELAY_CACHE_MAX_ENTRIES {
-            if let Some(oldest_key) = self.shreds.keys().min_by_key(|(slot, _, _)| *slot).copied()
-            {
+            if let Some(oldest_key) = self.shreds.keys().min_by_key(|(slot, _, _)| *slot).copied() {
                 self.shreds.remove(&oldest_key);
             }
         }
@@ -369,7 +358,7 @@ mod tests {
         );
 
         let mut relay = McpRelayProcessor::default();
-        let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        let outcome = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(
             outcome,
             McpRelayOutcome::StoredAndBroadcast {
@@ -381,7 +370,7 @@ mod tests {
         );
         assert_eq!(relay.stored_count(), 1);
 
-        let duplicate = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        let duplicate = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(duplicate, McpRelayOutcome::Duplicate);
     }
 
@@ -406,37 +395,10 @@ mod tests {
         );
 
         let mut relay = McpRelayProcessor::default();
-        let outcome = relay.process_shred(&payload, relay_index, &honest_proposer.pubkey());
+        let outcome = relay.process_shred(&payload, &honest_proposer.pubkey());
         assert_eq!(
             outcome,
             McpRelayOutcome::Dropped(McpDropReason::InvalidProposerSignature)
-        );
-        assert_eq!(relay.stored_count(), 0);
-    }
-
-    #[test]
-    fn test_wrong_relay_index_is_dropped() {
-        let slot = 13;
-        let proposer_index = 2;
-        let proposer = Keypair::new();
-        let shreds = make_shreds();
-        let (commitment, witnesses) =
-            derive_commitment_and_witnesses(slot, proposer_index, &shreds);
-        let payload = build_message(
-            slot,
-            proposer_index,
-            9,
-            commitment,
-            shreds[9],
-            witnesses[9],
-            &proposer,
-        );
-
-        let mut relay = McpRelayProcessor::default();
-        let outcome = relay.process_shred(&payload, 10, &proposer.pubkey());
-        assert_eq!(
-            outcome,
-            McpRelayOutcome::Dropped(McpDropReason::WrongRelayIndex)
         );
         assert_eq!(relay.stored_count(), 0);
     }
@@ -463,7 +425,7 @@ mod tests {
         );
 
         let mut relay = McpRelayProcessor::default();
-        let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        let outcome = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(
             outcome,
             McpRelayOutcome::Dropped(McpDropReason::InvalidWitness)
@@ -491,7 +453,7 @@ mod tests {
         );
 
         let mut relay = McpRelayProcessor::default();
-        let first = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        let first = relay.process_shred(&payload, &proposer.pubkey());
         assert!(matches!(first, McpRelayOutcome::StoredAndBroadcast { .. }));
         assert_eq!(relay.stored_count(), 1);
 
@@ -508,7 +470,7 @@ mod tests {
             alt_witnesses[relay_index as usize],
             &proposer,
         );
-        let conflict_outcome = relay.process_shred(&conflicting, relay_index, &proposer.pubkey());
+        let conflict_outcome = relay.process_shred(&conflicting, &proposer.pubkey());
         assert_eq!(
             conflict_outcome,
             McpRelayOutcome::Dropped(McpDropReason::ConflictingShred)
@@ -549,11 +511,11 @@ mod tests {
 
         let mut relay = McpRelayProcessor::default();
         assert!(matches!(
-            relay.process_shred(&payload_a, relay_index, &proposer.pubkey()),
+            relay.process_shred(&payload_a, &proposer.pubkey()),
             McpRelayOutcome::StoredAndBroadcast { .. }
         ));
         assert!(matches!(
-            relay.process_shred(&payload_b, relay_index, &proposer.pubkey()),
+            relay.process_shred(&payload_b, &proposer.pubkey()),
             McpRelayOutcome::StoredAndBroadcast { .. }
         ));
         assert_eq!(relay.stored_count(), 2);
@@ -581,7 +543,8 @@ mod tests {
         let proposer_index = 2;
         let slot = 31;
         let shreds = make_shreds();
-        let (commitment, witnesses) = derive_commitment_and_witnesses(slot, proposer_index, &shreds);
+        let (commitment, witnesses) =
+            derive_commitment_and_witnesses(slot, proposer_index, &shreds);
         let mut relay = McpRelayProcessor::default();
 
         for relay_index in [0u32, (MCP_NUM_RELAYS - 1) as u32] {
@@ -594,8 +557,11 @@ mod tests {
                 witnesses[relay_index as usize],
                 &proposer,
             );
-            let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
-            assert!(matches!(outcome, McpRelayOutcome::StoredAndBroadcast { .. }));
+            let outcome = relay.process_shred(&payload, &proposer.pubkey());
+            assert!(matches!(
+                outcome,
+                McpRelayOutcome::StoredAndBroadcast { .. }
+            ));
         }
         assert_eq!(relay.stored_count(), 2);
     }
@@ -607,7 +573,8 @@ mod tests {
         let proposer_index = MCP_NUM_PROPOSERS as u32;
         let slot = 33;
         let shreds = make_shreds();
-        let (commitment, witnesses) = derive_commitment_and_witnesses(slot, proposer_index, &shreds);
+        let (commitment, witnesses) =
+            derive_commitment_and_witnesses(slot, proposer_index, &shreds);
         let payload = build_message(
             slot,
             proposer_index,
@@ -619,10 +586,70 @@ mod tests {
         );
 
         let mut relay = McpRelayProcessor::default();
-        let outcome = relay.process_shred(&payload, relay_index, &proposer.pubkey());
+        let outcome = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(
             outcome,
             McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange)
         );
+    }
+
+    #[test]
+    fn test_invalid_high_slot_does_not_prune_valid_cached_entries() {
+        let proposer = Keypair::new();
+        let attacker = Keypair::new();
+        let proposer_index = 1;
+        let relay_index = 4u32;
+        let shreds = make_shreds();
+        let mut relay = McpRelayProcessor::default();
+
+        let (commitment_10, witnesses_10) =
+            derive_commitment_and_witnesses(10, proposer_index, &shreds);
+        let payload_10 = build_message(
+            10,
+            proposer_index,
+            relay_index,
+            commitment_10,
+            shreds[relay_index as usize],
+            witnesses_10[relay_index as usize],
+            &proposer,
+        );
+        assert!(matches!(
+            relay.process_shred(&payload_10, &proposer.pubkey()),
+            McpRelayOutcome::StoredAndBroadcast { .. }
+        ));
+
+        let (commitment_1000, witnesses_1000) =
+            derive_commitment_and_witnesses(1000, proposer_index, &shreds);
+        let payload_1000_invalid_sig = build_message(
+            1000,
+            proposer_index,
+            relay_index,
+            commitment_1000,
+            shreds[relay_index as usize],
+            witnesses_1000[relay_index as usize],
+            &attacker,
+        );
+        assert_eq!(
+            relay.process_shred(&payload_1000_invalid_sig, &proposer.pubkey()),
+            McpRelayOutcome::Dropped(McpDropReason::InvalidProposerSignature),
+        );
+
+        let (commitment_11, witnesses_11) =
+            derive_commitment_and_witnesses(11, proposer_index, &shreds);
+        let payload_11 = build_message(
+            11,
+            proposer_index,
+            relay_index,
+            commitment_11,
+            shreds[relay_index as usize],
+            witnesses_11[relay_index as usize],
+            &proposer,
+        );
+        assert!(matches!(
+            relay.process_shred(&payload_11, &proposer.pubkey()),
+            McpRelayOutcome::StoredAndBroadcast { .. }
+        ));
+
+        assert_eq!(relay.stored_count(), 2);
     }
 }
