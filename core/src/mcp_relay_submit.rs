@@ -281,14 +281,18 @@ pub fn dispatch_relay_attestation_to_slot_leader(
         .ok_or(RelaySubmitError::MissingLeaderAddress(
             dispatch.leader_pubkey,
         ))?;
-    quic_endpoint_sender
-        .try_send((leader_addr, Bytes::copy_from_slice(&dispatch.frame)))
-        .map_err(|err| match err {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => RelaySubmitError::SendChannelFull,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                RelaySubmitError::SendChannelClosed
-            }
-        })?;
+    let payload = Bytes::copy_from_slice(&dispatch.frame);
+    match quic_endpoint_sender.try_send((leader_addr, payload)) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full((leader_addr, payload))) => {
+            quic_endpoint_sender
+                .blocking_send((leader_addr, payload))
+                .map_err(|_| RelaySubmitError::SendChannelClosed)?;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Err(RelaySubmitError::SendChannelClosed);
+        }
+    }
 
     Ok(dispatch)
 }
