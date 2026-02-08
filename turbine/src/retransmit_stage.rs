@@ -15,7 +15,11 @@ use {
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
     solana_ledger::{
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{self, ShredFlags, ShredId, ShredType},
+        shred::{
+            self,
+            mcp_shred::{is_mcp_shred_bytes, McpShred},
+            ShredFlags, ShredId, ShredType,
+        },
     },
     solana_measure::measure::Measure,
     solana_perf::deduper::Deduper,
@@ -364,7 +368,7 @@ fn retransmit(
     let cache: HashMap<Slot, _> = shred_buf
         .iter()
         .flatten()
-        .filter_map(|shred| shred::layout::get_slot(shred))
+        .filter_map(|shred| shred::layout::get_slot(shred).or_else(|| get_mcp_slot(shred)))
         .collect::<HashSet<Slot>>()
         .into_iter()
         .filter_map(|slot: Slot| {
@@ -460,7 +464,8 @@ fn retransmit_shred(
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &RetransmitStats,
 ) -> Option<RetransmitShredOutput> {
-    let key = shred::layout::get_shred_id(shred.as_ref())?;
+    let key = shred::layout::get_shred_id(shred.as_ref())
+        .or_else(|| get_mcp_shred_id(shred.as_ref()))?;
     if key.slot() < root_bank.slot()
         || shred_deduper.dedup(key, shred.as_ref(), MAX_DUPLICATE_COUNT)
     {
@@ -534,6 +539,25 @@ fn retransmit_shred(
             Cow::Borrowed(_) => None,
         },
     })
+}
+
+fn get_mcp_slot(shred: &[u8]) -> Option<Slot> {
+    if !is_mcp_shred_bytes(shred) {
+        return None;
+    }
+    Some(McpShred::from_bytes(shred).ok()?.slot)
+}
+
+fn get_mcp_shred_id(shred: &[u8]) -> Option<ShredId> {
+    if !is_mcp_shred_bytes(shred) {
+        return None;
+    }
+    let mcp_shred = McpShred::from_bytes(shred).ok()?;
+    Some(ShredId::new(
+        mcp_shred.slot,
+        mcp_shred.shred_index,
+        ShredType::Data,
+    ))
 }
 
 fn get_retransmit_addrs<'a>(
