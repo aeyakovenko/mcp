@@ -8,6 +8,7 @@ use {
 };
 
 pub const MCP_NUM_RELAYS: usize = 200;
+pub const MCP_NUM_PROPOSERS: usize = 16;
 pub const MCP_SHRED_DATA_BYTES: usize = 863;
 pub const MCP_WITNESS_LEN: usize = mcp_witness_len(MCP_NUM_RELAYS);
 
@@ -59,10 +60,22 @@ const fn mcp_witness_len(num_relays: usize) -> usize {
 }
 
 pub fn is_mcp_shred_bytes(data: &[u8]) -> bool {
-    data.len() == MCP_SHRED_WIRE_SIZE
-        && data
+    if data.len() != MCP_SHRED_WIRE_SIZE
+        || !data
             .get(OFFSET_WITNESS_LEN)
             .is_some_and(|len| *len as usize == MCP_WITNESS_LEN)
+    {
+        return false;
+    }
+    let Ok(shred) = McpShred::from_bytes(data) else {
+        return false;
+    };
+    if shred.proposer_index as usize >= MCP_NUM_PROPOSERS
+        || shred.shred_index as usize >= MCP_NUM_RELAYS
+    {
+        return false;
+    }
+    shred.verify_witness()
 }
 
 pub fn is_mcp_shred_packet(packet: &Packet) -> bool {
@@ -347,5 +360,27 @@ mod tests {
         shred.shred_data[0] ^= 1;
         shred.commitment[0] ^= 1;
         assert!(!shred.verify_signature(&keypair.pubkey()));
+    }
+
+    #[test]
+    fn test_classifier_rejects_out_of_range_indices() {
+        let slot = 42;
+        let proposer_index = (MCP_NUM_PROPOSERS + 1) as u32;
+        let shred_index = 0usize;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let keypair = Keypair::new();
+        let proposer_signature = keypair.sign_message(&commitment);
+        let shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index: shred_index as u32,
+            commitment,
+            shred_data: leaves[shred_index],
+            witness,
+            proposer_signature,
+        };
+        assert!(!is_mcp_shred_bytes(&shred.to_bytes()));
     }
 }
