@@ -239,7 +239,15 @@ where
             legacy_shreds.push((shred, repair, block_location));
             continue;
         };
-        mcp_shred_count += 1;
+
+        if !cluster_nodes::check_feature_activation(
+            &feature_set::mcp_protocol_v1::id(),
+            mcp_shred.slot,
+            &root_bank,
+        ) {
+            legacy_shreds.push((shred, repair, block_location));
+            continue;
+        }
 
         if last_bank_refresh.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
             last_bank_refresh = Instant::now();
@@ -247,14 +255,6 @@ where
             mcp_relay_processor.prune_below_slot(root_bank.slot());
             relay_indices_cache.clear();
             proposer_pubkeys_cache.clear();
-        }
-
-        if !cluster_nodes::check_feature_activation(
-            &feature_set::mcp_protocol_v1::id(),
-            mcp_shred.slot,
-            &root_bank,
-        ) {
-            continue;
         }
 
         let relay_indices = relay_indices_cache
@@ -267,6 +267,7 @@ where
                 )
             });
         if !relay_indices.contains(&mcp_shred.shred_index) {
+            legacy_shreds.push((shred, repair, block_location));
             continue;
         }
 
@@ -281,6 +282,7 @@ where
             .get(mcp_shred.proposer_index as usize)
             .copied()
         else {
+            legacy_shreds.push((shred, repair, block_location));
             continue;
         };
 
@@ -292,9 +294,15 @@ where
                 payload,
             } => {
                 match blockstore.put_mcp_shred_data(slot, proposer_index, shred_index, &payload)? {
-                    McpPutStatus::Inserted => mcp_retransmit_batch.push(payload.into()),
-                    McpPutStatus::Duplicate => {}
+                    McpPutStatus::Inserted => {
+                        mcp_shred_count += 1;
+                        mcp_retransmit_batch.push(payload.into());
+                    }
+                    McpPutStatus::Duplicate => {
+                        mcp_shred_count += 1;
+                    }
                     McpPutStatus::Conflict(marker) => {
+                        mcp_shred_count += 1;
                         warn!(
                             "MCP shred conflict at ({slot}, {proposer_index}, {shred_index}); \
                          existing={}, incoming={}",
@@ -303,7 +311,19 @@ where
                     }
                 }
             }
-            McpRelayOutcome::Dropped(_) | McpRelayOutcome::Duplicate => {}
+            McpRelayOutcome::Duplicate => {
+                mcp_shred_count += 1;
+            }
+            McpRelayOutcome::Dropped(reason) => {
+                // Fall back to legacy handling for non-MCP bytes that happen to satisfy
+                // the fixed-size MCP envelope checks.
+                match reason {
+                    crate::mcp_relay::McpDropReason::ConflictingShred => {
+                        mcp_shred_count += 1;
+                    }
+                    _ => legacy_shreds.push((shred, repair, block_location)),
+                }
+            }
         }
     }
 
