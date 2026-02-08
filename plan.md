@@ -13,7 +13,10 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Release Blockers (`UNVERIFIED` until resolved)
 
-- none currently
+- `S1` payload bound wording mismatch in spec:
+  - Spec §3.2 says serialized batch MUST NOT exceed `NUM_RELAYS * SHRED_DATA_BYTES`.
+  - With §4 FEC parameters (`DATA_SHREDS_PER_FEC_BLOCK=40`, `NUM_RELAYS=200`), RS payload capacity is `DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES`.
+  - This plan uses the RS-capacity bound. Spec text should be clarified to avoid two incompatible interpretations.
 
 ## Resolved Policy Decisions
 
@@ -26,7 +29,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
     - otherwise pass through legacy bytes
   - Fee/ordering extraction:
     - latest format: read `ordering_fee` from §7.1 config field
-    - legacy format: derive ordering key from `compute_unit_price`
+    - legacy format: derive ordering key from `compute_unit_price` (default `0` if absent)
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
   - Execute highest-paying transactions first.
@@ -82,7 +85,10 @@ Non-reusable for MCP wire correctness:
     - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
     - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
     - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
-    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520`
+    - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
+    - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
+    - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (see blocker `S1`)
   - Types:
     - `McpPayload`
     - `RelayAttestation`
@@ -155,8 +161,8 @@ Non-reusable for MCP wire correctness:
   - Add:
     - `proposers_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=16)
     - `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=200)
-    - `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u8>`
-    - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u16>`
+    - `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
+    - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
   - Duplicate identities return all indices (spec §5).
 
 ### 2.4 Tests
@@ -175,8 +181,8 @@ Non-reusable for MCP wire correctness:
 ### 3.1 MCP column families
 
 - `ledger/src/blockstore/column.rs`:
-  - Add `McpShredData` with index `(Slot, u8 proposer_index, u32 shred_index)`.
-  - Add `McpRelayAttestation` with index `(Slot, u16 relay_index)`.
+  - Add `McpShredData` with index `(Slot, u32 proposer_index, u32 shred_index)`.
+  - Add `McpRelayAttestation` with index `(Slot, u32 relay_index)`.
 - `ledger/src/blockstore_db.rs`:
   - Register CF descriptors.
   - Add names to `columns()` list.
@@ -287,7 +293,7 @@ Non-reusable for MCP wire correctness:
 - Worker steps:
   1. drain verified tx packets from MCP channel.
   2. parse ordering key using dual-format rules from resolved `B1` and descending-fee policy from `B2`.
-  3. optional local admission control with `CostModel` + local `CostTracker` budgeted per proposer.
+  3. enforce per-proposer admission control with `CostModel` + local `CostTracker` budgeted per proposer (spec §3.2 resource partitioning).
   4. order transactions deterministically.
   5. serialize payload and enforce max payload bound; emit latest §7.1 format where available, otherwise legacy bytes.
   6. call ledger MCP encode helper -> 200 shreds + witnesses.
@@ -342,7 +348,7 @@ Validation rules:
 
 When this node is leader for slot `s` at aggregation deadline:
 1. filter invalid entries as above
-2. if valid relay entries < 120 -> submit empty result
+2. if valid relay entries < `REQUIRED_ATTESTATIONS` -> submit empty result
 3. build `AggregateAttestation`
 4. construct/sign `ConsensusBlock` with:
    - `consensus_meta` and authoritative `block_id` from Alpenglow consensus (`B3`)
@@ -355,7 +361,7 @@ When this node is leader for slot `s` at aggregation deadline:
 
 ### 6.5 Tests
 
-- threshold behavior (`<120` => empty)
+- threshold behavior (`< REQUIRED_ATTESTATIONS` => empty)
 - relay/proposer filtering semantics
 - canonical aggregate ordering
 - direct QUIC block distribution
@@ -372,13 +378,13 @@ When this node is leader for slot `s` at aggregation deadline:
   1. verify leader signature and leader index for slot
   2. verify delayed bankhash by consensus-defined delayed slot; if local delayed bankhash is unavailable, do not vote and keep block pending
   3. verify relay/proposer signatures and ignore invalid entries
-  4. enforce global relay threshold after filtering (`>=120`)
+  4. enforce global relay threshold after filtering (`>= REQUIRED_ATTESTATIONS`)
   5. implied proposer rules:
      - multiple commitments => exclude
-     - one commitment with `>=80` relay attestations => include
+     - one commitment with `>= REQUIRED_INCLUSIONS` relay attestations => include
   6. local availability check:
      - count only locally stored shreds whose witness validates against included commitment
-     - require `>=40` per included proposer
+     - require `>= REQUIRED_RECONSTRUCTION` per included proposer
 
 ### 7.2 Reconstruction
 
