@@ -9,6 +9,7 @@ use {
 pub const CONSENSUS_BLOCK_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
+const SIGNING_DOMAIN_V1: &[u8] = b"mcp:consensus_block:v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBlock {
@@ -65,7 +66,7 @@ impl ConsensusBlock {
         })
     }
 
-    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
+    fn wire_body_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
         if self.aggregate_bytes.len() > u32::MAX as usize {
             return Err(ConsensusBlockError::AggregateLengthOverflow(
                 self.aggregate_bytes.len(),
@@ -91,8 +92,16 @@ impl ConsensusBlock {
         Ok(out)
     }
 
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
+        let body = self.wire_body_bytes()?;
+        let mut out = Vec::with_capacity(SIGNING_DOMAIN_V1.len() + body.len());
+        out.extend_from_slice(SIGNING_DOMAIN_V1);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
     pub fn to_wire_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
-        let mut bytes = self.signing_bytes()?;
+        let mut bytes = self.wire_body_bytes()?;
         bytes.extend_from_slice(self.leader_signature.as_ref());
         Ok(bytes)
     }
@@ -148,11 +157,14 @@ impl ConsensusBlock {
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, ConsensusBlockError> {
-    if *cursor + 1 > bytes.len() {
+    let Some(end) = cursor.checked_add(1) else {
+        return Err(ConsensusBlockError::Truncated);
+    };
+    if end > bytes.len() {
         return Err(ConsensusBlockError::Truncated);
     }
     let value = bytes[*cursor];
-    *cursor += 1;
+    *cursor = end;
     Ok(value)
 }
 
@@ -165,11 +177,14 @@ fn read_u64_le(bytes: &[u8], cursor: &mut usize) -> Result<u64, ConsensusBlockEr
 }
 
 fn read_vec(bytes: &[u8], cursor: &mut usize, len: usize) -> Result<Vec<u8>, ConsensusBlockError> {
-    if *cursor + len > bytes.len() {
+    let Some(end) = cursor.checked_add(len) else {
+        return Err(ConsensusBlockError::Truncated);
+    };
+    if end > bytes.len() {
         return Err(ConsensusBlockError::Truncated);
     }
-    let out = bytes[*cursor..*cursor + len].to_vec();
-    *cursor += len;
+    let out = bytes[*cursor..end].to_vec();
+    *cursor = end;
     Ok(out)
 }
 
@@ -177,12 +192,15 @@ fn read_array<const N: usize>(
     bytes: &[u8],
     cursor: &mut usize,
 ) -> Result<[u8; N], ConsensusBlockError> {
-    if *cursor + N > bytes.len() {
+    let Some(end) = cursor.checked_add(N) else {
+        return Err(ConsensusBlockError::Truncated);
+    };
+    if end > bytes.len() {
         return Err(ConsensusBlockError::Truncated);
     }
     let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[*cursor..*cursor + N]);
-    *cursor += N;
+    out.copy_from_slice(&bytes[*cursor..end]);
+    *cursor = end;
     Ok(out)
 }
 
@@ -224,6 +242,16 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_verification_fails_with_wrong_key() {
+        let leader = Keypair::new();
+        let wrong_leader = Keypair::new();
+        let mut block =
+            ConsensusBlock::new_unsigned(9, 3, vec![1, 2], vec![3], Hash::new_unique()).unwrap();
+        block.sign_leader(&leader).unwrap();
+        assert!(!block.verify_leader_signature(&wrong_leader.pubkey()));
+    }
+
+    #[test]
     fn test_unknown_version_rejected() {
         let bytes = vec![2u8; HEADER_LEN + TRAILER_LEN];
         assert_eq!(
@@ -245,6 +273,21 @@ mod tests {
         assert_eq!(
             ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
             ConsensusBlockError::TrailingBytes
+        );
+    }
+
+    #[test]
+    fn test_truncated_payload_rejected() {
+        let leader = Keypair::new();
+        let mut block =
+            ConsensusBlock::new_unsigned(2, 4, vec![7, 8], vec![9], Hash::new_unique()).unwrap();
+        block.sign_leader(&leader).unwrap();
+
+        let mut bytes = block.to_wire_bytes().unwrap();
+        bytes.pop();
+        assert_eq!(
+            ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
+            ConsensusBlockError::Truncated
         );
     }
 }
