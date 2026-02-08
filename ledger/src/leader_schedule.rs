@@ -215,4 +215,19 @@ mod tests {
         assert_ne!(leader, proposer);
         assert_ne!(proposer, relay);
     }
+
+    #[test]
+    fn test_domain_separated_seed_handles_long_domain() {
+        let stakes = vec![(Pubkey::new_unique(), 100), (Pubkey::new_unique(), 50)];
+        let keyed_stakes: Vec<_> = stakes.iter().map(|(k, stake)| (k, *stake)).collect();
+        // Long domains are handled via hashing, not truncation
+        let result = stake_weighted_slot_leaders_domain_separated(
+            keyed_stakes,
+            1,
+            16,
+            1,
+            b"mcp:this-domain-is-way-too-long-for-the-seed",
+        );
+        assert!(!result.is_empty());
+    }
 }
