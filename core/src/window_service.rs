@@ -286,7 +286,7 @@ where
             continue;
         };
 
-        match mcp_relay_processor.process_shred(&shred, mcp_shred.shred_index, &proposer_pubkey) {
+        match mcp_relay_processor.process_shred(&shred, &proposer_pubkey) {
             McpRelayOutcome::StoredAndBroadcast {
                 slot,
                 proposer_index,
