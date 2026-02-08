@@ -14,6 +14,7 @@ use {
         voting_utils::{generate_vote_message, VoteError, VotingContext},
         votor::SharedContext,
     },
+    agave_feature_set as feature_set,
     crossbeam_channel::{select, RecvError, SendError},
     parking_lot::RwLock,
     solana_clock::Slot,
@@ -406,6 +407,14 @@ impl EventHandler {
             VotorEvent::Finalized(block, is_fast_finalization) => {
                 info!("{my_pubkey}: Finalized {block:?} fast: {is_fast_finalization}");
                 finalized_blocks.insert(block);
+                let mcp_enabled = ctx
+                    .bank_forks
+                    .read()
+                    .unwrap()
+                    .root_bank()
+                    .feature_set
+                    .is_active(&feature_set::mcp_protocol_v1::id());
+                Self::maybe_record_empty_execution_output(block, mcp_enabled, ctx);
                 Self::check_rootable_blocks(
                     my_pubkey,
                     ctx,
@@ -521,6 +530,37 @@ impl EventHandler {
             local_context.my_pubkey
         );
         Some((parent_slot, parent_block_id))
+    }
+
+    fn maybe_record_empty_execution_output(
+        finalized_block: Block,
+        mcp_enabled: bool,
+        ctx: &SharedContext,
+    ) {
+        if !mcp_enabled {
+            return;
+        }
+
+        let (slot, block_id) = finalized_block;
+        let bank_forks = ctx.bank_forks.read().unwrap();
+        if slot <= bank_forks.root() {
+            return;
+        }
+
+        if bank_forks
+            .get(slot)
+            .is_some_and(|bank| bank.block_id() == Some(block_id))
+        {
+            return;
+        }
+        drop(bank_forks);
+
+        if let Err(err) = ctx.blockstore.put_mcp_empty_execution_output(slot) {
+            warn!(
+                "Failed to store empty MCP execution output for slot {}: {:?}",
+                slot, err
+            );
+        }
     }
 
     fn handle_set_identity(
@@ -1529,6 +1569,52 @@ mod tests {
         assert_eq!(dropped_banks[0].slot(), 0);
         // The bank forks root should be updated to 1
         assert_eq!(test_context.bank_forks.read().unwrap().root(), 1);
+    }
+
+    #[test]
+    fn test_records_empty_execution_output_for_missing_finalized_block() {
+        let test_context = setup();
+        let slot = 9;
+        EventHandler::maybe_record_empty_execution_output(
+            (slot, Hash::new_unique()),
+            true,
+            &test_context.shared_context,
+        );
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(slot)
+                .unwrap(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_skips_empty_execution_output_when_finalized_bank_exists() {
+        let mut test_context = setup();
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        let bank = test_context.create_block_only(1, root_bank);
+        let block = (1, bank.block_id().unwrap());
+
+        EventHandler::maybe_record_empty_execution_output(
+            block,
+            true,
+            &test_context.shared_context,
+        );
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(1)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
