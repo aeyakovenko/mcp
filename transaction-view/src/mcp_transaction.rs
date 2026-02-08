@@ -7,6 +7,7 @@ pub const MCP_TX_CONFIG_BIT_COMPUTE_UNIT_LIMIT: u8 = 2;
 pub const MCP_TX_CONFIG_BIT_ACCOUNTS_DATA_SIZE_LIMIT: u8 = 3;
 pub const MCP_TX_CONFIG_BIT_HEAP_SIZE: u8 = 4;
 pub const MCP_TX_CONFIG_BIT_TARGET_PROPOSER: u8 = 5;
+pub const MCP_TX_CONFIG_MASK_ALLOWED: u32 = (1u32 << (MCP_TX_CONFIG_BIT_TARGET_PROPOSER + 1)) - 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LegacyHeader {
@@ -48,6 +49,7 @@ pub enum McpTransactionParseError {
     UnexpectedEof,
     TrailingBytes,
     InvalidVersion(u8),
+    InvalidConfigMask(u32),
     InvalidConfigValuesLen,
     InstructionLengthMismatch,
 }
@@ -62,7 +64,9 @@ impl McpTransaction {
     }
 
     pub fn from_bytes_compat(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
-        let latest = Self::from_bytes(bytes).ok().filter(|parsed| parsed.to_bytes() == bytes);
+        let latest = Self::from_bytes(bytes)
+            .ok()
+            .filter(|parsed| parsed.to_bytes() == bytes);
         if let Some(parsed) = latest {
             return Ok(parsed);
         }
@@ -76,7 +80,10 @@ impl McpTransaction {
         }
     }
 
-    fn parse_inner(bytes: &[u8], has_version_prefix: bool) -> Result<Self, McpTransactionParseError> {
+    fn parse_inner(
+        bytes: &[u8],
+        has_version_prefix: bool,
+    ) -> Result<Self, McpTransactionParseError> {
         let mut offset = 0usize;
         let version = if has_version_prefix {
             let version = take_u8(bytes, &mut offset)?;
@@ -97,6 +104,11 @@ impl McpTransaction {
         };
 
         let transaction_config_mask = take_u32(bytes, &mut offset)?;
+        if transaction_config_mask & !MCP_TX_CONFIG_MASK_ALLOWED != 0 {
+            return Err(McpTransactionParseError::InvalidConfigMask(
+                transaction_config_mask,
+            ));
+        }
         let lifetime_specifier = take_array_32(bytes, &mut offset)?;
         let num_instructions = take_u8(bytes, &mut offset)? as usize;
         let num_addresses = take_u8(bytes, &mut offset)? as usize;
@@ -256,10 +268,7 @@ fn take_array_64(bytes: &[u8], offset: &mut usize) -> Result<[u8; 64], McpTransa
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        solana_hash::Hash,
-        solana_keypair::Keypair,
-        solana_signer::Signer,
+        super::*, solana_hash::Hash, solana_keypair::Keypair, solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::Transaction,
     };
@@ -354,6 +363,19 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_config_mask_rejected() {
+        let tx = sample_transaction();
+        let mut bytes = tx.to_bytes();
+        // Set an unsupported config bit.
+        let mask = (1u32 << 30).to_le_bytes();
+        bytes[4..8].copy_from_slice(&mask);
+        assert_eq!(
+            McpTransaction::from_bytes(&bytes),
+            Err(McpTransactionParseError::InvalidConfigMask(1u32 << 30))
+        );
+    }
+
+    #[test]
     fn test_legacy_with_first_byte_one_prefers_legacy_layout() {
         let mut tx = sample_transaction();
         tx.legacy_header.num_required_signatures = 1;
@@ -384,11 +406,7 @@ mod tests {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
         let mut tx = Transaction::new_with_payer(
-            &[system_instruction::transfer(
-                &payer.pubkey(),
-                &recipient,
-                1,
-            )],
+            &[system_instruction::transfer(&payer.pubkey(), &recipient, 1)],
             Some(&payer.pubkey()),
         );
         tx.sign(&[&payer], Hash::new_unique());
