@@ -17,7 +17,9 @@ use {
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
-        blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
+        blockstore::{
+            Blockstore, BlockstoreInsertionMetrics, McpPutStatus, PossibleDuplicateShred,
+        },
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{self, ReedSolomonCache, Shred},
@@ -237,6 +239,7 @@ where
         if last_bank_refresh.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
             last_bank_refresh = Instant::now();
             root_bank = bank_forks.read().unwrap().root_bank();
+            mcp_relay_processor.prune_below_slot(root_bank.slot());
         }
 
         if !cluster_nodes::check_feature_activation(
@@ -257,8 +260,23 @@ where
         };
 
         match mcp_relay_processor.process_shred(&shred, mcp_shred.shred_index, &proposer_pubkey) {
-            McpRelayOutcome::StoredAndBroadcast { payload, .. } => {
-                mcp_retransmit_batch.push(payload.into());
+            McpRelayOutcome::StoredAndBroadcast {
+                slot,
+                proposer_index,
+                shred_index,
+                payload,
+            } => {
+                match blockstore.put_mcp_shred_data(slot, proposer_index, shred_index, &payload)? {
+                    McpPutStatus::Inserted => mcp_retransmit_batch.push(payload.into()),
+                    McpPutStatus::Duplicate => {}
+                    McpPutStatus::Conflict(marker) => {
+                        warn!(
+                            "MCP shred conflict at ({slot}, {proposer_index}, {shred_index}); \
+                         existing={}, incoming={}",
+                            marker.existing_hash, marker.incoming_hash,
+                        );
+                    }
+                }
             }
             McpRelayOutcome::Dropped(_) | McpRelayOutcome::Duplicate => {}
         }
