@@ -118,8 +118,8 @@ pub struct TransactionProcessingConfig<'a> {
     pub limit_to_load_programs: bool,
     /// Recording capabilities for transaction execution.
     pub recording_config: ExecutionRecordingConfig,
-    /// If true, execution skips fee payer deduction and zeroes fee_details in
-    /// processed transactions. Intended for MCP second-pass replay.
+    /// If true, execution skips fee payer deduction while still computing
+    /// fee_details for deterministic reporting in MCP second-pass replay.
     pub skip_fee_collection: bool,
 }
 
@@ -689,11 +689,7 @@ impl<FG: ForkGraph> TransactionBatchProcessor<FG> {
         );
 
         Ok(ValidatedTransactionDetails {
-            fee_details: if skip_fee_collection {
-                FeeDetails::default()
-            } else {
-                compute_budget_and_limits.fee_details
-            },
+            fee_details: compute_budget_and_limits.fee_details,
             rollback_accounts,
             loaded_accounts_bytes_limit: compute_budget_and_limits.loaded_accounts_data_size_limit,
             compute_budget: compute_budget_and_limits.budget,
@@ -2174,7 +2170,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(result.fee_details, FeeDetails::default());
+        assert_eq!(
+            result.fee_details,
+            MockBankCallback::calculate_fee_details(&message, lamports_per_signature, 0),
+        );
         assert_eq!(
             result.loaded_fee_payer_account.account.lamports(),
             starting_balance
