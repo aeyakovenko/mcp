@@ -65,14 +65,21 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
         );
         let compute_budget_instruction_details =
             ComputeBudgetInstructionDetails::try_from(transaction.program_instructions_iter())?;
-        let mcp_fee_components = McpTransaction::from_bytes_compat(transaction.data())
-            .ok()
-            .map(|mcp_tx| {
-                (
-                    u64::from(mcp_tx.inclusion_fee().unwrap_or_default()),
-                    u64::from(mcp_tx.ordering_fee().unwrap_or_default()),
-                )
-            });
+        let mcp_fee_components = match McpTransaction::from_bytes_compat(transaction.data()) {
+            Ok(mcp_tx) => {
+                if mcp_tx.to_bytes().as_slice() == transaction.data() {
+                    let inclusion_fee = mcp_tx
+                        .inclusion_fee()
+                        .ok_or(TransactionError::SanitizeFailure)?;
+                    let ordering_fee =
+                        mcp_tx.ordering_fee().ok_or(TransactionError::SanitizeFailure)?;
+                    Some((u64::from(inclusion_fee), u64::from(ordering_fee)))
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
 
         Ok(Self {
             transaction,
