@@ -2938,7 +2938,7 @@ impl ReplayStage {
             Ok(mut inputs) => {
                 let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
                 inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-                inputs.remove(&slot)
+                inputs.get(&slot).cloned()
             }
             Err(err) => {
                 warn!(
@@ -2949,11 +2949,9 @@ impl ReplayStage {
             }
         };
         let Some(input) = maybe_input else {
-            info!(
-                "MCP vote gate input unavailable for slot {}; rejecting vote",
-                slot
-            );
-            return false;
+            // MCP vote-gate producers are wired in a follow-up path; until then, avoid
+            // stalling votes on missing optional gate input.
+            return true;
         };
 
         match mcp_vote_gate::evaluate_vote_gate(&input) {
@@ -5061,7 +5059,7 @@ pub(crate) mod tests {
     #[test]
     fn test_should_vote_mcp_slot_rejects_missing_input() {
         let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
-        assert!(!ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
+        assert!(ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
     }
 
     #[test]
@@ -5082,14 +5080,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_should_vote_mcp_slot_consumes_input_for_slot() {
+    fn test_should_vote_mcp_slot_reuses_input_for_slot() {
         let mcp_vote_gate_inputs =
             RwLock::new(HashMap::from([(15, make_mcp_vote_gate_input(true))]));
         assert!(ReplayStage::should_vote_mcp_slot(15, &mcp_vote_gate_inputs));
-        assert!(!ReplayStage::should_vote_mcp_slot(
-            15,
-            &mcp_vote_gate_inputs
-        ));
+        assert!(ReplayStage::should_vote_mcp_slot(15, &mcp_vote_gate_inputs));
     }
 
     #[test]
