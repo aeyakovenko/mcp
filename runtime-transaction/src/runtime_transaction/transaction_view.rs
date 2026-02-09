@@ -65,20 +65,24 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
         );
         let compute_budget_instruction_details =
             ComputeBudgetInstructionDetails::try_from(transaction.program_instructions_iter())?;
-        let mcp_fee_components = match McpTransaction::from_bytes_compat(transaction.data()) {
-            Ok(mcp_tx) => {
-                if mcp_tx.to_bytes().as_slice() == transaction.data() {
-                    let inclusion_fee = mcp_tx
-                        .inclusion_fee()
-                        .ok_or(TransactionError::SanitizeFailure)?;
-                    let ordering_fee =
-                        mcp_tx.ordering_fee().ok_or(TransactionError::SanitizeFailure)?;
-                    Some((u64::from(inclusion_fee), u64::from(ordering_fee)))
-                } else {
-                    None
+        let mcp_fee_components = match McpTransaction::maybe_mcp_wire_prefix(transaction.data()) {
+            false => None,
+            true => match McpTransaction::from_bytes_compat(transaction.data()) {
+                Ok(mcp_tx) => {
+                    if mcp_tx.to_bytes().as_slice() == transaction.data() {
+                        let inclusion_fee = mcp_tx
+                            .inclusion_fee()
+                            .ok_or(TransactionError::SanitizeFailure)?;
+                        let ordering_fee =
+                            mcp_tx.ordering_fee().ok_or(TransactionError::SanitizeFailure)?;
+                        Some((u64::from(inclusion_fee), u64::from(ordering_fee)))
+                    } else {
+                        // Legacy MCP layout has no ordering_fee field; use CU price.
+                        Some((0, compute_budget_instruction_details.requested_compute_unit_price()))
+                    }
                 }
-            }
-            Err(_) => None,
+                Err(_) => None,
+            },
         };
 
         Ok(Self {
