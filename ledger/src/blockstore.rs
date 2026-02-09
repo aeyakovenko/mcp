@@ -113,6 +113,8 @@ pub use {
 
 pub const MAX_REPLAY_WAKE_UP_SIGNALS: usize = 1;
 pub const MAX_COMPLETED_SLOTS_IN_CHANNEL: usize = 100_000;
+const MAX_MCP_SHRED_BYTES: usize = 1_232;
+const MAX_MCP_RELAY_ATTESTATION_BYTES: usize = 1_678;
 
 pub type CompletedSlotsSender = Sender<Vec<Slot>>;
 pub type CompletedSlotsReceiver = Receiver<Vec<Slot>>;
@@ -3183,6 +3185,21 @@ impl Blockstore {
         Ok(McpPutStatus::Inserted)
     }
 
+    fn validate_mcp_len(
+        kind: &'static str,
+        value: &[u8],
+        max: usize,
+    ) -> Result<()> {
+        if value.len() > max {
+            return Err(BlockstoreError::InvalidMcpLength {
+                kind,
+                actual: value.len(),
+                max,
+            });
+        }
+        Ok(())
+    }
+
     pub fn get_mcp_shred_data(
         &self,
         slot: Slot,
@@ -3200,6 +3217,7 @@ impl Blockstore {
         shred_index: u32,
         shred: &[u8],
     ) -> Result<McpPutStatus> {
+        Self::validate_mcp_len("shred", shred, MAX_MCP_SHRED_BYTES)?;
         self.put_mcp_bytes_if_absent(
             &self.insert_mcp_shred_lock,
             &self.mcp_shred_data_cf,
@@ -3222,6 +3240,11 @@ impl Blockstore {
         relay_index: u32,
         relay_attestation: &[u8],
     ) -> Result<McpPutStatus> {
+        Self::validate_mcp_len(
+            "relay attestation",
+            relay_attestation,
+            MAX_MCP_RELAY_ATTESTATION_BYTES,
+        )?;
         self.put_mcp_bytes_if_absent(
             &self.insert_mcp_relay_attestation_lock,
             &self.mcp_relay_attestation_cf,
@@ -6674,6 +6697,42 @@ pub mod tests {
                 .get_mcp_relay_attestation(slot, relay_index)
                 .unwrap(),
             Some(attestation)
+        );
+    }
+
+    #[test]
+    fn test_put_mcp_shred_data_rejects_oversized_payload() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let err = blockstore
+            .put_mcp_shred_data(1, 0, 0, &vec![0u8; MAX_MCP_SHRED_BYTES + 1])
+            .unwrap_err();
+        assert_matches!(
+            err,
+            BlockstoreError::InvalidMcpLength {
+                kind: "shred",
+                actual,
+                max: MAX_MCP_SHRED_BYTES
+            } if actual == MAX_MCP_SHRED_BYTES + 1
+        );
+    }
+
+    #[test]
+    fn test_put_mcp_relay_attestation_rejects_oversized_payload() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let err = blockstore
+            .put_mcp_relay_attestation(1, 0, &vec![0u8; MAX_MCP_RELAY_ATTESTATION_BYTES + 1])
+            .unwrap_err();
+        assert_matches!(
+            err,
+            BlockstoreError::InvalidMcpLength {
+                kind: "relay attestation",
+                actual,
+                max: MAX_MCP_RELAY_ATTESTATION_BYTES
+            } if actual == MAX_MCP_RELAY_ATTESTATION_BYTES + 1
         );
     }
 
