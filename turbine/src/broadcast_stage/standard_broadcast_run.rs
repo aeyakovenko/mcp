@@ -946,12 +946,12 @@ mod test {
         rand::Rng,
         solana_entry::entry::create_ticks,
         solana_genesis_config::GenesisConfig,
-        solana_gossip::{cluster_info::ClusterInfo, node::Node},
+        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{Blockstore, BlockstoreError},
-            genesis_utils::create_genesis_config,
+            genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path, mcp,
             shred::{max_ticks_per_n_shreds, DATA_SHREDS_PER_FEC_BLOCK},
         },
@@ -987,9 +987,9 @@ mod test {
         );
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
-        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey);
+        let leader_info = ContactInfo::new_localhost(&leader_pubkey, 0);
         let cluster_info = Arc::new(ClusterInfo::new(
-            leader_info.info,
+            leader_info,
             leader_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
@@ -1056,9 +1056,20 @@ mod test {
 
     #[test]
     fn test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state() {
-        let num_shreds_per_slot = DATA_SHREDS_PER_FEC_BLOCK as u64;
-        let (_blockstore, _genesis_config, cluster_info, bank, leader_keypair, _socket, bank_forks) =
-            setup_with_mcp_feature(num_shreds_per_slot, true);
+        let leader_keypair = Arc::new(Keypair::new());
+        let cluster_info = Arc::new(ClusterInfo::new(
+            ContactInfo::new_localhost(&leader_keypair.pubkey(), 0),
+            leader_keypair.clone(),
+            SocketAddrSpace::Unspecified,
+        ));
+        let mut genesis_config =
+            create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1_000)
+                .genesis_config;
+        genesis_config.ticks_per_slot = max_ticks_per_n_shreds(DATA_SHREDS_PER_FEC_BLOCK as u64, None) + 1;
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let bank = bank_forks.read().unwrap().root_bank();
         let (quic_endpoint_sender, mut quic_endpoint_receiver) =
             tokio::sync::mpsc::channel(/*capacity:*/ 4096);
 
@@ -1101,7 +1112,15 @@ mod test {
         while quic_endpoint_receiver.try_recv().is_ok() {
             dispatch_count += 1;
         }
-        assert_eq!(dispatch_count, mcp::NUM_RELAYS);
+        let expected_dispatch_count = standard_broadcast_run
+            .mcp_leader_schedule_cache
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&bank))
+            .proposer_indices_at_slot(bank.slot(), &leader_keypair.pubkey(), Some(&bank))
+            .len()
+            .saturating_mul(mcp::NUM_RELAYS);
+        assert_eq!(dispatch_count, expected_dispatch_count);
     }
 
     #[test]
