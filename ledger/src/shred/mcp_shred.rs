@@ -71,15 +71,22 @@ pub fn is_mcp_shred_bytes(data: &[u8]) -> bool {
     {
         return false;
     }
-    let Ok(shred) = McpShred::from_bytes(data) else {
-        return false;
-    };
-    if shred.proposer_index as usize >= MCP_NUM_PROPOSERS
-        || shred.shred_index as usize >= MCP_NUM_RELAYS
-    {
-        return false;
-    }
-    shred.verify_witness()
+
+    // Keep classifier cost low: only check fixed layout and bounded indices.
+    // Full signature and witness verification happens in MCP-specific verify paths.
+    let proposer_index_offset = std::mem::size_of::<Slot>();
+    let shred_index_offset = proposer_index_offset + std::mem::size_of::<u32>();
+    let proposer_index = u32::from_le_bytes(
+        data[proposer_index_offset..proposer_index_offset + std::mem::size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+    let shred_index = u32::from_le_bytes(
+        data[shred_index_offset..shred_index_offset + std::mem::size_of::<u32>()]
+            .try_into()
+            .unwrap(),
+    );
+    (proposer_index as usize) < MCP_NUM_PROPOSERS && (shred_index as usize) < MCP_NUM_RELAYS
 }
 
 pub fn is_mcp_shred_packet(packet: &Packet) -> bool {
