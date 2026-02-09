@@ -38,6 +38,9 @@ pub struct ConsensusBlock {
     pub leader_index: u32,
     pub aggregate_bytes: Vec<u8>,
     pub consensus_meta: Vec<u8>,
+    // MCP does not define block_id derivation at this layer; block_id remains
+    // Alpenglow-consensus authoritative. This field only carries the delayed
+    // bankhash used by the vote-gate checks.
     pub delayed_bankhash: Hash,
     pub leader_signature: Signature,
 }
