@@ -10,8 +10,16 @@ pub const CONSENSUS_BLOCK_V1: u8 = 1;
 const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
 const MAX_QUIC_CONTROL_PAYLOAD_BYTES: usize = 512 * 1024;
+const MCP_NUM_RELAYS: usize = 200;
+const MCP_NUM_PROPOSERS: usize = 16;
+const RELAY_ENTRY_HEADER_LEN: usize = 4 + 1;
+const PROPOSER_ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
 const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
-    1 + 8 + 4 + 2 + (200 * (4 + 1 + (16 * (4 + HASH_BYTES + SIGNATURE_BYTES)) + SIGNATURE_BYTES));
+    1 + 8 + 4 + 2
+        + (MCP_NUM_RELAYS
+            * (RELAY_ENTRY_HEADER_LEN
+                + (MCP_NUM_PROPOSERS * PROPOSER_ENTRY_LEN)
+                + SIGNATURE_BYTES));
 const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
 const MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES: usize =
     HEADER_LEN + MAX_AGGREGATE_ATTESTATION_BYTES + MAX_CONSENSUS_META_BYTES + TRAILER_LEN;
@@ -281,6 +289,20 @@ mod tests {
             Hash::new_unique(),
         )
         .unwrap();
+        block.sign_leader(&leader).unwrap();
+
+        let bytes = block.to_wire_bytes().unwrap();
+        let decoded = ConsensusBlock::from_wire_bytes(&bytes).unwrap();
+
+        assert_eq!(decoded, block);
+        assert!(decoded.verify_leader_signature(&leader.pubkey()));
+    }
+
+    #[test]
+    fn test_roundtrip_with_empty_aggregate_and_meta() {
+        let leader = Keypair::new();
+        let mut block = ConsensusBlock::new_unsigned(21, 3, vec![], vec![], Hash::new_unique())
+            .unwrap();
         block.sign_leader(&leader).unwrap();
 
         let bytes = block.to_wire_bytes().unwrap();
