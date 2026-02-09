@@ -547,6 +547,15 @@ impl EventHandler {
             if slot_bank.block_id() == Some(block_id) {
                 return;
             }
+            // A finalized block id mismatch indicates a fork/local replay mismatch,
+            // not an empty execution result.
+            debug!(
+                "Skipped empty MCP execution output for slot {}: finalized block id {} mismatches local bank {:?}",
+                slot,
+                block_id,
+                slot_bank.block_id()
+            );
+            return;
         } else if !bank_forks
             .root_bank()
             .feature_set
@@ -1622,6 +1631,31 @@ mod tests {
         let block = (1, bank.block_id().unwrap());
 
         EventHandler::maybe_record_empty_execution_output(block, &test_context.shared_context);
+        assert_eq!(
+            test_context
+                .shared_context
+                .blockstore
+                .get_mcp_execution_output(1)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_skips_empty_execution_output_when_finalized_block_id_mismatches_local_bank() {
+        let mut test_context = setup();
+        let root_bank = test_context
+            .bank_forks
+            .read()
+            .unwrap()
+            .sharable_banks()
+            .root();
+        test_context.create_block_only(1, root_bank);
+
+        EventHandler::maybe_record_empty_execution_output(
+            (1, Hash::new_unique()),
+            &test_context.shared_context,
+        );
         assert_eq!(
             test_context
                 .shared_context
