@@ -22,6 +22,8 @@ pub enum McpErasureError {
     InsufficientShards { present: usize, required: usize },
     #[error("reed-solomon error: {0}")]
     ReedSolomon(String),
+    #[error("merkle error: {0}")]
+    Merkle(#[from] mcp_merkle::McpMerkleError),
 }
 
 pub fn encode_fec_set(payload: &[u8]) -> Result<Vec<[u8; MCP_SHRED_DATA_BYTES]>, McpErasureError> {
@@ -129,9 +131,8 @@ pub fn commitment_root(
     slot: u64,
     proposer_index: u32,
     shreds: &[[u8; MCP_SHRED_DATA_BYTES]],
-) -> [u8; 32] {
-    mcp_merkle::commitment_root(slot, proposer_index, shreds)
-        .expect("MCP erasure always computes commitment over a non-empty fixed-size shred set")
+) -> Result<[u8; 32], McpErasureError> {
+    Ok(mcp_merkle::commitment_root(slot, proposer_index, shreds)?)
 }
 
 fn payload_to_data_shards(payload: &[u8]) -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
@@ -218,13 +219,35 @@ mod tests {
         let payload = vec![1u8; 1024];
         let shreds = encode_fec_set(&payload).unwrap();
 
-        let root_1 = commitment_root(99, 3, &shreds);
-        let root_2 = commitment_root(99, 3, &shreds);
+        let root_1 = commitment_root(99, 3, &shreds).unwrap();
+        let root_2 = commitment_root(99, 3, &shreds).unwrap();
         assert_eq!(root_1, root_2);
 
         let mut modified = shreds.clone();
         modified[0][0] ^= 1;
-        let root_3 = commitment_root(99, 3, &modified);
+        let root_3 = commitment_root(99, 3, &modified).unwrap();
         assert_ne!(root_1, root_3);
+    }
+
+    #[test]
+    fn test_decode_payload_len_zero_returns_empty_payload() {
+        let payload = vec![5u8; 2048];
+        let encoded = encode_fec_set(&payload).unwrap();
+        let mut shards: Vec<Option<[u8; MCP_SHRED_DATA_BYTES]>> =
+            encoded.into_iter().map(Some).collect();
+        let decoded = decode_payload(&mut shards, 0).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_reconstruction_from_coding_shards_only() {
+        let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let encoded = encode_fec_set(&payload).unwrap();
+        let mut shards = vec![None; MCP_NUM_RELAYS];
+        for src in MCP_DATA_SHREDS_PER_FEC_BLOCK..(2 * MCP_DATA_SHREDS_PER_FEC_BLOCK) {
+            shards[src] = Some(encoded[src]);
+        }
+        let decoded = decode_payload(&mut shards, payload.len()).unwrap();
+        assert_eq!(decoded, payload);
     }
 }
