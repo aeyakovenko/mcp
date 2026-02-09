@@ -20,6 +20,8 @@ const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
             * (RELAY_ENTRY_HEADER_LEN
                 + (MCP_NUM_PROPOSERS * PROPOSER_ENTRY_LEN)
                 + SIGNATURE_BYTES));
+// Keep consensus metadata bounded to a small sidecar payload while preserving
+// room for attestation bytes and the leader signature under the QUIC cap.
 const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
 const MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES: usize =
     HEADER_LEN + MAX_AGGREGATE_ATTESTATION_BYTES + MAX_CONSENSUS_META_BYTES + TRAILER_LEN;
@@ -429,5 +431,26 @@ mod tests {
     #[test]
     fn test_max_wire_fits_quic_control_payload_bound() {
         assert!(MAX_CONSENSUS_BLOCK_WIRE_BYTES <= MAX_QUIC_CONTROL_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn test_sign_leader_rejects_oversized_aggregate() {
+        let mut block = ConsensusBlock {
+            version: CONSENSUS_BLOCK_V1,
+            slot: 1,
+            leader_index: 0,
+            aggregate_bytes: vec![0u8; MAX_AGGREGATE_ATTESTATION_BYTES + 1],
+            consensus_meta: Vec::new(),
+            delayed_bankhash: Hash::new_unique(),
+            leader_signature: Signature::default(),
+        };
+        let leader = Keypair::new();
+        assert_eq!(
+            block.sign_leader(&leader).unwrap_err(),
+            ConsensusBlockError::AggregateLengthTooLarge {
+                actual: MAX_AGGREGATE_ATTESTATION_BYTES + 1,
+                max: MAX_AGGREGATE_ATTESTATION_BYTES,
+            }
+        );
     }
 }
