@@ -2934,12 +2934,10 @@ impl ReplayStage {
         mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
     ) -> bool {
         const MCP_VOTE_GATE_INPUT_RETENTION_SLOTS: Slot = 512;
-        let maybe_input = match mcp_vote_gate_inputs.write() {
-            Ok(mut inputs) => {
-                let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
-                inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-                inputs.get(&slot).cloned()
-            }
+        const MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS: Slot = 64;
+
+        let maybe_input = match mcp_vote_gate_inputs.read() {
+            Ok(inputs) => inputs.get(&slot).cloned(),
             Err(err) => {
                 warn!(
                     "MCP vote gate lock poisoned while evaluating slot {}: {}; rejecting vote",
@@ -2948,10 +2946,17 @@ impl ReplayStage {
                 return false;
             }
         };
+
+        if slot % MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS == 0 {
+            if let Ok(mut inputs) = mcp_vote_gate_inputs.write() {
+                let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
+                inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            }
+        }
+
         let Some(input) = maybe_input else {
-            // MCP vote-gate producers are wired in a follow-up path; until then, avoid
-            // stalling votes on missing optional gate input.
-            return true;
+            info!("MCP vote gate missing input for slot {}; rejecting vote", slot);
+            return false;
         };
 
         match mcp_vote_gate::evaluate_vote_gate(&input) {
@@ -5059,7 +5064,7 @@ pub(crate) mod tests {
     #[test]
     fn test_should_vote_mcp_slot_rejects_missing_input() {
         let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
-        assert!(ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
+        assert!(!ReplayStage::should_vote_mcp_slot(9, &mcp_vote_gate_inputs));
     }
 
     #[test]
