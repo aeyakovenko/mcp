@@ -477,7 +477,6 @@ impl BankingStage {
                 let receive_and_buffer = TransactionViewReceiveAndBuffer {
                     receiver: context.non_vote_receiver.clone(),
                     bank_forks: context.bank_forks.clone(),
-                    mcp_fee_payer_tracker: consumer::McpFeePayerTracker::default(),
                 };
                 Self::spawn_scheduler_and_workers(
                     non_vote_thread_hdls,

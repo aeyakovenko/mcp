@@ -10,15 +10,13 @@ use {
     },
     crate::banking_stage::{
         consume_worker::ConsumeWorkerMetrics,
-        consumer::{Consumer, McpFeePayerTracker},
+        consumer::Consumer,
         decision_maker::{BufferedPacketsDecision, DecisionMaker},
         transaction_scheduler::{
             receive_and_buffer::ReceivingStats, transaction_state_container::StateContainer,
         },
         TOTAL_BUFFERED_PACKETS,
     },
-    agave_feature_set as feature_set,
-    log::warn,
     solana_clock::MAX_PROCESSING_AGE,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -27,7 +25,7 @@ use {
         num::Saturating,
         sync::{
             atomic::{AtomicBool, Ordering},
-            Arc, Mutex, RwLock,
+            Arc, RwLock,
         },
     },
 };
@@ -59,7 +57,6 @@ where
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     /// Detailed scheduling metrics.
     scheduling_details: SchedulingDetails,
-    mcp_fee_payer_tracker: Mutex<McpFeePayerTracker>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -86,7 +83,6 @@ where
             timing_metrics: SchedulerTimingMetrics::default(),
             worker_metrics,
             scheduling_details: SchedulingDetails::default(),
-            mcp_fee_payer_tracker: Mutex::default(),
         }
     }
 
@@ -148,13 +144,7 @@ where
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     |txs, results| {
-                        Self::pre_graph_filter(
-                            txs,
-                            results,
-                            bank,
-                            MAX_PROCESSING_AGE,
-                            &self.mcp_fee_payer_tracker,
-                        )
+                        Self::pre_graph_filter(txs, results, bank, MAX_PROCESSING_AGE)
                     },
                     |_| PreLockFilterAction::AttemptToSchedule // no pre-lock filter for now
                 )?);
@@ -197,21 +187,7 @@ where
         results: &mut [bool],
         bank: &Bank,
         max_age: usize,
-        mcp_fee_payer_tracker: &Mutex<McpFeePayerTracker>,
     ) {
-        let mcp_enabled = bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id());
-        let mut mcp_fee_payer_tracker = match mcp_fee_payer_tracker.lock() {
-            Ok(guard) => guard,
-            Err(err) => {
-                warn!(
-                    "MCP fee tracker lock poisoned in scheduler pre-filter for slot {}: {}",
-                    bank.slot(),
-                    err
-                );
-                results.fill(false);
-                return;
-            }
-        };
         let lock_results = vec![Ok(()); transactions.len()];
         let mut error_counters = TransactionErrorMetrics::default();
         let check_results = bank.check_transactions::<R::Transaction>(
@@ -226,16 +202,10 @@ where
             .zip(transactions)
             .zip(results.iter_mut())
         {
-            let fee_check_result = if mcp_enabled {
-                Consumer::check_fee_payer_unlocked_mcp(
-                    bank,
-                    *tx,
-                    &mut mcp_fee_payer_tracker,
-                    &mut error_counters,
-                )
-            } else {
-                Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters)
-            };
+            // This scheduler path ingests standard Solana transactions.
+            // MCP payload transactions are validated in their dedicated replay path.
+            let fee_check_result =
+                Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters);
             *result = check_result.and_then(|_| fee_check_result).is_ok();
         }
     }
@@ -447,7 +417,6 @@ mod tests {
         TransactionViewReceiveAndBuffer {
             receiver,
             bank_forks,
-            mcp_fee_payer_tracker: McpFeePayerTracker::default(),
         }
     }
 
