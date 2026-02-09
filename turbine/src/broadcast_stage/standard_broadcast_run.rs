@@ -932,13 +932,18 @@ mod test {
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
-        std::{ops::Deref, sync::Arc, time::Duration},
+        std::{
+            ops::Deref,
+            sync::Arc,
+            time::{Duration, Instant},
+        },
         test_case::test_case,
     };
 
     #[allow(clippy::type_complexity)]
-    fn setup(
+    fn setup_with_mcp_feature(
         num_shreds_per_slot: Slot,
+        mcp_feature_active: bool,
     ) -> (
         Arc<Blockstore>,
         GenesisConfig,
@@ -965,7 +970,10 @@ mod test {
         let mut genesis_config = create_genesis_config(10_000).genesis_config;
         genesis_config.ticks_per_slot = max_ticks_per_n_shreds(num_shreds_per_slot, None) + 1;
 
-        let bank = Bank::new_for_tests(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        if mcp_feature_active {
+            bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        }
         let bank_forks = BankForks::new_rw_arc(bank);
         let bank0 = bank_forks.read().unwrap().root_bank();
         (
@@ -977,6 +985,21 @@ mod test {
             socket,
             bank_forks,
         )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn setup(
+        num_shreds_per_slot: Slot,
+    ) -> (
+        Arc<Blockstore>,
+        GenesisConfig,
+        Arc<ClusterInfo>,
+        Arc<Bank>,
+        Arc<Keypair>,
+        UdpSocket,
+        Arc<RwLock<BankForks>>,
+    ) {
+        setup_with_mcp_feature(num_shreds_per_slot, false)
     }
 
     #[test]
@@ -1002,6 +1025,52 @@ mod test {
 
         let valid = vec![0u8; mcp_proposer::MCP_MAX_PAYLOAD_SIZE - 8];
         assert!(state.try_push_transaction(valid));
+    }
+
+    #[test]
+    fn test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state() {
+        let num_shreds_per_slot = DATA_SHREDS_PER_FEC_BLOCK as u64;
+        let (_blockstore, _genesis_config, cluster_info, bank, leader_keypair, _socket, bank_forks) =
+            setup_with_mcp_feature(num_shreds_per_slot, true);
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 4096);
+
+        let standard_broadcast_run = StandardBroadcastRun::new(
+            leader_keypair.pubkey(),
+            0,
+            Arc::new(MigrationStatus::post_migration_status()),
+        );
+        let mut slot_state = McpSlotDispatchState::default();
+        slot_state.seen_batches = 1;
+        slot_state.expected_batches = Some(1);
+        assert!(slot_state.try_push_transaction(vec![1u8, 2, 3, 4]));
+        standard_broadcast_run
+            .mcp_dispatch_state
+            .lock()
+            .unwrap()
+            .insert(bank.slot(), slot_state);
+
+        let batch_info = Some(BroadcastShredBatchInfo {
+            slot: bank.slot(),
+            num_expected_batches: Some(1),
+            slot_start_ts: Instant::now(),
+            was_interrupted: false,
+        });
+        standard_broadcast_run.maybe_dispatch_mcp_shreds(
+            &[],
+            &batch_info,
+            &cluster_info,
+            &bank_forks,
+            &quic_endpoint_sender,
+        );
+
+        assert!(standard_broadcast_run
+            .mcp_dispatch_state
+            .lock()
+            .unwrap()
+            .get(&bank.slot())
+            .is_none());
+        assert!(quic_endpoint_receiver.try_recv().is_ok());
     }
 
     #[test_case(MigrationStatus::default(); "pre_migration")]
