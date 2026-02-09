@@ -1382,7 +1382,7 @@ fn test_bank_withdraw_from_nonce_account() {
 
 #[test]
 fn test_collect_fees_only_for_transactions_debits_fee_payer() {
-    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = solana_fee::MCP_NUM_PROPOSERS;
     let leader = solana_pubkey::new_rand();
     let GenesisConfigInfo {
         mut genesis_config,
@@ -1417,7 +1417,7 @@ fn test_collect_fees_only_for_transactions_debits_fee_payer() {
 
 #[test]
 fn test_collect_fees_only_for_transactions_tracks_cumulative_payer_balance() {
-    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = solana_fee::MCP_NUM_PROPOSERS;
     let leader = solana_pubkey::new_rand();
     let GenesisConfigInfo {
         mut genesis_config,
@@ -1493,7 +1493,7 @@ fn test_collect_fees_only_for_transactions_rejects_payer_below_scaled_fee() {
 
 #[test]
 fn test_collect_fees_only_for_nonce_transaction_debits_scaled_fee_plus_nonce_rent() {
-    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = solana_fee::MCP_NUM_PROPOSERS;
     let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) = setup_nonce_with_bank(
         10_000_000,
         |genesis_config| {
@@ -1536,7 +1536,7 @@ fn test_collect_fees_only_for_nonce_transaction_debits_scaled_fee_plus_nonce_ren
 
 #[test]
 fn test_collect_fees_only_for_nonce_transaction_accepts_exact_scaled_plus_nonce_rent_balance() {
-    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = solana_fee::MCP_NUM_PROPOSERS;
     let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) = setup_nonce_with_bank(
         10_000_000,
         |genesis_config| {
