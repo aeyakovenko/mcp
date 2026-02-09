@@ -912,15 +912,25 @@ fn initial_packet_meta_filter(meta: &packet::Meta) -> bool {
 mod tests {
     use {
         super::*,
+        agave_feature_set as feature_set,
         crossbeam_channel::unbounded,
         packet::PacketFlags,
+        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_hash::Hash,
         solana_keypair::Keypair,
+        solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path_auto_delete},
         solana_perf::packet::{Packet, PacketBatch, PinnedPacketBatch},
+        solana_poh_config::PohConfig,
         solana_pubkey::Pubkey,
-        solana_runtime::genesis_utils::create_genesis_config,
+        solana_runtime::genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
+        solana_runtime::bank_forks::BankForks,
+        solana_signer::Signer,
+        solana_streamer::socket::SocketAddrSpace,
         solana_system_transaction as system_transaction,
-        std::sync::{Arc, Mutex},
+        std::sync::{
+            atomic::AtomicBool,
+            Arc, Mutex,
+        },
     };
 
     #[derive(Clone)]
@@ -1060,5 +1070,56 @@ mod tests {
             non_vote_wired_txs[0],
             non_vote_packets[0].first().unwrap().data(..).unwrap()
         );
+    }
+
+    #[test]
+    fn test_forward_address_getter_uses_mcp_proposer_schedule_when_effective() {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+
+        let local_keypair = Arc::new(Keypair::new());
+        let local_contact_info = ContactInfo::new_localhost(&local_keypair.pubkey(), 0);
+        let cluster_info =
+            Arc::new(ClusterInfo::new(local_contact_info, local_keypair, SocketAddrSpace::Unspecified));
+        let leader_contact_info = ContactInfo::new_localhost(&leader.pubkey(), 0);
+        let expected_address = leader_contact_info.tpu_forwards(Protocol::UDP).unwrap();
+        cluster_info.insert_info(leader_contact_info);
+
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+        let target_slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let tick_height = target_slot
+            .saturating_mul(root_bank.ticks_per_slot())
+            .saturating_add(1);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
+            tick_height,
+            Hash::default(),
+            root_bank.clone(),
+            None,
+            root_bank.ticks_per_slot(),
+            blockstore,
+            &leader_schedule_cache,
+            &PohConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let getter = ForwardAddressGetter::new(
+            cluster_info,
+            Arc::new(RwLock::new(poh_recorder)),
+            sharable_banks,
+        );
+
+        let addresses = getter.get_non_vote_forwarding_addresses(1, Protocol::UDP);
+        assert_eq!(addresses, vec![expected_address]);
+        assert!(getter.mcp_leader_schedule_cache.lock().unwrap().is_some());
     }
 }
