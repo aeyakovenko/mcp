@@ -58,6 +58,9 @@ pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
 /// ceil((numerator / denominator) * total), integer-only.
 pub const fn ceil_threshold_count(numerator: usize, denominator: usize, total: usize) -> usize {
+    if denominator == 0 {
+        return 0;
+    }
     // ceil(a / b) for integers is (a + b - 1) / b.
     let scaled = numerator * total;
     (scaled + denominator - 1) / denominator
@@ -108,5 +111,10 @@ mod tests {
     #[test]
     fn test_witness_len_for_num_relays() {
         assert_eq!(MCP_WITNESS_LEN, 8);
+    }
+
+    #[test]
+    fn test_ceil_threshold_count_zero_denominator() {
+        assert_eq!(ceil_threshold_count(3, 0, NUM_RELAYS), 0);
     }
 }
