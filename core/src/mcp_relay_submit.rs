@@ -340,7 +340,7 @@ fn try_send_dispatch_frame_with_retry(
 mod tests {
     use {
         super::*,
-        solana_gossip::{cluster_info::ClusterInfo, node::Node},
+        solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_keypair::Keypair,
         solana_ledger::{
             genesis_utils::create_genesis_config, leader_schedule_cache::LeaderScheduleCache,
@@ -591,8 +591,8 @@ mod tests {
         let leader_pubkey = leader_schedule_cache
             .slot_leader_at(slot, Some(&root_bank))
             .unwrap();
-        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
-        let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
+        let leader_info = ContactInfo::new_localhost(&leader_pubkey, 0);
+        let relay_info = ContactInfo::new_localhost(&relay.pubkey(), 0);
         let cluster_info = ClusterInfo::new(relay_info, relay, SocketAddrSpace::Unspecified);
         cluster_info.insert_info(leader_info.clone());
 
@@ -627,7 +627,7 @@ mod tests {
         root_bank.deactivate_feature(&feature_set::mcp_protocol_v1::id());
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let cluster_info = ClusterInfo::new(
-            Node::new_localhost_with_pubkey(&relay.pubkey()).info,
+            ContactInfo::new_localhost(&relay.pubkey(), 0),
             relay,
             SocketAddrSpace::Unspecified,
         );
@@ -663,8 +663,8 @@ mod tests {
         let leader_pubkey = leader_schedule_cache
             .slot_leader_at(slot, Some(&root_bank))
             .unwrap();
-        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
-        let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
+        let leader_info = ContactInfo::new_localhost(&leader_pubkey, 0);
+        let relay_info = ContactInfo::new_localhost(&relay.pubkey(), 0);
         let cluster_info = ClusterInfo::new(relay_info, relay, SocketAddrSpace::Unspecified);
         cluster_info.insert_info(leader_info);
 
