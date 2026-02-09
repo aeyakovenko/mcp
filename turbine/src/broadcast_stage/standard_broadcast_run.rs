@@ -63,15 +63,64 @@ enum BroadcastError {
     TooManyShreds,
 }
 
-#[derive(Default)]
 struct McpSlotDispatchState {
     seen_batches: usize,
     expected_batches: Option<usize>,
-    payload_bytes: Vec<u8>,
+    payload_transactions: Vec<Vec<u8>>,
+    payload_len_bytes: usize,
 }
 
 const MCP_DISPATCH_STATE_MAX_SLOTS: usize = 1024;
 const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
+const MCP_PAYLOAD_COUNT_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+const MCP_PAYLOAD_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+
+impl Default for McpSlotDispatchState {
+    fn default() -> Self {
+        Self {
+            seen_batches: 0,
+            expected_batches: None,
+            payload_transactions: Vec::new(),
+            // tx_count prefix is always present in encoded payload.
+            payload_len_bytes: MCP_PAYLOAD_COUNT_PREFIX_BYTES,
+        }
+    }
+}
+
+impl McpSlotDispatchState {
+    fn try_push_transaction(&mut self, serialized_tx: Vec<u8>) -> bool {
+        let Some(tx_wire_len) = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(serialized_tx.len()) else {
+            return false;
+        };
+        let Some(next_payload_len) = self.payload_len_bytes.checked_add(tx_wire_len) else {
+            return false;
+        };
+        if next_payload_len > mcp_proposer::MCP_MAX_PAYLOAD_SIZE {
+            return false;
+        }
+
+        self.payload_transactions.push(serialized_tx);
+        self.payload_len_bytes = next_payload_len;
+        true
+    }
+}
+
+fn encode_mcp_payload(transactions: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    let tx_count = u32::try_from(transactions.len()).ok()?;
+    let mut out = Vec::with_capacity(
+        transactions.iter().try_fold(MCP_PAYLOAD_COUNT_PREFIX_BYTES, |acc, tx| {
+            let tx_len_field = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(tx.len())?;
+            acc.checked_add(tx_len_field)
+        })?,
+    );
+    out.extend_from_slice(&tx_count.to_le_bytes());
+    for tx in transactions {
+        let tx_len = u32::try_from(tx.len()).ok()?;
+        out.extend_from_slice(&tx_len.to_le_bytes());
+        out.extend_from_slice(&tx);
+    }
+    Some(out)
+}
 
 impl StandardBroadcastRun {
     pub(super) fn new(
@@ -633,15 +682,9 @@ impl StandardBroadcastRun {
                     );
                     return;
                 };
-                let remaining = mcp_proposer::MCP_MAX_PAYLOAD_SIZE
-                    .saturating_sub(slot_state.payload_bytes.len());
-                if remaining == 0 {
+                if !slot_state.try_push_transaction(serialized_tx) {
                     return;
                 }
-                if serialized_tx.len() > remaining {
-                    return;
-                }
-                slot_state.payload_bytes.extend_from_slice(&serialized_tx);
             }
         }
     }
@@ -693,7 +736,7 @@ impl StandardBroadcastRun {
             return;
         }
 
-        let maybe_payload_bytes = {
+        let maybe_payload_transactions = {
             let mut state = self.mcp_dispatch_state.lock().unwrap();
             let min_retained_slot = root_slot.saturating_sub(MCP_DISPATCH_STATE_SLOT_RETENTION);
             state.retain(|tracked_slot, _| *tracked_slot >= min_retained_slot);
@@ -707,18 +750,22 @@ impl StandardBroadcastRun {
             if is_slot_complete {
                 state
                     .remove(&slot)
-                    .map(|slot_state| slot_state.payload_bytes)
+                    .map(|slot_state| slot_state.payload_transactions)
             } else {
                 None
             }
         };
-        let Some(payload_bytes) = maybe_payload_bytes else {
+        let Some(payload_transactions) = maybe_payload_transactions else {
             return;
         };
-        if payload_bytes.is_empty() {
+        if payload_transactions.is_empty() {
             warn!("MCP proposer dispatch skipped for slot {slot}: empty payload");
             return;
         }
+        let Some(payload_bytes) = encode_mcp_payload(payload_transactions) else {
+            warn!("MCP proposer dispatch skipped for slot {slot}: invalid payload framing");
+            return;
+        };
         let shred_payloads = match mcp_proposer::encode_payload_to_mcp_shreds(&payload_bytes) {
             Ok(shreds) => shreds,
             Err(err) => {
@@ -928,6 +975,31 @@ mod test {
             socket,
             bank_forks,
         )
+    }
+
+    #[test]
+    fn test_encode_mcp_payload_frames_transactions() {
+        let tx0 = vec![1u8, 2, 3];
+        let tx1 = vec![4u8, 5];
+        let payload = encode_mcp_payload(vec![tx0.clone(), tx1.clone()]).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(2u32).to_le_bytes());
+        expected.extend_from_slice(&(tx0.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&tx0);
+        expected.extend_from_slice(&(tx1.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&tx1);
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_enforces_payload_bound_with_framing_overhead() {
+        let mut state = McpSlotDispatchState::default();
+        let max_size_tx = vec![0u8; mcp_proposer::MCP_MAX_PAYLOAD_SIZE];
+        assert!(!state.try_push_transaction(max_size_tx));
+
+        let valid = vec![0u8; mcp_proposer::MCP_MAX_PAYLOAD_SIZE - 8];
+        assert!(state.try_push_transaction(valid));
     }
 
     #[test_case(MigrationStatus::default(); "pre_migration")]
