@@ -13,7 +13,12 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Release Blockers (`UNVERIFIED` until resolved)
 
-- none currently
+- Vote-gate input producer wiring:
+  - Replay vote gate requires per-slot `VoteGateInput` populated from MCP consensus/attestation ingestion.
+  - Until this path is wired, MCP-gated voting can fail closed due to missing inputs.
+- Bankless recording caller wiring:
+  - `PohRecorder::record_bankless` requires an explicit production caller in the MCP leader path.
+  - Until wired, bankless recording semantics are implemented but not exercised end-to-end.
 
 ## Resolved Policy Decisions
 
