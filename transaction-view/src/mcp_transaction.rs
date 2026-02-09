@@ -55,6 +55,18 @@ pub enum McpTransactionParseError {
 }
 
 impl McpTransaction {
+    pub fn maybe_mcp_wire_prefix(bytes: &[u8]) -> bool {
+        if bytes.first() == Some(&MCP_TX_LATEST_VERSION)
+            && read_config_mask_at(bytes, 4)
+                .is_some_and(|mask| mask & !MCP_TX_CONFIG_MASK_ALLOWED == 0)
+        {
+            return true;
+        }
+
+        read_config_mask_at(bytes, 3)
+            .is_some_and(|mask| mask & !MCP_TX_CONFIG_MASK_ALLOWED == 0)
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
         Self::parse_inner(bytes, true)
     }
@@ -265,6 +277,12 @@ fn take_array_64(bytes: &[u8], offset: &mut usize) -> Result<[u8; 64], McpTransa
     Ok(take_bytes(bytes, offset, 64)?.try_into().unwrap())
 }
 
+fn read_config_mask_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let slice = bytes.get(offset..end)?;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -413,5 +431,27 @@ mod tests {
         let serialized = bincode::serialize(&tx).unwrap();
 
         assert!(McpTransaction::from_bytes_compat(&serialized).is_err());
+    }
+
+    #[test]
+    fn test_maybe_mcp_wire_prefix_for_latest_and_legacy() {
+        let latest = sample_transaction().to_bytes();
+        let legacy = latest[1..].to_vec();
+        assert!(McpTransaction::maybe_mcp_wire_prefix(&latest));
+        assert!(McpTransaction::maybe_mcp_wire_prefix(&legacy));
+    }
+
+    #[test]
+    fn test_maybe_mcp_wire_prefix_rejects_standard_solana_transaction() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let mut tx = Transaction::new_with_payer(
+            &[system_instruction::transfer(&payer.pubkey(), &recipient, 1)],
+            Some(&payer.pubkey()),
+        );
+        tx.sign(&[&payer], Hash::new_unique());
+        let serialized = bincode::serialize(&tx).unwrap();
+
+        assert!(!McpTransaction::maybe_mcp_wire_prefix(&serialized));
     }
 }
