@@ -76,20 +76,24 @@ impl McpTransaction {
     }
 
     pub fn from_bytes_compat(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {
-        let latest = Self::from_bytes(bytes)
-            .ok()
-            .filter(|parsed| parsed.to_bytes() == bytes);
-        if let Some(parsed) = latest {
+        if bytes.first().copied() != Some(MCP_TX_LATEST_VERSION) {
+            return parse_legacy_canonical(bytes);
+        }
+
+        let latest = Self::from_bytes(bytes).and_then(|parsed| {
+            // Require canonical latest layout to avoid accepting malformed payloads.
+            if parsed.to_bytes() == bytes {
+                Ok(parsed)
+            } else {
+                Err(McpTransactionParseError::TrailingBytes)
+            }
+        });
+        if let Ok(parsed) = latest {
             return Ok(parsed);
         }
 
-        let legacy = Self::from_legacy_bytes(bytes)?;
-        // Require canonical legacy layout to avoid accepting malformed payloads.
-        if legacy.to_bytes().get(1..) == Some(bytes) {
-            Ok(legacy)
-        } else {
-            Err(McpTransactionParseError::TrailingBytes)
-        }
+        // Ambiguous prefix (`0x01`) may still be valid legacy.
+        parse_legacy_canonical(bytes)
     }
 
     fn parse_inner(
@@ -234,6 +238,16 @@ impl McpTransaction {
 
     pub fn target_proposer(&self) -> Option<u32> {
         self.config_value(MCP_TX_CONFIG_BIT_TARGET_PROPOSER)
+    }
+}
+
+fn parse_legacy_canonical(bytes: &[u8]) -> Result<McpTransaction, McpTransactionParseError> {
+    let legacy = McpTransaction::from_legacy_bytes(bytes)?;
+    // Require canonical legacy layout to avoid accepting malformed payloads.
+    if legacy.to_bytes().get(1..) == Some(bytes) {
+        Ok(legacy)
+    } else {
+        Err(McpTransactionParseError::TrailingBytes)
     }
 }
 
