@@ -3574,6 +3574,7 @@ impl Bank {
             let Ok(fee_details) = fee_result else {
                 continue;
             };
+            let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
             let mut fee = match fee_details
                 .total_fee()
                 .checked_mul(MCP_NUM_PROPOSERS_FEE_MULTIPLIER)
@@ -3584,7 +3585,7 @@ impl Bank {
                     continue;
                 }
             };
-            if tx.get_durable_nonce(require_static_nonce_account).is_some() {
+            if is_durable_nonce_tx {
                 fee = match fee.checked_add(nonce_min_balance) {
                     Some(fee) => fee,
                     None => {
@@ -3596,7 +3597,12 @@ impl Bank {
             if fee == 0 {
                 continue;
             }
-            if let Err(err) = self.withdraw(tx.fee_payer(), fee) {
+            let withdraw_result = if is_durable_nonce_tx {
+                self.withdraw_for_mcp_phase_a_nonce(tx.fee_payer(), fee)
+            } else {
+                self.withdraw(tx.fee_payer(), fee)
+            };
+            if let Err(err) = withdraw_result {
                 *fee_result = Err(err);
             }
         }
@@ -6299,6 +6305,21 @@ impl Bank {
                     .map_err(|_| TransactionError::InsufficientFundsForFee)?;
                 self.store_account(pubkey, &account);
 
+                Ok(())
+            }
+            None => Err(TransactionError::AccountNotFound),
+        }
+    }
+
+    fn withdraw_for_mcp_phase_a_nonce(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
+        match self.get_account_with_fixed_root(pubkey) {
+            Some(mut account) => {
+                // Phase-A nonce charging already includes the nonce rent floor in `lamports`.
+                // Avoid re-applying the nonce reserve check from `withdraw()`.
+                account
+                    .checked_sub_lamports(lamports)
+                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+                self.store_account(pubkey, &account);
                 Ok(())
             }
             None => Err(TransactionError::AccountNotFound),
