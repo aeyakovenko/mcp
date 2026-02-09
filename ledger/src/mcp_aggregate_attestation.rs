@@ -370,6 +370,8 @@ fn relay_signing_bytes(
 ) -> Result<Vec<u8>, AggregateAttestationError> {
     // Relay signatures follow RelayAttestation v1 signing bytes:
     // version || slot || relay_index || entries_len || entries.
+    // `leader_index` is intentionally excluded because relay attestations are
+    // defined as leader-agnostic for the same slot.
     ensure_relay_index_in_range(relay_index)?;
     if entries.len() > mcp::NUM_PROPOSERS {
         return Err(AggregateAttestationError::TooManyProposerEntries {
