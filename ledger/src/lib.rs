@@ -28,6 +28,7 @@ pub mod leader_schedule_utils;
 pub mod mcp;
 pub mod mcp_aggregate_attestation;
 pub mod mcp_merkle;
+pub mod mcp_ordering;
 pub mod mcp_relay_attestation;
 pub mod mcp_reconstruction;
 pub mod next_slots_iterator;
