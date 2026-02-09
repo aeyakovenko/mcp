@@ -4,6 +4,7 @@
 use {
     crate::next_leader::next_leaders,
     agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_feature_set as feature_set,
     agave_transaction_view::transaction_view::SanitizedTransactionView,
     async_trait::async_trait,
     crossbeam_channel::{Receiver, RecvTimeoutError},
@@ -11,9 +12,11 @@ use {
     solana_client::connection_cache::ConnectionCache,
     solana_connection_cache::client_connection::ClientConnection,
     solana_cost_model::cost_model::CostModel,
+    solana_clock::{FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, node::NodeMultihoming},
     solana_keypair::Keypair,
+    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_net_utils::multihomed_sockets::BindIpAddrs,
     solana_packet as packet,
     solana_perf::data_budget::DataBudget,
@@ -27,6 +30,7 @@ use {
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
     },
     solana_streamer::sendmmsg::{batch_send, SendPktsError},
+    solana_turbine::cluster_nodes,
     solana_tpu_client_next::{
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, StakeIdentity,
@@ -38,8 +42,9 @@ use {
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransportError,
     std::{
+        collections::HashSet,
         net::{SocketAddr, UdpSocket},
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock},
         thread::{Builder, JoinHandle},
         time::{Duration, Instant},
     },
@@ -92,13 +97,21 @@ const NUM_LOOKAHEAD_LEADERS: u64 = 3;
 pub(crate) struct ForwardAddressGetter {
     cluster_info: Arc<ClusterInfo>,
     poh_recorder: Arc<RwLock<PohRecorder>>,
+    sharable_banks: SharableBanks,
+    mcp_leader_schedule_cache: Arc<Mutex<Option<LeaderScheduleCache>>>,
 }
 
 impl ForwardAddressGetter {
-    pub fn new(cluster_info: Arc<ClusterInfo>, poh_recorder: Arc<RwLock<PohRecorder>>) -> Self {
+    pub fn new(
+        cluster_info: Arc<ClusterInfo>,
+        poh_recorder: Arc<RwLock<PohRecorder>>,
+        sharable_banks: SharableBanks,
+    ) -> Self {
         Self {
             cluster_info,
             poh_recorder,
+            sharable_banks,
+            mcp_leader_schedule_cache: Arc::default(),
         }
     }
 
@@ -108,6 +121,64 @@ impl ForwardAddressGetter {
         max_count: u64,
         protocol: Protocol,
     ) -> Vec<SocketAddr> {
+        let root_bank = self.sharable_banks.root();
+        let (tick_height, ticks_per_slot) = {
+            let recorder = self.poh_recorder.read().unwrap();
+            (recorder.tick_height(), recorder.ticks_per_slot())
+        };
+        let current_slot = tick_height.saturating_sub(1) / ticks_per_slot;
+        let first_lookahead_slot =
+            current_slot.saturating_add(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET);
+        if root_bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
+            && cluster_nodes::check_feature_activation(
+                &feature_set::mcp_protocol_v1::id(),
+                first_lookahead_slot,
+                &root_bank,
+            )
+        {
+            let proposer_pubkeys = {
+                let mut cache_guard = self.mcp_leader_schedule_cache.lock().unwrap();
+                let cache = cache_guard
+                    .get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&root_bank));
+                cache.set_root(&root_bank);
+
+                let mut proposers = Vec::new();
+                for i in 0..max_count {
+                    let slot = first_lookahead_slot
+                        .saturating_add(i.saturating_mul(NUM_CONSECUTIVE_LEADER_SLOTS));
+                    if let Some(slot_proposers) = cache
+                        .proposers_at_slot(slot, Some(&root_bank))
+                        .or_else(|| cache.proposers_at_slot(slot, None))
+                    {
+                        proposers.extend(slot_proposers);
+                    }
+                }
+                proposers
+            };
+
+            let mut seen_pubkeys = HashSet::new();
+            let mut seen_addresses = HashSet::new();
+            let mut addresses = Vec::new();
+            for proposer_pubkey in proposer_pubkeys {
+                if !seen_pubkeys.insert(proposer_pubkey) {
+                    continue;
+                }
+                let Some(address) = self
+                    .cluster_info
+                    .lookup_contact_info(&proposer_pubkey, |node| node.tpu_forwards(protocol))
+                    .flatten()
+                else {
+                    continue;
+                };
+                if seen_addresses.insert(address) {
+                    addresses.push(address);
+                }
+            }
+            return addresses;
+        }
+
         next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
             node.tpu_forwards(protocol)
         })
