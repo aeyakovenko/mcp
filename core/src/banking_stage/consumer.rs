@@ -9,7 +9,7 @@ use {
     itertools::Itertools,
     solana_account::ReadableAccount,
     solana_clock::{Slot, MAX_PROCESSING_AGE},
-    solana_fee::FeeFeatures,
+    solana_fee::{FeeFeatures, MCP_NUM_PROPOSERS},
     solana_fee_structure::FeeBudgetLimits,
     solana_measure::measure_us,
     solana_nonce_account::{get_system_account_kind, SystemAccountKind},
@@ -26,7 +26,7 @@ use {
     },
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm::{
-        account_loader::{validate_fee_payer, validate_fee_payer_for_mcp, MCP_NUM_PROPOSERS},
+        account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
         transaction_error_metrics::TransactionErrorMetrics,
         transaction_processing_result::TransactionProcessingResultExtensions,
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
