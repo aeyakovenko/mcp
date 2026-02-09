@@ -5,6 +5,7 @@ use {
         leader_schedule_utils,
         mcp,
     },
+    agave_feature_set as feature_set,
     itertools::Itertools,
     log::*,
     solana_clock::{Epoch, Slot},
@@ -19,8 +20,6 @@ use {
 
 type CachedSchedules = (HashMap<Epoch, Arc<LeaderSchedule>>, VecDeque<u64>);
 const MAX_SCHEDULES: usize = 10;
-const MCP_PROPOSERS_PER_SLOT: usize = mcp::NUM_PROPOSERS;
-const MCP_RELAYS_PER_SLOT: usize = mcp::NUM_RELAYS;
 
 #[derive(Copy, Clone)]
 enum McpScheduleKind {
@@ -74,7 +73,12 @@ impl LeaderScheduleCache {
             .get_leader_schedule_epoch(root_bank.slot());
         for epoch in 0..leader_schedule_epoch {
             cache.compute_epoch_schedule(epoch, root_bank);
-            cache.compute_epoch_mcp_schedules(epoch, root_bank);
+            if root_bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                cache.compute_epoch_mcp_schedules(epoch, root_bank);
+            }
         }
         cache
     }
@@ -104,7 +108,12 @@ impl LeaderScheduleCache {
         // Calculate the epoch as soon as it's rooted
         if new_max_epoch > old_max_epoch {
             self.compute_epoch_schedule(new_max_epoch, root_bank);
-            self.compute_epoch_mcp_schedules(new_max_epoch, root_bank);
+            if root_bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                self.compute_epoch_mcp_schedules(new_max_epoch, root_bank);
+            }
         }
     }
 
@@ -124,13 +133,18 @@ impl LeaderScheduleCache {
             slot,
             bank,
             McpScheduleKind::Proposer,
-            MCP_PROPOSERS_PER_SLOT,
+            leader_schedule_utils::MCP_PROPOSERS_PER_SLOT,
         )
     }
 
     /// Returns the ordered relay list for `slot`.
     pub fn relays_at_slot(&self, slot: Slot, bank: Option<&Bank>) -> Option<Vec<Pubkey>> {
-        self.mcp_roles_at_slot(slot, bank, McpScheduleKind::Relay, MCP_RELAYS_PER_SLOT)
+        self.mcp_roles_at_slot(
+            slot,
+            bank,
+            McpScheduleKind::Relay,
+            leader_schedule_utils::MCP_RELAYS_PER_SLOT,
+        )
     }
 
     /// Returns all proposer indices owned by `pubkey` for `slot`.
@@ -258,6 +272,12 @@ impl LeaderScheduleCache {
     ) -> Option<Vec<Pubkey>> {
         let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
         let schedule = if let Some(bank) = bank {
+            if !bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                return None;
+            }
             // Forbid asking for slots in an unconfirmed epoch.
             if epoch > *self.max_epoch.read().unwrap() {
                 debug!("Requested MCP schedule in slot: {slot} of unconfirmed epoch: {epoch}");
@@ -330,6 +350,12 @@ impl LeaderScheduleCache {
         epoch: Epoch,
         bank: &Bank,
     ) -> Option<(Arc<LeaderSchedule>, Arc<LeaderSchedule>)> {
+        if !bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
+        {
+            return None;
+        }
         let proposer = leader_schedule_utils::mcp_proposer_schedule(epoch, bank)?;
         let relay = leader_schedule_utils::mcp_relay_schedule(epoch, bank)?;
         let proposer = Arc::new(proposer);
@@ -405,7 +431,7 @@ mod tests {
             EpochSchedule, DEFAULT_LEADER_SCHEDULE_SLOT_OFFSET, MINIMUM_SLOTS_PER_EPOCH,
         },
         solana_keypair::Keypair,
-        solana_runtime::bank::Bank,
+        solana_runtime::{bank::Bank, genesis_utils::deactivate_features},
         solana_signer::Signer,
         std::{sync::Arc, thread::Builder},
     };
@@ -767,12 +793,27 @@ mod tests {
 
         let proposers = cache.proposers_at_slot(slot, Some(&bank)).unwrap();
         let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
-        assert_eq!(proposers.len(), MCP_PROPOSERS_PER_SLOT);
-        assert_eq!(relays.len(), MCP_RELAYS_PER_SLOT);
+        assert_eq!(proposers.len(), leader_schedule_utils::MCP_PROPOSERS_PER_SLOT);
+        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
 
         // No-compute path should hit caches populated by the first call.
         assert_eq!(cache.proposers_at_slot(slot, None).unwrap(), proposers);
         assert_eq!(cache.relays_at_slot(slot, None).unwrap(), relays);
+    }
+
+    #[test]
+    fn test_mcp_schedule_accessors_require_feature_activation() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        deactivate_features(&mut genesis_config, &vec![feature_set::mcp_protocol_v1::id()]);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+
+        assert!(cache.proposers_at_slot(bank.slot(), Some(&bank)).is_none());
+        assert!(cache.relays_at_slot(bank.slot(), Some(&bank)).is_none());
     }
 
     #[test]
@@ -790,11 +831,11 @@ mod tests {
 
         assert_eq!(
             proposer_indices,
-            (0..MCP_PROPOSERS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..leader_schedule_utils::MCP_PROPOSERS_PER_SLOT as u32).collect::<Vec<_>>()
         );
         assert_eq!(
             relay_indices,
-            (0..MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..leader_schedule_utils::MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
         );
     }
 
