@@ -1,4 +1,8 @@
-use {crate::{mcp, mcp_merkle}, reed_solomon_erasure::galois_8::ReedSolomon};
+use {
+    agave_transaction_view::mcp_payload::{McpPayload, McpPayloadParseError},
+    crate::{mcp, mcp_merkle},
+    reed_solomon_erasure::galois_8::ReedSolomon,
+};
 
 pub const MCP_RECON_DATA_SHREDS: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
 pub const MCP_RECON_CODING_SHREDS: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
@@ -28,6 +32,8 @@ pub enum McpReconstructionError {
     TooManyShreds(usize),
     #[error("reed-solomon error: {0}")]
     ReedSolomon(String),
+    #[error("invalid reconstructed MCP payload: {0:?}")]
+    InvalidPayload(McpPayloadParseError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,9 +224,24 @@ fn map_merkle_error(err: mcp_merkle::McpMerkleError) -> McpReconstructionError {
     }
 }
 
+pub fn decode_reconstructed_payload(payload: &[u8]) -> Result<McpPayload, McpReconstructionError> {
+    McpPayload::from_bytes(payload).map_err(McpReconstructionError::InvalidPayload)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        agave_transaction_view::{
+            mcp_payload::McpPayloadTransactionFormat,
+            mcp_transaction::{
+                InstructionHeader, InstructionPayload, LegacyHeader, McpTransaction,
+                MCP_TX_LATEST_VERSION,
+            },
+        },
+        solana_pubkey::Pubkey,
+        solana_signature::Signature,
+    };
 
     fn encode_payload(payload: &[u8]) -> Vec<[u8; MCP_RECON_SHRED_BYTES]> {
         let mut data = vec![[0u8; MCP_RECON_SHRED_BYTES]; MCP_RECON_DATA_SHREDS];
@@ -247,6 +268,41 @@ mod tests {
                 out
             })
             .collect()
+    }
+
+    fn sample_mcp_transaction() -> McpTransaction {
+        McpTransaction {
+            version: MCP_TX_LATEST_VERSION,
+            legacy_header: LegacyHeader {
+                num_required_signatures: 1,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 0,
+            },
+            transaction_config_mask: 0,
+            lifetime_specifier: [1u8; 32],
+            addresses: vec![Pubkey::new_unique()],
+            config_values: vec![],
+            instruction_headers: vec![InstructionHeader {
+                program_account_index: 0,
+                num_instruction_accounts: 1,
+                num_instruction_data_bytes: 0,
+            }],
+            instruction_payloads: vec![InstructionPayload {
+                account_indexes: vec![0],
+                instruction_data: vec![],
+            }],
+            signatures: vec![Signature::from([7u8; 64])],
+        }
+    }
+
+    fn encode_framed_payload(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for tx in entries {
+            out.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            out.extend_from_slice(tx);
+        }
+        out
     }
 
     #[test]
@@ -429,5 +485,27 @@ mod tests {
             commitment_root(1, 1, &[]).unwrap_err(),
             McpReconstructionError::EmptyShredSet
         );
+    }
+
+    #[test]
+    fn test_decode_reconstructed_payload_accepts_latest_and_legacy_transactions() {
+        let tx = sample_mcp_transaction();
+        let latest = tx.to_bytes();
+        let legacy = latest[1..].to_vec();
+        let payload = encode_framed_payload(&[latest, legacy]);
+
+        let parsed = decode_reconstructed_payload(&payload).unwrap();
+        assert_eq!(parsed.transactions.len(), 2);
+        assert_eq!(parsed.transactions[0].format, McpPayloadTransactionFormat::Latest);
+        assert_eq!(parsed.transactions[1].format, McpPayloadTransactionFormat::Legacy);
+    }
+
+    #[test]
+    fn test_decode_reconstructed_payload_rejects_invalid_payload() {
+        let payload = vec![0u8, 1u8, 2u8, 3u8];
+        assert!(matches!(
+            decode_reconstructed_payload(&payload),
+            Err(McpReconstructionError::InvalidPayload(_))
+        ));
     }
 }
