@@ -592,6 +592,34 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_relay_signature_excludes_relay_entry() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut relay_entry = AggregateRelayEntry {
+            relay_index: 2,
+            entries: vec![AggregateProposerEntry {
+                proposer_index: 0,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            }],
+            relay_signature: Signature::default(),
+        };
+        relay_entry
+            .sign(AGGREGATE_ATTESTATION_V1, 77, &relay)
+            .unwrap();
+        relay_entry.relay_signature = Signature::new_unique();
+
+        let aggregate = AggregateAttestation::new_canonical(77, 0, vec![relay_entry]).unwrap();
+        let filtered = aggregate.filtered_valid_entries(
+            |_| Some(relay.pubkey()),
+            |_| Some(proposer.pubkey()),
+        );
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
     fn test_unsorted_relay_entries_rejected() {
         let bytes = {
             let mut out = Vec::new();
