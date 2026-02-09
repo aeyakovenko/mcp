@@ -17,6 +17,7 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
+    solana_turbine::cluster_nodes,
     std::net::SocketAddr,
     thiserror::Error,
     tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
@@ -279,10 +280,11 @@ pub fn dispatch_relay_attestation_to_slot_leader(
     cluster_info: &ClusterInfo,
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
 ) -> Result<RelayAttestationDispatch, RelaySubmitError> {
-    if !root_bank
-        .feature_set
-        .is_active(&feature_set::mcp_protocol_v1::id())
-    {
+    if !cluster_nodes::check_feature_activation(
+        &feature_set::mcp_protocol_v1::id(),
+        attestation.slot,
+        root_bank,
+    ) {
         return Err(RelaySubmitError::FeatureNotActive {
             slot: attestation.slot,
         });
@@ -584,9 +586,10 @@ mod tests {
         let genesis_config = create_genesis_config(10_000).genesis_config;
         let mut root_bank = Bank::new_for_tests(&genesis_config);
         root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let leader_pubkey = leader_schedule_cache
-            .slot_leader_at(0, Some(&root_bank))
+            .slot_leader_at(slot, Some(&root_bank))
             .unwrap();
         let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
         let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
@@ -594,7 +597,7 @@ mod tests {
         cluster_info.insert_info(leader_info.clone());
 
         let attestation = signed_attestation(
-            0,
+            slot,
             12,
             vec![signed_entry(1, [7u8; 32], &proposer)],
             &Keypair::new(),
@@ -655,9 +658,10 @@ mod tests {
         let genesis_config = create_genesis_config(10_000).genesis_config;
         let mut root_bank = Bank::new_for_tests(&genesis_config);
         root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let leader_pubkey = leader_schedule_cache
-            .slot_leader_at(0, Some(&root_bank))
+            .slot_leader_at(slot, Some(&root_bank))
             .unwrap();
         let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
         let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
@@ -665,7 +669,7 @@ mod tests {
         cluster_info.insert_info(leader_info);
 
         let attestation = signed_attestation(
-            0,
+            slot,
             12,
             vec![signed_entry(1, [7u8; 32], &proposer)],
             &Keypair::new(),
