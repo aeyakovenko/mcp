@@ -1459,6 +1459,37 @@ fn test_collect_fees_only_for_transactions_tracks_cumulative_payer_balance() {
 }
 
 #[test]
+fn test_collect_fees_only_for_transactions_rejects_payer_below_scaled_fee() {
+    let leader = solana_pubkey::new_rand();
+    let GenesisConfigInfo {
+        mut genesis_config,
+        mint_keypair,
+        ..
+    } = create_genesis_config_with_leader(60_000, &leader, 3);
+    genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+    let bank = Bank::new_for_tests(&genesis_config);
+
+    let recipient = solana_pubkey::new_rand();
+    let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+        &mint_keypair,
+        &recipient,
+        1,
+        bank.last_blockhash(),
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+    let before = bank.get_balance(&mint_keypair.pubkey());
+
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert_eq!(fee_results[0], Err(TransactionError::InsufficientFundsForFee));
+    assert_eq!(bank.get_balance(&mint_keypair.pubkey()), before);
+    assert_eq!(bank.get_balance(&recipient), 0);
+}
+
+#[test]
 fn test_collect_fees_only_for_nonce_transaction_debits_scaled_fee_plus_nonce_rent() {
     const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
     let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) = setup_nonce_with_bank(

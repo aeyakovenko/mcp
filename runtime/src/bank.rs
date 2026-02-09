@@ -3476,6 +3476,8 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<Result<FeeDetails>> {
+        // Keep in sync with `solana_ledger::mcp::NUM_PROPOSERS`; duplicated here to
+        // avoid introducing a `runtime -> ledger` dependency edge.
         const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
 
         let sanitized_txs = batch.sanitized_transactions();
