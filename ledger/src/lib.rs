@@ -26,6 +26,7 @@ pub mod leader_schedule;
 pub mod leader_schedule_cache;
 pub mod leader_schedule_utils;
 pub mod mcp;
+pub mod mcp_aggregate_attestation;
 pub mod mcp_merkle;
 pub mod mcp_relay_attestation;
 pub mod mcp_reconstruction;
