@@ -291,6 +291,8 @@ impl LeaderScheduleCache {
         if slot_leaders.is_empty() {
             return None;
         }
+        // Spec §5 defines proposers/relays as "next N entries ... with wrap-around".
+        // This intentionally permits duplicates when role count exceeds schedule length.
         let start = slot_index as usize % slot_leaders.len();
         Some(
             (0..count)
@@ -432,7 +434,7 @@ mod tests {
         solana_keypair::Keypair,
         solana_runtime::{bank::Bank, genesis_utils::deactivate_features},
         solana_signer::Signer,
-        std::{sync::Arc, thread::Builder},
+        std::{collections::HashSet, sync::Arc, thread::Builder},
     };
 
     #[test]
@@ -836,6 +838,27 @@ mod tests {
             relay_indices,
             (0..leader_schedule_utils::MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_mcp_relay_schedule_wraps_for_short_epoch_schedules() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        genesis_config.epoch_schedule =
+            EpochSchedule::custom(MINIMUM_SLOTS_PER_EPOCH, MINIMUM_SLOTS_PER_EPOCH / 2, true);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+        let slot = bank.slot();
+        let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
+
+        assert!(genesis_config.epoch_schedule.slots_per_epoch < relays.len() as u64);
+        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
+
+        let unique_relays: HashSet<_> = relays.iter().collect();
+        assert!(unique_relays.len() <= genesis_config.epoch_schedule.slots_per_epoch as usize);
     }
 
     #[test]
