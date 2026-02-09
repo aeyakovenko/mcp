@@ -301,7 +301,8 @@ pub struct Blockstore {
     highest_primary_index_slot: RwLock<Option<Slot>>,
     max_root: AtomicU64,
     insert_shreds_lock: Mutex<()>,
-    insert_mcp_lock: Mutex<()>,
+    insert_mcp_shred_lock: Mutex<()>,
+    insert_mcp_relay_attestation_lock: Mutex<()>,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
     pub lowest_cleanup_slot: RwLock<Slot>,
@@ -531,7 +532,8 @@ impl Blockstore {
             new_shreds_signals: Mutex::default(),
             completed_slots_senders: Mutex::default(),
             insert_shreds_lock: Mutex::<()>::default(),
-            insert_mcp_lock: Mutex::<()>::default(),
+            insert_mcp_shred_lock: Mutex::<()>::default(),
+            insert_mcp_relay_attestation_lock: Mutex::<()>::default(),
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
             slots_stats: SlotsStats::default(),
@@ -3158,6 +3160,7 @@ impl Blockstore {
 
     fn put_mcp_bytes_if_absent<C>(
         &self,
+        lock: &Mutex<()>,
         column: &LedgerColumn<C>,
         index: C::Index,
         value: &[u8],
@@ -3166,7 +3169,7 @@ impl Blockstore {
         C: Column + ColumnName,
         C::Index: Clone,
     {
-        let _lock = self.insert_mcp_lock.lock().unwrap();
+        let _lock = lock.lock().unwrap();
         if let Some(existing) = column.get_bytes(index.clone())? {
             if existing.as_slice() == value {
                 return Ok(McpPutStatus::Duplicate);
@@ -3198,6 +3201,7 @@ impl Blockstore {
         shred: &[u8],
     ) -> Result<McpPutStatus> {
         self.put_mcp_bytes_if_absent(
+            &self.insert_mcp_shred_lock,
             &self.mcp_shred_data_cf,
             (slot, proposer_index, shred_index),
             shred,
@@ -3219,6 +3223,7 @@ impl Blockstore {
         relay_attestation: &[u8],
     ) -> Result<McpPutStatus> {
         self.put_mcp_bytes_if_absent(
+            &self.insert_mcp_relay_attestation_lock,
             &self.mcp_relay_attestation_cf,
             (slot, relay_index),
             relay_attestation,
