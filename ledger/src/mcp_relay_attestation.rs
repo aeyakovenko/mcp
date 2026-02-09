@@ -37,6 +37,8 @@ pub enum RelayAttestationError {
     UnknownVersion(u8),
     #[error("relay attestation entries exceed MCP proposer limit: {0}")]
     TooManyEntries(usize),
+    #[error("relay attestation must include at least one proposer entry")]
+    EmptyEntries,
     #[error("relay index out of range: {0}")]
     RelayIndexOutOfRange(u32),
     #[error("proposer index out of range: {0}")]
@@ -56,6 +58,9 @@ impl RelayAttestation {
         mut entries: Vec<RelayAttestationEntry>,
     ) -> Result<Self, RelayAttestationError> {
         ensure_relay_index_in_range(relay_index)?;
+        if entries.is_empty() {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
         if entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(entries.len()));
         }
@@ -73,6 +78,9 @@ impl RelayAttestation {
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, RelayAttestationError> {
         ensure_relay_index_in_range(self.relay_index)?;
+        if self.entries.is_empty() {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
         if self.entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(self.entries.len()));
         }
@@ -117,6 +125,9 @@ impl RelayAttestation {
         let relay_index = read_u32_le(bytes, &mut cursor)?;
         ensure_relay_index_in_range(relay_index)?;
         let entries_len = read_u8(bytes, &mut cursor)? as usize;
+        if entries_len == 0 {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
         if entries_len > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(entries_len));
         }
@@ -451,6 +462,14 @@ mod tests {
     }
 
     #[test]
+    fn test_new_unsigned_rejects_empty_entries() {
+        assert_eq!(
+            RelayAttestation::new_unsigned(1, 2, Vec::new()).unwrap_err(),
+            RelayAttestationError::EmptyEntries,
+        );
+    }
+
+    #[test]
     fn test_from_wire_rejects_too_many_entries() {
         let relay = Keypair::new();
         let proposer = Keypair::new();
@@ -506,6 +525,21 @@ mod tests {
         assert_eq!(
             RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
             RelayAttestationError::ProposerIndexOutOfRange(MCP_NUM_PROPOSERS as u32),
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_empty_entries() {
+        let relay = Keypair::new();
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::EmptyEntries,
         );
     }
 }
