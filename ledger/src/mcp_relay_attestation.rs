@@ -542,4 +542,45 @@ mod tests {
             RelayAttestationError::EmptyEntries,
         );
     }
+
+    #[test]
+    fn test_verify_proposer_signatures_fails_when_pubkey_lookup_missing() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let commitment = Hash::new_unique();
+        let mut attestation = RelayAttestation::new_unsigned(
+            77,
+            9,
+            vec![RelayAttestationEntry {
+                proposer_index: 2,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            }],
+        )
+        .unwrap();
+        attestation.sign_relay(&relay).unwrap();
+        assert!(!attestation.verify_proposer_signatures(|_| None));
+    }
+
+    #[test]
+    fn test_from_wire_rejects_truncated_mid_entry() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(commitment.as_ref());
+        bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        bytes.truncate(HEADER_LEN + ENTRY_LEN - 1);
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::Truncated,
+        );
+    }
 }
