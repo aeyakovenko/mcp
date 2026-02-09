@@ -1,4 +1,5 @@
 use {
+    crate::mcp,
     solana_clock::Slot,
     solana_hash::{Hash, HASH_BYTES},
     solana_pubkey::Pubkey,
@@ -11,9 +12,7 @@ const HEADER_LEN: usize = 1 + 8 + 4 + 1;
 const ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
 const FOOTER_LEN: usize = SIGNATURE_BYTES;
 const MIN_WIRE_LEN: usize = HEADER_LEN + FOOTER_LEN;
-const MCP_NUM_PROPOSERS: usize = 16;
-const MCP_NUM_RELAYS: usize = 200;
-const MAX_RELAY_ATTESTATION_ENTRIES: usize = MCP_NUM_PROPOSERS;
+const MAX_RELAY_ATTESTATION_ENTRIES: usize = mcp::NUM_PROPOSERS;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayAttestationEntry {
@@ -135,7 +134,7 @@ impl RelayAttestation {
         let mut entries = Vec::with_capacity(entries_len);
         for _ in 0..entries_len {
             let proposer_index = read_u32_le(bytes, &mut cursor)?;
-            if proposer_index as usize >= MCP_NUM_PROPOSERS {
+            if proposer_index as usize >= mcp::NUM_PROPOSERS {
                 return Err(RelayAttestationError::ProposerIndexOutOfRange(
                     proposer_index,
                 ));
@@ -207,7 +206,7 @@ fn ensure_entries_strictly_sorted(
 }
 
 fn ensure_relay_index_in_range(relay_index: u32) -> Result<(), RelayAttestationError> {
-    if relay_index as usize >= MCP_NUM_RELAYS {
+    if relay_index as usize >= mcp::NUM_RELAYS {
         return Err(RelayAttestationError::RelayIndexOutOfRange(relay_index));
     }
     Ok(())
@@ -217,7 +216,7 @@ fn ensure_proposer_indices_in_range(
     entries: &[RelayAttestationEntry],
 ) -> Result<(), RelayAttestationError> {
     for entry in entries {
-        if entry.proposer_index as usize >= MCP_NUM_PROPOSERS {
+        if entry.proposer_index as usize >= mcp::NUM_PROPOSERS {
             return Err(RelayAttestationError::ProposerIndexOutOfRange(
                 entry.proposer_index,
             ));
@@ -502,8 +501,8 @@ mod tests {
             proposer_signature: proposer.sign_message(commitment.as_ref()),
         }];
         assert_eq!(
-            RelayAttestation::new_unsigned(1, MCP_NUM_RELAYS as u32, entries).unwrap_err(),
-            RelayAttestationError::RelayIndexOutOfRange(MCP_NUM_RELAYS as u32),
+            RelayAttestation::new_unsigned(1, mcp::NUM_RELAYS as u32, entries).unwrap_err(),
+            RelayAttestationError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
         );
     }
 
@@ -517,14 +516,14 @@ mod tests {
         bytes.extend_from_slice(&9u64.to_le_bytes());
         bytes.extend_from_slice(&3u32.to_le_bytes());
         bytes.push(1);
-        bytes.extend_from_slice(&(MCP_NUM_PROPOSERS as u32).to_le_bytes());
+        bytes.extend_from_slice(&(mcp::NUM_PROPOSERS as u32).to_le_bytes());
         bytes.extend_from_slice(commitment.as_ref());
         bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
         bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
 
         assert_eq!(
             RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
-            RelayAttestationError::ProposerIndexOutOfRange(MCP_NUM_PROPOSERS as u32),
+            RelayAttestationError::ProposerIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
         );
     }
 
