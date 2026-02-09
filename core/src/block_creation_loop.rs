@@ -453,7 +453,13 @@ fn record_with_optional_bankless(
             .map(|_| ())
     } else {
         poh_recorder
-            .record_bankless(slot, mixins, transaction_batches)
+            .record_bankless(
+                // `has_bank() == false` means this slot is using the bankless path.
+                true,
+                slot,
+                mixins,
+                transaction_batches,
+            )
             .map(|_| ())
     }
 }
