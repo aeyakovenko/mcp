@@ -90,7 +90,8 @@ impl Default for McpSlotDispatchState {
 
 impl McpSlotDispatchState {
     fn try_push_transaction(&mut self, serialized_tx: Vec<u8>) -> bool {
-        let Some(tx_wire_len) = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(serialized_tx.len()) else {
+        let Some(tx_wire_len) = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(serialized_tx.len())
+        else {
             return false;
         };
         let Some(next_payload_len) = self.payload_len_bytes.checked_add(tx_wire_len) else {
@@ -108,12 +109,13 @@ impl McpSlotDispatchState {
 
 fn encode_mcp_payload(transactions: Vec<Vec<u8>>) -> Option<Vec<u8>> {
     let tx_count = u32::try_from(transactions.len()).ok()?;
-    let mut out = Vec::with_capacity(
-        transactions.iter().try_fold(MCP_PAYLOAD_COUNT_PREFIX_BYTES, |acc, tx| {
+    let mut out = Vec::with_capacity(transactions.iter().try_fold(
+        MCP_PAYLOAD_COUNT_PREFIX_BYTES,
+        |acc, tx| {
             let tx_len_field = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(tx.len())?;
             acc.checked_add(tx_len_field)
-        })?,
-    );
+        },
+    )?);
     out.extend_from_slice(&tx_count.to_le_bytes());
     for tx in transactions {
         let tx_len = u32::try_from(tx.len()).ok()?;
@@ -950,7 +952,7 @@ mod test {
         solana_ledger::{
             blockstore::{Blockstore, BlockstoreError},
             genesis_utils::create_genesis_config,
-            get_tmp_ledger_path,
+            get_tmp_ledger_path, mcp,
             shred::{max_ticks_per_n_shreds, DATA_SHREDS_PER_FEC_BLOCK},
         },
         solana_net_utils::sockets::bind_to_localhost_unique,
@@ -1095,7 +1097,11 @@ mod test {
             .unwrap()
             .get(&bank.slot())
             .is_none());
-        assert!(quic_endpoint_receiver.try_recv().is_ok());
+        let mut dispatch_count = 0usize;
+        while quic_endpoint_receiver.try_recv().is_ok() {
+            dispatch_count += 1;
+        }
+        assert_eq!(dispatch_count, mcp::NUM_RELAYS);
     }
 
     #[test]
