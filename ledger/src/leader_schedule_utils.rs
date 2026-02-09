@@ -12,6 +12,8 @@ use {
 const MCP_PROPOSER_DOMAIN: &[u8] = b"mcp:proposer";
 const MCP_RELAY_DOMAIN: &[u8] = b"mcp:relay";
 const MCP_SCHEDULE_REPEAT: u64 = 1;
+// Keep in sync with MCP protocol constants (`NUM_PROPOSERS`/`NUM_RELAYS`) in
+// `ledger::mcp` when branches are merged.
 pub const MCP_PROPOSERS_PER_SLOT: usize = 16;
 pub const MCP_RELAYS_PER_SLOT: usize = 200;
 
