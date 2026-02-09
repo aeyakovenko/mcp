@@ -2604,6 +2604,10 @@ impl ReplayStage {
         };
 
         assert!(parent_bank.is_frozen());
+        let allow_bankless_start = migration_status.is_alpenglow_enabled()
+            && parent_bank
+                .feature_set
+                .is_active(&agave_feature_set::mcp_protocol_v1::id());
 
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
@@ -2612,7 +2616,7 @@ impl ReplayStage {
             bank_forks,
             maybe_my_leader_slot,
             has_new_vote_been_rooted,
-            migration_status.is_alpenglow_enabled(),
+            allow_bankless_start,
         ) {
             return None;
         }
@@ -5151,6 +5155,41 @@ pub(crate) mod tests {
             15,
             &mcp_vote_gate_inputs,
             &mcp_vote_gate_included_proposers,
+        ));
+    }
+
+    #[test]
+    fn test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote() {
+        let (VoteSimulator { bank_forks, .. }, _blockstore) =
+            setup_default_forks(1, None::<GenerateVotes>);
+        let parent_bank = bank_forks.read().unwrap().working_bank();
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&parent_bank));
+        let my_pubkey = leader_schedule_cache
+            .slot_leader_at(parent_bank.slot().saturating_add(1), Some(&parent_bank))
+            .expect("leader must exist");
+        let maybe_my_leader_slot = ((parent_bank.slot() + 1)..=(parent_bank.slot() + 2048))
+            .find(|slot| {
+                leader_schedule_cache.slot_leader_at(*slot, Some(&parent_bank)) == Some(my_pubkey)
+            })
+            .expect("a leader slot should exist for the local validator");
+
+        assert!(!ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            false,
+        ));
+        assert!(ReplayStage::common_maybe_start_leader_checks(
+            &my_pubkey,
+            &leader_schedule_cache,
+            &parent_bank,
+            bank_forks.as_ref(),
+            maybe_my_leader_slot,
+            false,
+            true,
         ));
     }
 

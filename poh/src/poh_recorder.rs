@@ -65,6 +65,27 @@ pub enum PohRecorderError {
 
     #[error("channel disconnected")]
     ChannelDisconnected,
+
+    #[error("bankless recording only allowed when no working bank is installed")]
+    BanklessWorkingBankPresent,
+
+    #[error("bankless recording is disabled for this caller")]
+    BanklessRecordingDisabled,
+
+    #[error("bankless recording slot mismatch: expected {expected}, got {actual}")]
+    BanklessSlotMismatch { expected: Slot, actual: Slot },
+
+    #[error("bankless recording mixin/batch length mismatch: mixins={mixins}, batches={batches}")]
+    BanklessBatchLengthMismatch { mixins: usize, batches: usize },
+
+    #[error("bankless recording requires at least one mixin/batch pair")]
+    BanklessEmptyInput,
+
+    #[error("bankless recording received an empty transaction batch")]
+    BanklessEmptyBatch,
+
+    #[error("bankless recording made no PoH progress in slot {slot}")]
+    BanklessProgressStalled { slot: Slot },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, PohRecorderError>;
@@ -76,11 +97,13 @@ pub struct RecordSummary {
     pub remaining_hashes_in_slot: u64,
 }
 
+#[derive(Debug)]
 pub struct BanklessRecordEntry {
     pub entry: Entry,
     pub tick_height: u64,
 }
 
+#[derive(Debug)]
 pub struct BanklessRecordSummary {
     pub remaining_hashes_in_slot: u64,
     pub recorded_entries: Vec<BanklessRecordEntry>,
@@ -417,27 +440,50 @@ impl PohRecorder {
     /// requiring a working bank in PohRecorder.
     pub fn record_bankless(
         &mut self,
+        allow_bankless_recording: bool,
         slot: Slot,
         mixins: Vec<Hash>,
         transaction_batches: Vec<Vec<VersionedTransaction>>,
     ) -> Result<BanklessRecordSummary> {
-        assert!(
-            mixins.len() == transaction_batches.len(),
-            "mismatched mixin and transaction batch lengths"
-        );
-        assert!(
-            !transaction_batches.iter().any(|batch| batch.is_empty()),
-            "No transactions provided"
-        );
+        if !allow_bankless_recording {
+            return Err(PohRecorderError::BanklessRecordingDisabled);
+        }
+        if self.has_bank() {
+            return Err(PohRecorderError::BanklessWorkingBankPresent);
+        }
+        let expected_slot = self.start_slot();
+        if slot != expected_slot {
+            return Err(PohRecorderError::BanklessSlotMismatch {
+                expected: expected_slot,
+                actual: slot,
+            });
+        }
+        if mixins.len() != transaction_batches.len() {
+            return Err(PohRecorderError::BanklessBatchLengthMismatch {
+                mixins: mixins.len(),
+                batches: transaction_batches.len(),
+            });
+        }
+        if mixins.is_empty() {
+            return Err(PohRecorderError::BanklessEmptyInput);
+        }
+        if transaction_batches.iter().any(|batch| batch.is_empty()) {
+            return Err(PohRecorderError::BanklessEmptyBatch);
+        }
 
         let ((), report_metrics_us) = measure_us!(self.metrics.report(slot));
         self.metrics.report_metrics_us += report_metrics_us;
 
         loop {
+            let current_slot = self.start_slot();
+            if current_slot != slot {
+                return Err(PohRecorderError::BanklessSlotMismatch {
+                    expected: slot,
+                    actual: current_slot,
+                });
+            }
             if self.has_bank() {
-                let (flush_cache_res, flush_cache_us) = measure_us!(self.flush_cache(false, None));
-                self.metrics.flush_cache_no_tick_us += flush_cache_us;
-                flush_cache_res?;
+                return Err(PohRecorderError::BanklessWorkingBankPresent);
             }
 
             let tick_height = self.tick_height(); // cannot change until next loop iteration.
@@ -474,7 +520,19 @@ impl PohRecorder {
             }
 
             self.metrics.ticks_from_record += 1;
+            let tick_height_before_tick = self.tick_height();
             self.tick();
+            let tick_height_after_tick = self.tick_height();
+            let remaining_hashes_after_tick = self
+                .poh
+                .lock()
+                .unwrap()
+                .remaining_hashes_in_slot(self.ticks_per_slot);
+            if tick_height_after_tick == tick_height_before_tick
+                && remaining_hashes_after_tick == remaining_hashes_in_slot
+            {
+                return Err(PohRecorderError::BanklessProgressStalled { slot });
+            }
         }
     }
 
@@ -1363,6 +1421,7 @@ mod tests {
         assert!(!poh_recorder.has_bank());
         let summary = poh_recorder
             .record_bankless(
+                true,
                 bank.slot(),
                 vec![hash(&[1u8])],
                 vec![vec![test_tx().into()]],
@@ -1370,6 +1429,189 @@ mod tests {
             .unwrap();
         assert_eq!(summary.recorded_entries.len(), 1);
         assert_eq!(summary.recorded_entries[0].entry.transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_slot_mismatch() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(
+                true,
+                bank.slot().saturating_add(1),
+                vec![hash(&[1u8])],
+                vec![vec![test_tx().into()]],
+            ),
+            Err(PohRecorderError::BanklessSlotMismatch { .. })
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_when_disabled() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(
+                false,
+                bank.slot(),
+                vec![hash(&[1u8])],
+                vec![vec![test_tx().into()]],
+            ),
+            Err(PohRecorderError::BanklessRecordingDisabled)
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_mismatched_mixin_batch_lengths() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(
+                true,
+                bank.slot(),
+                vec![hash(&[1u8]), hash(&[2u8])],
+                vec![vec![test_tx().into()]],
+            ),
+            Err(PohRecorderError::BanklessBatchLengthMismatch { .. })
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_empty_input() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(true, bank.slot(), vec![], vec![]),
+            Err(PohRecorderError::BanklessEmptyInput)
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_empty_transaction_batch() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(true, bank.slot(), vec![hash(&[1u8])], vec![vec![]],),
+            Err(PohRecorderError::BanklessEmptyBatch)
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_does_not_stall_when_tick_height_unchanged_but_hashes_progress() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+
+        let mut poh_config = PohConfig::default();
+        poh_config.hashes_per_tick = Some(4);
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &poh_config,
+            Arc::new(AtomicBool::default()),
+        );
+
+        // Leave only two hash steps before the next tick boundary so the first
+        // `record_batches` attempt cannot mix in all three entries.
+        poh_recorder.tick();
+        poh_recorder.tick();
+
+        let result = poh_recorder.record_bankless(
+            true,
+            bank.slot(),
+            vec![hash(&[1u8]), hash(&[2u8]), hash(&[3u8])],
+            vec![
+                vec![test_tx().into()],
+                vec![test_tx().into()],
+                vec![test_tx().into()],
+            ],
+        );
+
+        assert!(result.is_ok());
+        let summary = result.unwrap();
+        assert_eq!(summary.recorded_entries.len(), 3);
     }
 
     #[test]
