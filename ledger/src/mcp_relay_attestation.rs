@@ -507,6 +507,42 @@ mod tests {
     }
 
     #[test]
+    fn test_new_unsigned_accepts_max_valid_relay_index() {
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries = vec![RelayAttestationEntry {
+            proposer_index: 0,
+            commitment,
+            proposer_signature: proposer.sign_message(commitment.as_ref()),
+        }];
+
+        let attestation =
+            RelayAttestation::new_unsigned(1, (mcp::NUM_RELAYS - 1) as u32, entries).unwrap();
+        assert_eq!(attestation.relay_index, (mcp::NUM_RELAYS - 1) as u32);
+    }
+
+    #[test]
+    fn test_from_wire_rejects_out_of_range_relay_index() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&(mcp::NUM_RELAYS as u32).to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(commitment.as_ref());
+        bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
+        );
+    }
+
+    #[test]
     fn test_from_wire_rejects_out_of_range_proposer_index() {
         let relay = Keypair::new();
         let proposer = Keypair::new();
