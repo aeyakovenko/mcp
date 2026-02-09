@@ -2,22 +2,41 @@ use {
     crate::mcp_vote_gate::{
         Commitment, RelayAttestationObservation, RelayProposerEntry, VoteGateInput,
     },
+    agave_transaction_view::transaction_view::SanitizedTransactionView,
     solana_clock::Slot,
     solana_ledger::{
-        blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache, mcp,
-        mcp_aggregate_attestation::AggregateAttestation, mcp_consensus_block::ConsensusBlock,
+        blockstore::Blockstore,
+        leader_schedule_cache::LeaderScheduleCache,
+        mcp,
+        mcp_aggregate_attestation::AggregateAttestation,
+        mcp_consensus_block::ConsensusBlock,
+        mcp_ordering,
+        mcp_reconstruction::{
+            decode_reconstructed_payload, reconstruct_payload, MCP_RECON_MAX_PAYLOAD_BYTES,
+            MCP_RECON_NUM_SHREDS, MCP_RECON_SHRED_BYTES,
+        },
         shred::mcp_shred::McpShred,
     },
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
+    },
+    solana_transaction::sanitized::MessageHash,
     std::{
-        collections::{BTreeSet, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         sync::{Arc, RwLock},
     },
 };
 
 pub(crate) type McpConsensusBlockStore = Arc<RwLock<HashMap<Slot, Vec<u8>>>>;
 const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReconstructedTransaction {
+    ordering_fee: u64,
+    wire_bytes: Vec<u8>,
+}
 
 fn load_proposer_schedule(
     slot: Slot,
@@ -270,6 +289,154 @@ pub(crate) fn refresh_vote_gate_input(
     if let Ok(mut consensus_blocks) = mcp_consensus_blocks.write() {
         let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
         consensus_blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+    }
+}
+
+fn ordering_fee_for_transaction(wire_bytes: &[u8]) -> Option<u64> {
+    let view = SanitizedTransactionView::try_new_sanitized(wire_bytes).ok()?;
+    let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+        view,
+        MessageHash::Compute,
+        None,
+    )
+    .ok()?;
+    Some(
+        runtime_tx
+            .mcp_fee_components()
+            .map(|(_, ordering_fee)| ordering_fee)
+            .unwrap_or_else(|| {
+                runtime_tx
+                    .compute_budget_instruction_details()
+                    .requested_compute_unit_price()
+            }),
+    )
+}
+
+fn encode_ordered_execution_output(transactions: &[ReconstructedTransaction]) -> Option<Vec<u8>> {
+    let tx_count = u32::try_from(transactions.len()).ok()?;
+    let mut out = Vec::with_capacity(transactions.iter().try_fold(4usize, |acc, tx| {
+        let tx_len_field = 4usize.checked_add(tx.wire_bytes.len())?;
+        acc.checked_add(tx_len_field)
+    })?);
+    out.extend_from_slice(&tx_count.to_le_bytes());
+    for tx in transactions {
+        let tx_len = u32::try_from(tx.wire_bytes.len()).ok()?;
+        out.extend_from_slice(&tx_len.to_le_bytes());
+        out.extend_from_slice(&tx.wire_bytes);
+    }
+    Some(out)
+}
+
+pub(crate) fn maybe_persist_reconstructed_execution_output(
+    slot: Slot,
+    bank: &Bank,
+    bank_forks: &RwLock<BankForks>,
+    blockstore: &Blockstore,
+    leader_schedule_cache: &LeaderScheduleCache,
+    mcp_vote_gate_included_proposers: &RwLock<HashMap<Slot, BTreeMap<u32, Commitment>>>,
+) {
+    if blockstore
+        .get_mcp_execution_output(slot)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+
+    let included_proposers = match mcp_vote_gate_included_proposers.read() {
+        Ok(included) => included.get(&slot).cloned().unwrap_or_default(),
+        Err(_) => return,
+    };
+    if included_proposers.is_empty() {
+        return;
+    }
+
+    let root_bank = bank_forks.read().unwrap().root_bank();
+    let proposers = load_proposer_schedule(slot, bank, &root_bank, leader_schedule_cache);
+    if proposers.is_empty() {
+        return;
+    }
+
+    let mut reconstructed_batches: Vec<(u32, Vec<ReconstructedTransaction>)> = Vec::new();
+    for (proposer_index, commitment) in included_proposers {
+        let Some(proposer_pubkey) = proposers.get(proposer_index as usize) else {
+            continue;
+        };
+        let mut shards: Vec<Option<[u8; MCP_RECON_SHRED_BYTES]>> = vec![None; MCP_RECON_NUM_SHREDS];
+        for shred_index in 0..mcp::NUM_RELAYS {
+            let Some(shred_index_u32) = u32::try_from(shred_index).ok() else {
+                continue;
+            };
+            let Ok(Some(bytes)) =
+                blockstore.get_mcp_shred_data(slot, proposer_index, shred_index_u32)
+            else {
+                continue;
+            };
+            let Ok(mcp_shred) = McpShred::from_bytes(&bytes) else {
+                continue;
+            };
+            if mcp_shred.slot != slot
+                || mcp_shred.proposer_index != proposer_index
+                || mcp_shred.commitment != commitment
+                || (mcp_shred.shred_index as usize) >= MCP_RECON_NUM_SHREDS
+            {
+                continue;
+            }
+            if !mcp_shred.verify_signature(proposer_pubkey) || !mcp_shred.verify_witness() {
+                continue;
+            }
+            shards[mcp_shred.shred_index as usize] = Some(mcp_shred.shred_data);
+        }
+
+        let Ok(payload) = reconstruct_payload(
+            slot,
+            proposer_index,
+            MCP_RECON_MAX_PAYLOAD_BYTES,
+            commitment,
+            &mut shards,
+        ) else {
+            continue;
+        };
+        let Ok(decoded_payload) = decode_reconstructed_payload(&payload) else {
+            continue;
+        };
+
+        let transactions = decoded_payload
+            .transactions
+            .into_iter()
+            .filter_map(|tx| {
+                let ordering_fee = ordering_fee_for_transaction(&tx.wire_bytes)?;
+                Some(ReconstructedTransaction {
+                    ordering_fee,
+                    wire_bytes: tx.wire_bytes,
+                })
+            })
+            .collect::<Vec<_>>();
+        if transactions.is_empty() {
+            continue;
+        }
+        reconstructed_batches.push((proposer_index, transactions));
+    }
+
+    if reconstructed_batches.is_empty() {
+        return;
+    }
+
+    let ordered_transactions =
+        mcp_ordering::order_batches_by_fee_desc(reconstructed_batches, |tx| tx.ordering_fee);
+    let Some(encoded_output) = encode_ordered_execution_output(&ordered_transactions) else {
+        return;
+    };
+    if encoded_output.is_empty() {
+        return;
+    }
+
+    if let Err(err) = blockstore.put_mcp_execution_output(slot, &encoded_output) {
+        debug!(
+            "failed to persist reconstructed MCP execution output for slot {}: {}",
+            slot, err
+        );
     }
 }
 
