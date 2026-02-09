@@ -1,5 +1,5 @@
 use {
-    crate::mcp_merkle,
+    crate::{mcp, mcp_merkle},
     solana_clock::Slot,
     solana_perf::packet::{Packet, PacketRef},
     solana_pubkey::Pubkey,
@@ -9,9 +9,9 @@ use {
 #[cfg(test)]
 use solana_sha256_hasher::hashv;
 
-pub const MCP_NUM_RELAYS: usize = 200;
-pub const MCP_NUM_PROPOSERS: usize = 16;
-pub const MCP_SHRED_DATA_BYTES: usize = 863;
+pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
+pub const MCP_NUM_PROPOSERS: usize = mcp::NUM_PROPOSERS;
+pub const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
 pub const MCP_WITNESS_LEN: usize = mcp_witness_len(MCP_NUM_RELAYS);
 
 pub const MCP_SHRED_WIRE_SIZE: usize = std::mem::size_of::<Slot>() // slot
