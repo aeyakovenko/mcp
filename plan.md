@@ -350,7 +350,8 @@ Validation rules:
 - invalid proposer signature inside relay entry => drop that entry, keep other valid entries
 - canonical aggregate ordering by `relay_index`
 - enforce aggregate and consensus wire-size upper bounds before decode (including QUIC control payload cap)
-- threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation; proposer-entry filtering does not change this relay count
+- threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation and retain at least one valid proposer entry after proposer filtering
+- relay entries that become empty after proposer-signature filtering are dropped and MUST NOT count toward attestation thresholds
 
 ### 6.3 Leader finalization
 
@@ -386,6 +387,7 @@ When this node is leader for slot `s` at aggregation deadline:
   1. verify leader signature and leader index for slot
   2. verify delayed bankhash by consensus-defined delayed slot; if local delayed bankhash is unavailable, do not vote and keep block pending
   3. verify relay/proposer signatures and ignore invalid entries
+     - drop relay entries that become empty after proposer-signature filtering
   4. enforce global relay threshold using the same relay-count rule from Pass 6 (`>= REQUIRED_ATTESTATIONS`)
   5. implied proposer rules:
      - multiple commitments => exclude
@@ -442,7 +444,8 @@ Implementation wiring:
 
 ### 7.5 Empty result
 
-- if consensus outputs empty result for slot, freeze bank with no transactions.
+- if consensus outputs empty result for slot, record empty MCP execution output for the slot.
+- if a local slot bank exists with a different `block_id`, treat it as fork mismatch and do not record empty output for that slot.
 
 ### 7.6 Tests
 
