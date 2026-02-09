@@ -7087,6 +7087,157 @@ fn test_alpenglow_ensure_liveness_after_double_notar_fallback() {
     quic_server_thread.join().unwrap();
 }
 
+#[test]
+#[serial]
+fn test_local_cluster_mcp_produces_blockstore_artifacts() {
+    fn slot_has_relay_attestation(blockstore: &Blockstore, slot: Slot) -> bool {
+        for relay_index in 0..solana_ledger::mcp::NUM_RELAYS {
+            let Some(relay_index) = u32::try_from(relay_index).ok() else {
+                continue;
+            };
+            if blockstore
+                .get_mcp_relay_attestation(slot, relay_index)
+                .unwrap()
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn slot_has_shred_data(blockstore: &Blockstore, slot: Slot) -> bool {
+        for proposer_index in 0..solana_ledger::mcp::NUM_PROPOSERS {
+            let Some(proposer_index) = u32::try_from(proposer_index).ok() else {
+                continue;
+            };
+            for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
+                let Some(shred_index) = u32::try_from(shred_index).ok() else {
+                    continue;
+                };
+                if blockstore
+                    .get_mcp_shred_data(slot, proposer_index, shred_index)
+                    .unwrap()
+                    .is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn slot_has_non_empty_execution_output(blockstore: &Blockstore, slot: Slot) -> bool {
+        blockstore
+            .get_mcp_execution_output(slot)
+            .unwrap()
+            .is_some_and(|output| !output.is_empty())
+    }
+
+    agave_logger::setup_with_default(RUST_LOG_FILTER);
+
+    let mut validator_config = ValidatorConfig::default_for_test();
+    validator_config.wait_for_supermajority = Some(0);
+
+    let mcp_feature_id = agave_feature_set::mcp_protocol_v1::id();
+    let mcp_feature_lamports = std::cmp::max(
+        solana_rent::Rent::default().minimum_balance(
+            solana_feature_gate_interface::Feature::size_of(),
+        ),
+        1,
+    );
+    let mcp_feature_account = AccountSharedData::from(
+        solana_feature_gate_interface::create_account(
+            &solana_feature_gate_interface::Feature {
+                activated_at: Some(0),
+            },
+            mcp_feature_lamports,
+        ),
+    );
+
+    let num_nodes = 3;
+    let mut config = ClusterConfig {
+        validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+        node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
+        ticks_per_slot: 8,
+        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
+        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
+        skip_warmup_slots: true,
+        additional_accounts: vec![(mcp_feature_id, mcp_feature_account)],
+        ..ClusterConfig::default()
+    };
+    let cluster = LocalCluster::new(&mut config, SocketAddrSpace::Unspecified);
+
+    let entry_client = RpcClient::new_socket_with_commitment(
+        cluster.entry_point_info.rpc().unwrap(),
+        CommitmentConfig::processed(),
+    );
+    let mcp_feature_account = entry_client
+        .get_account(&mcp_feature_id)
+        .expect("MCP feature account should exist in genesis");
+    let mcp_feature = solana_feature_gate_interface::from_account(&mcp_feature_account)
+        .expect("MCP feature account should deserialize");
+    assert!(
+        mcp_feature.activated_at.is_some(),
+        "MCP feature must be activated for local-cluster MCP test",
+    );
+
+    // Drive proposer payload generation with regular transfer traffic.
+    cluster_tests::send_many_transactions(
+        &cluster.entry_point_info,
+        &cluster.funding_keypair,
+        &cluster.connection_cache,
+        10,
+        64,
+    );
+
+    cluster.check_for_new_roots(
+        16,
+        "test_local_cluster_mcp_produces_blockstore_artifacts",
+        SocketAddrSpace::Unspecified,
+    );
+
+    let leader_pubkey = cluster.entry_point_info.pubkey();
+    let leader_info = cluster
+        .validators
+        .get(leader_pubkey)
+        .expect("entry validator should be present");
+    let blockstore = open_blockstore(&leader_info.info.ledger_path);
+
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut observed_slot = None;
+    while Instant::now() < deadline {
+        let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
+        let min_slot = highest_slot.saturating_sub(64);
+
+        for slot in (min_slot..=highest_slot).rev() {
+            if slot_has_non_empty_execution_output(&blockstore, slot)
+                && slot_has_relay_attestation(&blockstore, slot)
+                && slot_has_shred_data(&blockstore, slot)
+            {
+                observed_slot = Some(slot);
+                break;
+            }
+        }
+        if observed_slot.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+
+    let observed_slot = observed_slot.unwrap_or_else(|| {
+        let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
+        panic!(
+            "timed out waiting for MCP artifacts in blockstore; highest observed slot {}",
+            highest_slot
+        );
+    });
+    info!(
+        "observed MCP shred/attestation/execution artifacts at slot {}",
+        observed_slot
+    );
+}
+
 /// Test to validate Alpenglow's ability to maintain liveness when nodes issue both NotarizeFallback
 /// and SkipFallback votes in an intertwined manner.
 ///
