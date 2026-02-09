@@ -247,6 +247,7 @@ Non-reusable for MCP wire correctness:
   - if a validator owns multiple relay indices, it may emit multiple attestations (one per index).
 - Attestation encoding:
   - `RelayAttestation.entries` MUST be sorted by `proposer_index` and deduplicated.
+  - Empty `RelayAttestation.entries` is invalid and MUST be rejected.
 
 ### 4.3 MCP QUIC transport
 
@@ -300,6 +301,7 @@ Non-reusable for MCP wire correctness:
   - record path is explicit opt-in from replay-stage call sites
   - reject if a working bank is installed
   - reject slot-mismatch vs PoH recorder start slot
+  - reject malformed inputs (`mixins.len() != transaction_batches.len()` or any empty transaction batch)
 
 ### 5.3 Forwarding stage changes
 
