@@ -862,6 +862,46 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_schedule_epoch_boundary_requires_confirmed_epoch() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        genesis_config.epoch_schedule = EpochSchedule::custom(32, 16, true);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+        let slots_per_epoch = genesis_config.epoch_schedule.slots_per_epoch;
+        let epoch0_last_slot = slots_per_epoch - 1;
+        let epoch1_first_slot = slots_per_epoch;
+
+        assert!(cache
+            .proposers_at_slot(epoch0_last_slot, Some(&bank))
+            .is_some());
+        assert!(cache.relays_at_slot(epoch0_last_slot, Some(&bank)).is_some());
+
+        // Epoch 1 is unconfirmed until root advances through the end of epoch 0.
+        assert!(cache
+            .proposers_at_slot(epoch1_first_slot, Some(&bank))
+            .is_none());
+        assert!(cache.relays_at_slot(epoch1_first_slot, Some(&bank)).is_none());
+
+        let bank2 = Arc::new(Bank::new_from_parent(
+            bank,
+            &solana_pubkey::new_rand(),
+            epoch0_last_slot,
+        ));
+        cache.set_root(&bank2);
+
+        assert!(cache
+            .proposers_at_slot(epoch1_first_slot, Some(&bank2))
+            .is_some());
+        assert!(cache
+            .relays_at_slot(epoch1_first_slot, Some(&bank2))
+            .is_some());
+    }
+
+    #[test]
     fn test_set_max_schedules() {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
