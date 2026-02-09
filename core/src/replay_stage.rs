@@ -2863,6 +2863,14 @@ impl ReplayStage {
             ) {
                 return Ok(());
             }
+            mcp_replay::maybe_persist_reconstructed_execution_output(
+                bank.slot(),
+                bank,
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_vote_gate_included_proposers,
+            );
         } else {
             // Preserve pre-MCP behavior: Alpenglow migration should not progress through
             // ReplayStage vote handling unless MCP vote gating is explicitly enabled.
