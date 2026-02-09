@@ -25,7 +25,9 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
     - produce latest §7.1 format whenever the transaction representation supports it
     - otherwise pass through legacy bytes
   - Fee/ordering extraction:
-    - latest format: read `ordering_fee` from §7.1 config field
+    - latest format:
+      - `inclusion_fee`: read §7.1 config field when present, else default `0`
+      - `ordering_fee`: read §7.1 config field when present, else derive from `compute_unit_price` (default `0` if absent)
     - legacy format: derive ordering key from `compute_unit_price` (default `0` if absent)
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
