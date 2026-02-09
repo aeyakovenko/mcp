@@ -2941,8 +2941,14 @@ impl ReplayStage {
         const MCP_VOTE_GATE_INPUT_RETENTION_SLOTS: Slot = 512;
         const MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS: Slot = 64;
 
-        let maybe_input = match mcp_vote_gate_inputs.read() {
-            Ok(inputs) => inputs.get(&slot).cloned(),
+        let decision = match mcp_vote_gate_inputs.read() {
+            Ok(inputs) => {
+                let Some(input) = inputs.get(&slot) else {
+                    info!("MCP vote gate missing input for slot {}; rejecting vote", slot);
+                    return false;
+                };
+                mcp_vote_gate::evaluate_vote_gate(input)
+            }
             Err(err) => {
                 warn!(
                     "MCP vote gate lock poisoned while evaluating slot {}: {}; rejecting vote",
@@ -2959,12 +2965,7 @@ impl ReplayStage {
             }
         }
 
-        let Some(input) = maybe_input else {
-            info!("MCP vote gate missing input for slot {}; rejecting vote", slot);
-            return false;
-        };
-
-        match mcp_vote_gate::evaluate_vote_gate(&input) {
+        match decision {
             VoteGateDecision::Vote { .. } => true,
             VoteGateDecision::Reject(reason) => {
                 info!("MCP vote gate rejected slot {}: {}", slot, reason);
