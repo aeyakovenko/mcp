@@ -524,7 +524,11 @@ impl PohRecorder {
             self.metrics.ticks_from_record += 1;
             let tick_height_before_tick = self.tick_height();
             self.tick();
-            if self.tick_height() == tick_height_before_tick {
+            let tick_height_after_tick = self.tick_height();
+            let remaining_hashes_after_tick = self.poh.lock().unwrap().remaining_hashes_in_slot(self.ticks_per_slot);
+            if tick_height_after_tick == tick_height_before_tick
+                && remaining_hashes_after_tick == remaining_hashes_in_slot
+            {
                 return Err(PohRecorderError::BanklessProgressStalled { slot });
             }
         }
@@ -1563,6 +1567,49 @@ mod tests {
             poh_recorder.record_bankless(true, bank.slot(), vec![], vec![]),
             Err(PohRecorderError::BanklessEmptyInput)
         );
+    }
+
+    #[test]
+    fn test_record_bankless_does_not_stall_when_tick_height_unchanged_but_hashes_progress() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+
+        let mut poh_config = PohConfig::default();
+        poh_config.hashes_per_tick = Some(4);
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &poh_config,
+            Arc::new(AtomicBool::default()),
+        );
+
+        // Leave only two hash steps before the next tick boundary so the first
+        // `record_batches` attempt cannot mix in all three entries.
+        poh_recorder.tick();
+        poh_recorder.tick();
+
+        let result = poh_recorder.record_bankless(
+            true,
+            bank.slot(),
+            vec![hash(&[1u8]), hash(&[2u8]), hash(&[3u8])],
+            vec![
+                vec![test_tx().into()],
+                vec![test_tx().into()],
+                vec![test_tx().into()],
+            ],
+        );
+
+        assert!(result.is_ok());
+        let summary = result.unwrap();
+        assert_eq!(summary.recorded_entries.len(), 3);
     }
 
     #[test]
