@@ -1,0 +1,6 @@
+pub const NUM_PROPOSERS: usize = 16;
+pub const NUM_RELAYS: usize = 200;
+pub const DATA_SHREDS_PER_FEC_BLOCK: usize = 40;
+pub const CODING_SHREDS_PER_FEC_BLOCK: usize = NUM_RELAYS - DATA_SHREDS_PER_FEC_BLOCK;
+pub const SHRED_DATA_BYTES: usize = 863;
+pub const MAX_PAYLOAD_BYTES: usize = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES;

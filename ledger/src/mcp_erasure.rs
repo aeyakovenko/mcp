@@ -1,14 +1,14 @@
 use {
-    crate::mcp_merkle,
+    crate::{mcp, mcp_merkle},
     reed_solomon_erasure::galois_8::ReedSolomon,
     std::sync::OnceLock,
 };
 
-pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = 40;
-pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = 160;
-pub const MCP_NUM_RELAYS: usize = MCP_DATA_SHREDS_PER_FEC_BLOCK + MCP_CODING_SHREDS_PER_FEC_BLOCK;
-pub const MCP_SHRED_DATA_BYTES: usize = 863;
-pub const MCP_MAX_PAYLOAD_BYTES: usize = MCP_DATA_SHREDS_PER_FEC_BLOCK * MCP_SHRED_DATA_BYTES;
+pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
+pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
+pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
+pub const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
+pub const MCP_MAX_PAYLOAD_BYTES: usize = mcp::MAX_PAYLOAD_BYTES;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum McpErasureError {
