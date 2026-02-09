@@ -449,6 +449,16 @@ mod tests {
     use {
         super::*,
         crate::mcp_vote_gate::{RelayAttestationObservation, RelayProposerEntry},
+        agave_feature_set as feature_set,
+        solana_keypair::Keypair,
+        solana_ledger::{
+            blockstore::Blockstore,
+            genesis_utils::create_genesis_config_with_leader,
+            get_tmp_ledger_path_auto_delete,
+            mcp_aggregate_attestation::AggregateAttestation,
+        },
+        solana_runtime::bank_forks::BankForks,
+        solana_signer::Signer,
     };
 
     fn relay_with_entry(
@@ -495,5 +505,87 @@ mod tests {
 
         let selected = derive_selected_commitments(&aggregate);
         assert_eq!(selected.get(&3), Some(&commitment));
+    }
+
+    #[test]
+    fn test_refresh_vote_gate_input_populates_slot_input_from_consensus_block() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+
+        let slot = 1;
+        let bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(
+                root_bank.clone(),
+                &leader.pubkey(),
+                slot,
+            ))
+            .clone_without_scheduler();
+
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let leader_index = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&bank))
+            .and_then(|proposers| {
+                proposers
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in proposer schedule");
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_bankhash = root_bank.hash();
+        let mut consensus_block = ConsensusBlock::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            vec![],
+            delayed_bankhash,
+        )
+        .unwrap();
+        consensus_block.sign_leader(&leader).unwrap();
+        let consensus_bytes = consensus_block.to_wire_bytes().unwrap();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        mcp_consensus_blocks
+            .write()
+            .unwrap()
+            .insert(slot, consensus_bytes);
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+
+        refresh_vote_gate_input(
+            slot,
+            &bank,
+            &bank_forks,
+            &blockstore,
+            &leader_schedule_cache,
+            &mcp_consensus_blocks,
+            &mcp_vote_gate_inputs,
+        );
+
+        let input = mcp_vote_gate_inputs
+            .read()
+            .unwrap()
+            .get(&slot)
+            .cloned()
+            .expect("vote-gate input should be populated");
+        assert!(input.leader_signature_valid);
+        assert!(input.leader_index_matches);
+        assert!(input.delayed_bankhash_available);
+        assert!(input.delayed_bankhash_matches);
     }
 }
