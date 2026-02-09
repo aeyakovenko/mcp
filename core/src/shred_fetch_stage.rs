@@ -475,3 +475,72 @@ fn check_feature_activation(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crossbeam_channel::unbounded,
+        solana_packet::PacketFlags,
+        std::thread,
+    };
+
+    #[test]
+    fn test_receive_quic_datagrams_routes_mcp_control_frames_before_size_drop() {
+        let (quic_sender, quic_receiver) = unbounded();
+        let (packet_sender, packet_receiver) = unbounded();
+        let (mcp_control_sender, mcp_control_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_clone = exit.clone();
+
+        let receiver_thread = thread::spawn(move || {
+            receive_quic_datagrams(
+                quic_receiver,
+                PacketFlags::empty(),
+                packet_sender,
+                exit_clone,
+                Some(mcp_control_sender),
+            );
+        });
+
+        let sender_pubkey = Pubkey::new_unique();
+        let remote_addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+
+        // Oversized MCP control payload should bypass PACKET_DATA_SIZE filtering.
+        let mut oversized_control = vec![0u8; PACKET_DATA_SIZE + 128];
+        oversized_control[0] = MCP_CONTROL_MSG_CONSENSUS_BLOCK;
+        quic_sender
+            .send((sender_pubkey, remote_addr, Bytes::from(oversized_control.clone())))
+            .unwrap();
+
+        // Oversized non-control payload should be dropped.
+        let oversized_non_control = vec![9u8; PACKET_DATA_SIZE + 128];
+        quic_sender
+            .send((sender_pubkey, remote_addr, Bytes::from(oversized_non_control)))
+            .unwrap();
+
+        // Small non-control payload should still flow into packet batches.
+        let small_payload = vec![7u8; 64];
+        quic_sender
+            .send((sender_pubkey, remote_addr, Bytes::from(small_payload)))
+            .unwrap();
+
+        let (_pubkey, _addr, forwarded_control) = mcp_control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected MCP control frame");
+        assert_eq!(forwarded_control.len(), oversized_control.len());
+        assert_eq!(
+            forwarded_control.first().copied(),
+            Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK)
+        );
+
+        let batch = packet_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected packet batch for non-control datagrams");
+        assert_eq!(batch.len(), 1);
+
+        exit.store(true, Ordering::Relaxed);
+        drop(quic_sender);
+        receiver_thread.join().unwrap();
+    }
+}
