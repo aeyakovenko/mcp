@@ -6859,6 +6859,30 @@ pub mod tests {
     }
 
     #[test]
+    fn test_purge_slots_removes_mcp_execution_output_entries() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        blockstore.put_mcp_execution_output(120, b"slot-120").unwrap();
+        blockstore.put_mcp_execution_output(121, b"slot-121").unwrap();
+        assert_eq!(
+            blockstore.get_mcp_execution_output(120).unwrap(),
+            Some(b"slot-120".to_vec())
+        );
+        assert_eq!(
+            blockstore.get_mcp_execution_output(121).unwrap(),
+            Some(b"slot-121".to_vec())
+        );
+
+        blockstore.purge_slots(120, 120, PurgeType::CompactionFilter);
+        assert_eq!(blockstore.get_mcp_execution_output(120).unwrap(), None);
+        assert_eq!(
+            blockstore.get_mcp_execution_output(121).unwrap(),
+            Some(b"slot-121".to_vec())
+        );
+    }
+
+    #[test]
     fn test_write_entries() {
         agave_logger::setup();
         let ledger_path = get_tmp_ledger_path_auto_delete!();
