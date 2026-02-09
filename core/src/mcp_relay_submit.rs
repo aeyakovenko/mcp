@@ -19,11 +19,12 @@ use {
     solana_signature::{Signature, SIGNATURE_BYTES},
     std::net::SocketAddr,
     thiserror::Error,
-    tokio::sync::mpsc::Sender as AsyncSender,
+    tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
 pub const RELAY_ATTESTATION_VERSION_V1: u8 = RELAY_ATTESTATION_V1;
+const RELAY_SUBMIT_SEND_RETRY_LIMIT: usize = 3;
 pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
     + 8
     + 4
@@ -293,17 +294,37 @@ pub fn dispatch_relay_attestation_to_slot_leader(
             dispatch.leader_pubkey,
         ))?;
     let payload = Bytes::copy_from_slice(&dispatch.frame);
-    match quic_endpoint_sender.try_send((leader_addr, payload)) {
+    match try_send_dispatch_frame_with_retry(quic_endpoint_sender, leader_addr, payload) {
         Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            return Err(RelaySubmitError::SendChannelFull);
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            return Err(RelaySubmitError::SendChannelClosed);
-        }
+        Err(AsyncTrySendError::Full(_)) => return Err(RelaySubmitError::SendChannelFull),
+        Err(AsyncTrySendError::Closed(_)) => return Err(RelaySubmitError::SendChannelClosed),
     }
 
     Ok(dispatch)
+}
+
+fn try_send_dispatch_frame_with_retry(
+    quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    leader_addr: SocketAddr,
+    payload: Bytes,
+) -> Result<(), AsyncTrySendError<(SocketAddr, Bytes)>> {
+    let mut send_item = (leader_addr, payload);
+    for attempt in 0..=RELAY_SUBMIT_SEND_RETRY_LIMIT {
+        match quic_endpoint_sender.try_send(send_item) {
+            Ok(()) => return Ok(()),
+            Err(AsyncTrySendError::Closed(returned)) => {
+                return Err(AsyncTrySendError::Closed(returned));
+            }
+            Err(AsyncTrySendError::Full(returned)) => {
+                if attempt == RELAY_SUBMIT_SEND_RETRY_LIMIT {
+                    return Err(AsyncTrySendError::Full(returned));
+                }
+                send_item = returned;
+                std::thread::yield_now();
+            }
+        }
+    }
+    unreachable!("retry loop should always return on success or terminal send error")
 }
 
 #[cfg(test)]
@@ -499,6 +520,54 @@ mod tests {
     fn test_unknown_frame_type_rejected() {
         let err = decode_relay_attestation_frame(&[0x02, 0x00]).unwrap_err();
         assert_eq!(err, RelaySubmitError::UnknownMessageType(0x02));
+    }
+
+    #[test]
+    fn test_try_send_dispatch_frame_with_retry_succeeds_when_channel_has_capacity() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let leader_addr = SocketAddr::from(([127, 0, 0, 1], 12345));
+        let payload = Bytes::from_static(b"frame");
+
+        assert!(try_send_dispatch_frame_with_retry(&sender, leader_addr, payload.clone()).is_ok());
+
+        let (received_addr, received_payload) = receiver.try_recv().unwrap();
+        assert_eq!(received_addr, leader_addr);
+        assert_eq!(received_payload, payload);
+    }
+
+    #[test]
+    fn test_try_send_dispatch_frame_with_retry_rejects_full_channel_after_retries() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"x")))
+            .unwrap();
+
+        let err = try_send_dispatch_frame_with_retry(
+            &sender,
+            SocketAddr::from(([127, 0, 0, 1], 12346)),
+            Bytes::from_static(b"y"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AsyncTrySendError::Full(_)));
+
+        // Ensure the initial payload remains queued after retry exhaustion.
+        let (addr, payload) = receiver.try_recv().unwrap();
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 12345)));
+        assert_eq!(payload, Bytes::from_static(b"x"));
+    }
+
+    #[test]
+    fn test_try_send_dispatch_frame_with_retry_rejects_closed_channel() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+
+        let err = try_send_dispatch_frame_with_retry(
+            &sender,
+            SocketAddr::from(([127, 0, 0, 1], 12345)),
+            Bytes::from_static(b"frame"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AsyncTrySendError::Closed(_)));
     }
 
     #[test]
