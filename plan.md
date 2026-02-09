@@ -250,6 +250,7 @@ Non-reusable for MCP wire correctness:
 - Attestation encoding:
   - `RelayAttestation.entries` MUST be sorted by `proposer_index` and deduplicated.
   - Empty `RelayAttestation.entries` is invalid and MUST be rejected.
+  - relay-signing domain is `version || slot || relay_index || entries_len || entries` and intentionally excludes `leader_index` (leader-agnostic within slot).
 
 ### 4.3 MCP QUIC transport
 
