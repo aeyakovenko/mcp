@@ -2,11 +2,11 @@ use {
     solana_ledger::{
         mcp,
         mcp_erasure::{encode_fec_set, McpErasureError, MCP_MAX_PAYLOAD_BYTES},
+        mcp_merkle,
         shred::mcp_shred::{McpShred, MCP_SHRED_WIRE_SIZE},
     },
     solana_clock::Slot,
     solana_keypair::Keypair,
-    solana_sha256_hasher::hashv,
     solana_signer::Signer,
     thiserror::Error,
 };
@@ -17,15 +17,14 @@ pub(crate) const MCP_WITNESS_LEN: usize = mcp::MCP_WITNESS_LEN;
 pub(crate) const MCP_MAX_PAYLOAD_SIZE: usize = MCP_MAX_PAYLOAD_BYTES;
 pub(crate) const MCP_SHRED_MESSAGE_SIZE: usize = MCP_SHRED_WIRE_SIZE;
 
-const LEAF_DOMAIN: [u8; 1] = [0x00];
-const NODE_DOMAIN: [u8; 1] = [0x01];
-
 #[derive(Debug, Error, Eq, PartialEq)]
 pub(crate) enum McpProposerError {
     #[error("shred list size mismatch: expected {expected}, got {actual}")]
     ShredCountMismatch { expected: usize, actual: usize },
     #[error("failed to encode MCP RS shreds: {0}")]
     Erasure(McpErasureError),
+    #[error("failed to derive MCP commitment/witnesses: {0}")]
+    Merkle(mcp_merkle::McpMerkleError),
 }
 
 pub(crate) fn encode_payload_to_mcp_shreds(
@@ -47,7 +46,13 @@ pub(crate) fn build_shred_messages(
         });
     }
 
-    let (commitment, witnesses) = derive_commitment_and_witnesses(slot, proposer_index, shreds);
+    let (commitment, witnesses) =
+        mcp_merkle::commitment_and_witnesses::<MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN>(
+            slot,
+            proposer_index,
+            shreds,
+        )
+        .map_err(McpProposerError::Merkle)?;
     let proposer_signature = proposer_keypair.sign_message(&commitment);
     let mut messages = Vec::with_capacity(MCP_NUM_RELAYS);
 
@@ -66,57 +71,6 @@ pub(crate) fn build_shred_messages(
     }
 
     Ok(messages)
-}
-
-fn derive_commitment_and_witnesses(
-    slot: Slot,
-    proposer_index: u32,
-    shreds: &[[u8; MCP_SHRED_DATA_BYTES]],
-) -> ([u8; 32], Vec<[[u8; 32]; MCP_WITNESS_LEN]>) {
-    let mut levels = vec![shreds
-        .iter()
-        .enumerate()
-        .map(|(index, shred_data)| {
-            hashv(&[
-                &LEAF_DOMAIN,
-                &slot.to_le_bytes(),
-                &proposer_index.to_le_bytes(),
-                &(index as u32).to_le_bytes(),
-                shred_data,
-            ])
-            .to_bytes()
-        })
-        .collect::<Vec<_>>()];
-
-    while levels.last().unwrap().len() > 1 {
-        let prev = levels.last().unwrap();
-        let next = prev
-            .chunks(2)
-            .map(|pair| {
-                let left = pair[0];
-                let right = if pair.len() == 2 { pair[1] } else { pair[0] };
-                hashv(&[&NODE_DOMAIN, &left, &right]).to_bytes()
-            })
-            .collect::<Vec<_>>();
-        levels.push(next);
-    }
-
-    let commitment = levels.last().unwrap()[0];
-    let mut witnesses = vec![[[0u8; 32]; MCP_WITNESS_LEN]; MCP_NUM_RELAYS];
-    for (shred_index, witness) in witnesses.iter_mut().enumerate() {
-        let mut index = shred_index;
-        for (depth, level) in levels[..MCP_WITNESS_LEN].iter().enumerate() {
-            let sibling = if index & 1 == 0 {
-                level.get(index + 1).copied().unwrap_or(level[index])
-            } else {
-                level[index - 1]
-            };
-            witness[depth] = sibling;
-            index >>= 1;
-        }
-    }
-
-    (commitment, witnesses)
 }
 
 #[cfg(test)]

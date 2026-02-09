@@ -1,7 +1,6 @@
 use {
-    crate::mcp,
+    crate::{mcp, mcp_merkle},
     reed_solomon_erasure::galois_8::ReedSolomon,
-    solana_sha256_hasher::hashv,
 };
 
 pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
@@ -22,6 +21,8 @@ pub enum McpErasureError {
     InsufficientShards { present: usize, required: usize },
     #[error("reed-solomon error: {0}")]
     ReedSolomon(String),
+    #[error("merkle error: {0}")]
+    Merkle(#[from] mcp_merkle::McpMerkleError),
 }
 
 pub fn encode_fec_set(payload: &[u8]) -> Result<Vec<[u8; MCP_SHRED_DATA_BYTES]>, McpErasureError> {
@@ -129,33 +130,8 @@ pub fn commitment_root(
     slot: u64,
     proposer_index: u32,
     shreds: &[[u8; MCP_SHRED_DATA_BYTES]],
-) -> [u8; 32] {
-    let mut level: Vec<[u8; 32]> = shreds
-        .iter()
-        .enumerate()
-        .map(|(shred_index, shred_data)| {
-            hashv(&[
-                &[0x00],
-                &slot.to_le_bytes(),
-                &proposer_index.to_le_bytes(),
-                &(shred_index as u32).to_le_bytes(),
-                shred_data,
-            ])
-            .to_bytes()
-        })
-        .collect();
-
-    while level.len() > 1 {
-        let mut next = Vec::with_capacity(level.len().div_ceil(2));
-        for pair in level.chunks(2) {
-            let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(left);
-            next.push(hashv(&[&[0x01], &left, &right]).to_bytes());
-        }
-        level = next;
-    }
-
-    level[0]
+) -> Result<[u8; 32], McpErasureError> {
+    mcp_merkle::commitment_root(slot, proposer_index, shreds).map_err(Into::into)
 }
 
 fn payload_to_data_shards(payload: &[u8]) -> Vec<[u8; MCP_SHRED_DATA_BYTES]> {
@@ -236,13 +212,13 @@ mod tests {
         let payload = vec![1u8; 1024];
         let shreds = encode_fec_set(&payload).unwrap();
 
-        let root_1 = commitment_root(99, 3, &shreds);
-        let root_2 = commitment_root(99, 3, &shreds);
+        let root_1 = commitment_root(99, 3, &shreds).unwrap();
+        let root_2 = commitment_root(99, 3, &shreds).unwrap();
         assert_eq!(root_1, root_2);
 
         let mut modified = shreds.clone();
         modified[0][0] ^= 1;
-        let root_3 = commitment_root(99, 3, &modified);
+        let root_3 = commitment_root(99, 3, &modified).unwrap();
         assert_ne!(root_1, root_3);
     }
 }
