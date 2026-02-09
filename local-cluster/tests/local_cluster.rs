@@ -7131,7 +7131,16 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         blockstore
             .get_mcp_execution_output(slot)
             .unwrap()
-            .is_some_and(|output| !output.is_empty())
+            .is_some_and(|output| {
+                let Some(count_bytes) = output.get(..std::mem::size_of::<u32>()) else {
+                    return false;
+                };
+                let Ok(count_bytes) = <[u8; 4]>::try_from(count_bytes) else {
+                    return false;
+                };
+                let tx_count = u32::from_le_bytes(count_bytes);
+                tx_count > 0
+            })
     }
 
     agave_logger::setup_with_default(RUST_LOG_FILTER);
@@ -7163,6 +7172,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
         stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
         skip_warmup_slots: true,
+        tpu_use_quic: false,
         additional_accounts: vec![(mcp_feature_id, mcp_feature_account)],
         ..ClusterConfig::default()
     };
@@ -7209,10 +7219,14 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     while Instant::now() < deadline {
         let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
         let min_slot = highest_slot.saturating_sub(64);
+        let candidate_slots: Vec<_> = (min_slot..=highest_slot)
+            .rev()
+            .filter(|slot| slot_has_non_empty_execution_output(&blockstore, *slot))
+            .take(8)
+            .collect();
 
-        for slot in (min_slot..=highest_slot).rev() {
-            if slot_has_non_empty_execution_output(&blockstore, slot)
-                && slot_has_relay_attestation(&blockstore, slot)
+        for slot in candidate_slots {
+            if slot_has_relay_attestation(&blockstore, slot)
                 && slot_has_shred_data(&blockstore, slot)
             {
                 observed_slot = Some(slot);

@@ -1086,8 +1086,8 @@ impl WindowService {
                         mcp_relay_attestation_receiver.as_ref(),
                         turbine_quic_endpoint_sender.as_ref(),
                     ) {
+                        let root_bank = bank_forks.read().unwrap().root_bank();
                         for attestation in receiver.try_iter() {
-                            let root_bank = bank_forks.read().unwrap().root_bank();
                             if let Err(err) = dispatch_relay_attestation_to_slot_leader(
                                 &attestation,
                                 &leader_schedule_cache,
