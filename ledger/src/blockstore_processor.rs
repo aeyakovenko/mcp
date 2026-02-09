@@ -227,10 +227,7 @@ pub fn execute_batch<'a>(
         }
     };
 
-    let mcp_two_pass_fees = block_verification
-        && bank
-            .feature_set
-            .is_active(&feature_set::mcp_protocol_v1::id());
+    let mcp_two_pass_fees = should_use_mcp_two_pass_fees(block_verification, bank);
     let (commit_results, balance_collector) = if mcp_two_pass_fees {
         let mut fee_error_counters = TransactionErrorMetrics::default();
         let fee_collection_results =
@@ -350,6 +347,10 @@ pub fn execute_batch<'a>(
     }
 
     Ok(())
+}
+
+fn should_use_mcp_two_pass_fees(block_verification: bool, bank: &Bank) -> bool {
+    block_verification && bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id())
 }
 
 // Get actual transaction execution costs from transaction commit results
@@ -2559,6 +2560,7 @@ pub mod tests {
                 create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
             },
         },
+        agave_feature_set as feature_set,
         assert_matches::assert_matches,
         rand::{thread_rng, Rng},
         solana_account::{AccountSharedData, WritableAccount},
@@ -5479,6 +5481,26 @@ pub mod tests {
         } else {
             assert_matches!(receiver.try_recv(), Err(_));
         }
+    }
+
+    #[test]
+    fn test_should_use_mcp_two_pass_fees_requires_block_verification_and_feature() {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo { genesis_config, .. } =
+            create_genesis_config_with_leader(60_000, &dummy_leader_pubkey, 100);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        let feature_id = feature_set::mcp_protocol_v1::id();
+
+        assert!(!should_use_mcp_two_pass_fees(false, &bank));
+        assert_eq!(
+            should_use_mcp_two_pass_fees(true, &bank),
+            bank.feature_set.is_active(&feature_id)
+        );
+
+        bank.deactivate_feature(&feature_id);
+        assert!(!should_use_mcp_two_pass_fees(true, &bank));
+        bank.activate_feature(&feature_id);
+        assert!(should_use_mcp_two_pass_fees(true, &bank));
     }
 
     #[test]

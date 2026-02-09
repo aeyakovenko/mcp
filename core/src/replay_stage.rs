@@ -3016,14 +3016,31 @@ impl ReplayStage {
 
         match decision {
             VoteGateDecision::Vote { included_proposers } => {
-                if let Ok(mut output) = mcp_vote_gate_included_proposers.try_write() {
-                    output.insert(slot, included_proposers);
+                match mcp_vote_gate_included_proposers.write() {
+                    Ok(mut output) => {
+                        output.insert(slot, included_proposers);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "MCP vote gate proposer-output lock poisoned for slot {}: {}; rejecting vote",
+                            slot, err
+                        );
+                        return false;
+                    }
                 }
                 true
             }
             VoteGateDecision::Reject(reason) => {
-                if let Ok(mut output) = mcp_vote_gate_included_proposers.try_write() {
-                    output.remove(&slot);
+                match mcp_vote_gate_included_proposers.write() {
+                    Ok(mut output) => {
+                        output.remove(&slot);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "MCP vote gate proposer-output lock poisoned while rejecting slot {}: {}",
+                            slot, err
+                        );
+                    }
                 }
                 info!("MCP vote gate rejected slot {}: {}", slot, reason);
                 false
