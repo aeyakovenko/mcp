@@ -3,8 +3,8 @@ use {
         blockstore::Blockstore,
         leader_schedule::{FixedSchedule, LeaderSchedule},
         leader_schedule_utils,
-        mcp,
     },
+    agave_feature_set as feature_set,
     itertools::Itertools,
     log::*,
     solana_clock::{Epoch, Slot},
@@ -19,8 +19,6 @@ use {
 
 type CachedSchedules = (HashMap<Epoch, Arc<LeaderSchedule>>, VecDeque<u64>);
 const MAX_SCHEDULES: usize = 10;
-const MCP_PROPOSERS_PER_SLOT: usize = mcp::NUM_PROPOSERS;
-const MCP_RELAYS_PER_SLOT: usize = mcp::NUM_RELAYS;
 
 #[derive(Copy, Clone)]
 enum McpScheduleKind {
@@ -74,6 +72,12 @@ impl LeaderScheduleCache {
             .get_leader_schedule_epoch(root_bank.slot());
         for epoch in 0..leader_schedule_epoch {
             cache.compute_epoch_schedule(epoch, root_bank);
+            if root_bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                cache.compute_epoch_mcp_schedules(epoch, root_bank);
+            }
         }
         cache
     }
@@ -103,6 +107,12 @@ impl LeaderScheduleCache {
         // Calculate the epoch as soon as it's rooted
         if new_max_epoch > old_max_epoch {
             self.compute_epoch_schedule(new_max_epoch, root_bank);
+            if root_bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                self.compute_epoch_mcp_schedules(new_max_epoch, root_bank);
+            }
         }
     }
 
@@ -122,13 +132,18 @@ impl LeaderScheduleCache {
             slot,
             bank,
             McpScheduleKind::Proposer,
-            MCP_PROPOSERS_PER_SLOT,
+            leader_schedule_utils::MCP_PROPOSERS_PER_SLOT,
         )
     }
 
     /// Returns the ordered relay list for `slot`.
     pub fn relays_at_slot(&self, slot: Slot, bank: Option<&Bank>) -> Option<Vec<Pubkey>> {
-        self.mcp_roles_at_slot(slot, bank, McpScheduleKind::Relay, MCP_RELAYS_PER_SLOT)
+        self.mcp_roles_at_slot(
+            slot,
+            bank,
+            McpScheduleKind::Relay,
+            leader_schedule_utils::MCP_RELAYS_PER_SLOT,
+        )
     }
 
     /// Returns all proposer indices owned by `pubkey` for `slot`.
@@ -256,6 +271,12 @@ impl LeaderScheduleCache {
     ) -> Option<Vec<Pubkey>> {
         let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
         let schedule = if let Some(bank) = bank {
+            if !bank
+                .feature_set
+                .is_active(&feature_set::mcp_protocol_v1::id())
+            {
+                return None;
+            }
             // Forbid asking for slots in an unconfirmed epoch.
             if epoch > *self.max_epoch.read().unwrap() {
                 debug!("Requested MCP schedule in slot: {slot} of unconfirmed epoch: {epoch}");
@@ -270,6 +291,8 @@ impl LeaderScheduleCache {
         if slot_leaders.is_empty() {
             return None;
         }
+        // Spec §5 defines proposers/relays as "next N entries ... with wrap-around".
+        // This intentionally permits duplicates when role count exceeds schedule length.
         let start = slot_index as usize % slot_leaders.len();
         Some(
             (0..count)
@@ -301,7 +324,10 @@ impl LeaderScheduleCache {
         kind: McpScheduleKind,
     ) -> Option<Arc<LeaderSchedule>> {
         self.get_epoch_mcp_schedule_no_compute(epoch, kind)
-            .or_else(|| self.compute_epoch_mcp_schedule(epoch, bank, kind))
+            .or_else(|| self.compute_epoch_mcp_schedules(epoch, bank).map(|(p, r)| match kind {
+                McpScheduleKind::Proposer => p,
+                McpScheduleKind::Relay => r,
+            }))
     }
 
     fn get_epoch_schedule_else_compute(
@@ -320,30 +346,41 @@ impl LeaderScheduleCache {
         }
     }
 
-    fn compute_epoch_mcp_schedule(
+    fn compute_epoch_mcp_schedules(
         &self,
         epoch: Epoch,
         bank: &Bank,
-        kind: McpScheduleKind,
-    ) -> Option<Arc<LeaderSchedule>> {
-        let schedule = match kind {
-            McpScheduleKind::Proposer => leader_schedule_utils::mcp_proposer_schedule(epoch, bank),
-            McpScheduleKind::Relay => leader_schedule_utils::mcp_relay_schedule(epoch, bank),
-        };
-        schedule.map(|schedule| {
-            let schedule = Arc::new(schedule);
-            let cache = match kind {
-                McpScheduleKind::Proposer => &self.cached_mcp_proposer_schedules,
-                McpScheduleKind::Relay => &self.cached_mcp_relay_schedules,
-            };
-            let (ref mut cached_schedules, ref mut order) = *cache.write().unwrap();
-            if let Entry::Vacant(v) = cached_schedules.entry(epoch) {
-                v.insert(schedule.clone());
-                order.push_back(epoch);
-                Self::retain_latest(cached_schedules, order, self.max_schedules());
-            }
-            schedule
-        })
+    ) -> Option<(Arc<LeaderSchedule>, Arc<LeaderSchedule>)> {
+        if !bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
+        {
+            return None;
+        }
+        let proposer = leader_schedule_utils::mcp_proposer_schedule(epoch, bank)?;
+        let relay = leader_schedule_utils::mcp_relay_schedule(epoch, bank)?;
+        let proposer = Arc::new(proposer);
+        let relay = Arc::new(relay);
+
+        // Insert both MCP schedules under write locks held at the same time so
+        // readers cannot observe a mixed epoch view.
+        let mut proposer_cache = self.cached_mcp_proposer_schedules.write().unwrap();
+        let mut relay_cache = self.cached_mcp_relay_schedules.write().unwrap();
+
+        if let Entry::Vacant(v) = proposer_cache.0.entry(epoch) {
+            v.insert(proposer.clone());
+            proposer_cache.1.push_back(epoch);
+            let (ref mut cached_schedules, ref mut order) = *proposer_cache;
+            Self::retain_latest(cached_schedules, order, self.max_schedules());
+        }
+        if let Entry::Vacant(v) = relay_cache.0.entry(epoch) {
+            v.insert(relay.clone());
+            relay_cache.1.push_back(epoch);
+            let (ref mut cached_schedules, ref mut order) = *relay_cache;
+            Self::retain_latest(cached_schedules, order, self.max_schedules());
+        }
+
+        Some((proposer, relay))
     }
 
     fn compute_epoch_schedule(&self, epoch: Epoch, bank: &Bank) -> Option<Arc<LeaderSchedule>> {
@@ -395,9 +432,9 @@ mod tests {
             EpochSchedule, DEFAULT_LEADER_SCHEDULE_SLOT_OFFSET, MINIMUM_SLOTS_PER_EPOCH,
         },
         solana_keypair::Keypair,
-        solana_runtime::bank::Bank,
+        solana_runtime::{bank::Bank, genesis_utils::deactivate_features},
         solana_signer::Signer,
-        std::{sync::Arc, thread::Builder},
+        std::{collections::HashSet, sync::Arc, thread::Builder},
     };
 
     #[test]
@@ -757,12 +794,27 @@ mod tests {
 
         let proposers = cache.proposers_at_slot(slot, Some(&bank)).unwrap();
         let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
-        assert_eq!(proposers.len(), MCP_PROPOSERS_PER_SLOT);
-        assert_eq!(relays.len(), MCP_RELAYS_PER_SLOT);
+        assert_eq!(proposers.len(), leader_schedule_utils::MCP_PROPOSERS_PER_SLOT);
+        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
 
         // No-compute path should hit caches populated by the first call.
         assert_eq!(cache.proposers_at_slot(slot, None).unwrap(), proposers);
         assert_eq!(cache.relays_at_slot(slot, None).unwrap(), relays);
+    }
+
+    #[test]
+    fn test_mcp_schedule_accessors_require_feature_activation() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        deactivate_features(&mut genesis_config, &vec![feature_set::mcp_protocol_v1::id()]);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+
+        assert!(cache.proposers_at_slot(bank.slot(), Some(&bank)).is_none());
+        assert!(cache.relays_at_slot(bank.slot(), Some(&bank)).is_none());
     }
 
     #[test]
@@ -780,12 +832,73 @@ mod tests {
 
         assert_eq!(
             proposer_indices,
-            (0..MCP_PROPOSERS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..leader_schedule_utils::MCP_PROPOSERS_PER_SLOT as u32).collect::<Vec<_>>()
         );
         assert_eq!(
             relay_indices,
-            (0..MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..leader_schedule_utils::MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_mcp_relay_schedule_wraps_for_short_epoch_schedules() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        genesis_config.epoch_schedule =
+            EpochSchedule::custom(MINIMUM_SLOTS_PER_EPOCH, MINIMUM_SLOTS_PER_EPOCH / 2, true);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+        let slot = bank.slot();
+        let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
+
+        assert!(genesis_config.epoch_schedule.slots_per_epoch < relays.len() as u64);
+        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
+
+        let unique_relays: HashSet<_> = relays.iter().collect();
+        assert!(unique_relays.len() <= genesis_config.epoch_schedule.slots_per_epoch as usize);
+    }
+
+    #[test]
+    fn test_mcp_schedule_epoch_boundary_requires_confirmed_epoch() {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        genesis_config.epoch_schedule = EpochSchedule::custom(32, 16, true);
+
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+        let slots_per_epoch = genesis_config.epoch_schedule.slots_per_epoch;
+        let epoch0_last_slot = slots_per_epoch - 1;
+        let epoch1_first_slot = slots_per_epoch;
+
+        assert!(cache
+            .proposers_at_slot(epoch0_last_slot, Some(&bank))
+            .is_some());
+        assert!(cache.relays_at_slot(epoch0_last_slot, Some(&bank)).is_some());
+
+        // Epoch 1 is unconfirmed until root advances through the end of epoch 0.
+        assert!(cache
+            .proposers_at_slot(epoch1_first_slot, Some(&bank))
+            .is_none());
+        assert!(cache.relays_at_slot(epoch1_first_slot, Some(&bank)).is_none());
+
+        let bank2 = Arc::new(Bank::new_from_parent(
+            bank,
+            &solana_pubkey::new_rand(),
+            epoch0_last_slot,
+        ));
+        cache.set_root(&bank2);
+
+        assert!(cache
+            .proposers_at_slot(epoch1_first_slot, Some(&bank2))
+            .is_some());
+        assert!(cache
+            .relays_at_slot(epoch1_first_slot, Some(&bank2))
+            .is_some());
     }
 
     #[test]
