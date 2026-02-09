@@ -3476,6 +3476,8 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<Result<FeeDetails>> {
+        const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+
         let sanitized_txs = batch.sanitized_transactions();
         let check_results =
             self.check_transactions(sanitized_txs, batch.lock_results(), max_age, error_counters);
@@ -3498,6 +3500,13 @@ impl Bank {
                 check_results,
                 &processing_environment,
             );
+        let require_static_nonce_account = self
+            .feature_set
+            .is_active(&feature_set::require_static_nonce_account::id());
+        let nonce_min_balance = self
+            .rent_collector
+            .rent
+            .minimum_balance(nonce::state::State::size());
 
         // Phase-A semantics: persist fee deductions for every transaction that
         // passes signature/basic checks, even if execution later fails.
@@ -3505,7 +3514,25 @@ impl Bank {
             let Ok(fee_details) = fee_result else {
                 continue;
             };
-            let fee = fee_details.total_fee();
+            let mut fee = match fee_details
+                .total_fee()
+                .checked_mul(MCP_NUM_PROPOSERS_FEE_MULTIPLIER)
+            {
+                Some(fee) => fee,
+                None => {
+                    *fee_result = Err(TransactionError::InsufficientFundsForFee);
+                    continue;
+                }
+            };
+            if tx.get_durable_nonce(require_static_nonce_account).is_some() {
+                fee = match fee.checked_add(nonce_min_balance) {
+                    Some(fee) => fee,
+                    None => {
+                        *fee_result = Err(TransactionError::InsufficientFundsForFee);
+                        continue;
+                    }
+                };
+            }
             if fee == 0 {
                 continue;
             }
