@@ -2,6 +2,7 @@
 
 use {
     crate::{
+        mcp_relay_submit::MCP_CONTROL_MSG_RELAY_ATTESTATION,
         repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
         validator::TurbineMode,
     },
@@ -41,6 +42,7 @@ use {
 // while being small enough to keep the overhead small on deduper, blockstore,
 // etc.
 const MAX_SHRED_DISTANCE_MINIMUM: u64 = 500;
+const MCP_CONTROL_MSG_CONSENSUS_BLOCK: u8 = 0x02;
 
 pub(crate) struct ShredFetchStage {
     thread_hdls: Vec<JoinHandle<()>>,
@@ -250,6 +252,7 @@ impl ShredFetchStage {
     pub(crate) fn new(
         sockets: Vec<Arc<UdpSocket>>,
         turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
+        mcp_control_message_sender: Option<Sender<(Pubkey, SocketAddr, Bytes)>>,
         repair_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_socket: Arc<UdpSocket>,
         sender: EvictingSender<PacketBatch>,
@@ -318,6 +321,7 @@ impl ShredFetchStage {
                             PacketFlags::REPAIR,
                             packet_sender,
                             exit,
+                            None,
                         )
                     })
                     .unwrap(),
@@ -351,6 +355,7 @@ impl ShredFetchStage {
                         PacketFlags::empty(),
                         packet_sender,
                         exit,
+                        mcp_control_message_sender,
                     )
                 })
                 .unwrap(),
@@ -411,6 +416,7 @@ pub(crate) fn receive_quic_datagrams(
     flags: PacketFlags,
     sender: Sender<PacketBatch>,
     exit: Arc<AtomicBool>,
+    mcp_control_message_sender: Option<Sender<(Pubkey, SocketAddr, Bytes)>>,
 ) {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
     const PACKET_COALESCE_DURATION: Duration = Duration::from_millis(1);
@@ -426,15 +432,30 @@ pub(crate) fn receive_quic_datagrams(
                 .while_some(),
         );
         let packet_batch: BytesPacketBatch = entries
-            .filter(|(_, _, bytes)| bytes.len() <= PACKET_DATA_SIZE)
-            .map(|(_pubkey, addr, bytes)| {
+            .filter_map(|(pubkey, addr, bytes)| {
+                if matches!(
+                    bytes.first().copied(),
+                    Some(MCP_CONTROL_MSG_RELAY_ATTESTATION | MCP_CONTROL_MSG_CONSENSUS_BLOCK)
+                ) {
+                    if let Some(sender) = mcp_control_message_sender.as_ref() {
+                        if sender.send((pubkey, addr, bytes)).is_err() {
+                            return None;
+                        }
+                    }
+                    return None;
+                }
+
+                if bytes.len() > PACKET_DATA_SIZE {
+                    return None;
+                }
+
                 let meta = Meta {
                     size: bytes.len(),
                     addr: addr.ip(),
                     port: addr.port(),
                     flags,
                 };
-                BytesPacket::new(bytes, meta)
+                Some(BytesPacket::new(bytes, meta))
             })
             .collect();
         if !packet_batch.is_empty() && sender.send(packet_batch.into()).is_err() {

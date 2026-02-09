@@ -30,6 +30,7 @@ pub mod gen_keys;
 pub mod mcp_proposer;
 pub mod mcp_relay;
 pub mod mcp_relay_submit;
+mod mcp_replay;
 pub mod mcp_vote_gate;
 pub mod next_leader;
 pub mod optimistic_confirmation_verifier;
