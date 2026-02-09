@@ -9072,6 +9072,7 @@ dependencies = [
  "agave-feature-set",
  "agave-logger",
  "agave-reserved-account-keys",
+ "agave-transaction-view",
  "anyhow",
  "assert_matches",
  "bincode",

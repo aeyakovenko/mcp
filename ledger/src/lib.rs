@@ -28,6 +28,7 @@ pub mod leader_schedule_utils;
 pub mod mcp;
 pub mod mcp_merkle;
 pub mod mcp_relay_attestation;
+pub mod mcp_reconstruction;
 pub mod next_slots_iterator;
 pub mod rooted_slot_iterator;
 conditional_mod::conditional_vis_mod!(shred, feature="agave-unstable-api", pub,pub(crate));
