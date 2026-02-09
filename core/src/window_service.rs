@@ -5,6 +5,7 @@
 use {
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
+        mcp_relay::{McpRelayOutcome, McpRelayProcessor, McpShredMessage},
         mcp_relay_submit::{dispatch_relay_attestation_to_slot_leader, RelayAttestationV1},
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
@@ -18,20 +19,25 @@ use {
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::{
-        blockstore::{Blockstore, BlockstoreInsertionMetrics, PossibleDuplicateShred},
+        blockstore::{
+            Blockstore, BlockstoreInsertionMetrics, McpPutStatus, PossibleDuplicateShred,
+        },
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{self, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
     solana_metrics::inc_new_counter_error,
+    solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
     solana_streamer::evicting_sender::EvictingSender,
+    solana_streamer::streamer::ChannelSend,
     solana_turbine::cluster_nodes,
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
+        collections::HashMap,
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -194,6 +200,8 @@ fn run_insert<F>(
     thread_pool: &ThreadPool,
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
+    _local_pubkey: &Pubkey,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
@@ -202,6 +210,7 @@ fn run_insert<F>(
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     reed_solomon_cache: &ReedSolomonCache,
     accept_repairs_only: bool,
+    mcp_relay_processor: &mut McpRelayProcessor,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -213,26 +222,121 @@ where
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
-    let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
+    let mut root_bank = bank_forks.read().unwrap().root_bank();
+    let mut last_bank_refresh = Instant::now();
+    let mut mcp_retransmit_batch = Vec::new();
+    let mut mcp_shred_count = 0usize;
+    let mut legacy_shreds = Vec::with_capacity(shreds.len());
+    let mut proposer_pubkeys_cache: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
+
+    for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
-            return None;
+            continue;
         }
         if repair {
             ws_metrics.num_repairs.fetch_add(1, Ordering::Relaxed);
         }
+
+        let Ok(mcp_shred) = McpShredMessage::from_bytes(&shred) else {
+            legacy_shreds.push((shred, repair, block_location));
+            continue;
+        };
+
+        if !cluster_nodes::check_feature_activation(
+            &feature_set::mcp_protocol_v1::id(),
+            mcp_shred.slot,
+            &root_bank,
+        ) {
+            legacy_shreds.push((shred, repair, block_location));
+            continue;
+        }
+
+        if last_bank_refresh.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
+            last_bank_refresh = Instant::now();
+            root_bank = bank_forks.read().unwrap().root_bank();
+            mcp_relay_processor.prune_below_slot(root_bank.slot());
+            proposer_pubkeys_cache.clear();
+        }
+
+        let proposer_pubkeys = proposer_pubkeys_cache
+            .entry(mcp_shred.slot)
+            .or_insert_with(|| {
+                leader_schedule_cache
+                    .proposers_at_slot(mcp_shred.slot, Some(&root_bank))
+                    .unwrap_or_default()
+            });
+        let Some(proposer_pubkey) = proposer_pubkeys
+            .get(mcp_shred.proposer_index as usize)
+            .copied()
+        else {
+            legacy_shreds.push((shred, repair, block_location));
+            continue;
+        };
+
+        match mcp_relay_processor.process_shred(&shred, &proposer_pubkey) {
+            McpRelayOutcome::StoredAndBroadcast {
+                slot,
+                proposer_index,
+                shred_index,
+                payload,
+            } => {
+                match blockstore.put_mcp_shred_data(slot, proposer_index, shred_index, &payload)? {
+                    McpPutStatus::Inserted => {
+                        mcp_shred_count += 1;
+                        mcp_retransmit_batch.push(payload.into());
+                    }
+                    McpPutStatus::Duplicate => {
+                        mcp_shred_count += 1;
+                    }
+                    McpPutStatus::Conflict(marker) => {
+                        mcp_shred_count += 1;
+                        warn!(
+                            "MCP shred conflict at ({slot}, {proposer_index}, {shred_index}); \
+                         existing={}, incoming={}",
+                            marker.existing_hash, marker.incoming_hash,
+                        );
+                    }
+                }
+            }
+            McpRelayOutcome::Duplicate => {
+                mcp_shred_count += 1;
+            }
+            McpRelayOutcome::Dropped(reason) => {
+                // Fall back to legacy handling for non-MCP bytes that happen to satisfy
+                // the fixed-size MCP envelope checks.
+                match reason {
+                    crate::mcp_relay::McpDropReason::ConflictingShred => {
+                        mcp_shred_count += 1;
+                    }
+                    _ => legacy_shreds.push((shred, repair, block_location)),
+                }
+            }
+        }
+    }
+
+    let handle_shred = |(shred, repair, block_location): (shred::Payload, bool, BlockLocation)| {
         let shred = Shred::new_from_serialized_shred(shred).ok()?;
         Some((Cow::Owned(shred), repair, block_location))
     };
     let now = Instant::now();
     let shreds: Vec<_> = thread_pool.install(|| {
-        shreds
+        legacy_shreds
             .into_par_iter()
             .with_min_len(32)
             .filter_map(handle_shred)
             .collect()
     });
     ws_metrics.handle_packets_elapsed_us += now.elapsed().as_micros() as u64;
-    ws_metrics.num_shreds_received += shreds.len();
+    ws_metrics.num_shreds_received += shreds.len() + mcp_shred_count;
+
+    if !mcp_retransmit_batch.is_empty() {
+        retransmit_sender.send(mcp_retransmit_batch)?;
+    }
+
+    if shreds.is_empty() {
+        return Ok(());
+    }
+
     let completed_data_sets = blockstore.insert_shreds_at_location_handle_duplicate(
         shreds,
         Some(leader_schedule_cache),
@@ -302,6 +406,7 @@ impl WindowService {
     ) -> WindowService {
         let cluster_info = repair_info.cluster_info.clone();
         let bank_forks = repair_info.bank_forks.clone();
+        let local_pubkey = cluster_info.id();
 
         // In wen_restart, we discard all shreds from Turbine and keep only those from repair to
         // avoid new shreds make validator OOM before wen_restart is over.
@@ -343,10 +448,11 @@ impl WindowService {
         let t_insert = Self::start_window_insert_thread(
             exit,
             blockstore,
+            bank_forks,
+            local_pubkey,
             leader_schedule_cache,
             verified_receiver,
             cluster_info,
-            bank_forks,
             duplicate_sender,
             completed_data_sets_sender,
             retransmit_sender,
@@ -398,10 +504,11 @@ impl WindowService {
     fn start_window_insert_thread(
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,
+        bank_forks: Arc<RwLock<BankForks>>,
+        local_pubkey: Pubkey,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         cluster_info: Arc<ClusterInfo>,
-        bank_forks: Arc<RwLock<BankForks>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
@@ -430,12 +537,15 @@ impl WindowService {
                 };
                 let mut metrics = BlockstoreInsertionMetrics::default();
                 let mut ws_metrics = WindowServiceMetrics::default();
+                let mut mcp_relay_processor = McpRelayProcessor::default();
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(e) = run_insert(
                         &thread_pool,
                         &verified_receiver,
                         &blockstore,
+                        &bank_forks,
+                        &local_pubkey,
                         &leader_schedule_cache,
                         handle_duplicate,
                         &mut metrics,
@@ -444,6 +554,7 @@ impl WindowService {
                         &retransmit_sender,
                         &reed_solomon_cache,
                         accept_repairs_only,
+                        &mut mcp_relay_processor,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {

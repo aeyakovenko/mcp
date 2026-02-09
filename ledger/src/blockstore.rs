@@ -7,7 +7,9 @@ use trees::{Tree, TreeWalk};
 use {
     crate::{
         ancestor_iterator::AncestorIterator,
-        blockstore::column::{columns as cf, Column, ColumnIndexDeprecation, TypedColumn},
+        blockstore::column::{
+            columns as cf, Column, ColumnIndexDeprecation, ColumnName, TypedColumn,
+        },
         blockstore_db::{IteratorDirection, IteratorMode, LedgerColumn, Rocks, WriteBatch},
         blockstore_meta::*,
         blockstore_metrics::BlockstoreRpcApiMetrics,
@@ -225,6 +227,19 @@ pub struct InsertResults {
     duplicate_shreds: Vec<PossibleDuplicateShred>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McpConflictMarker {
+    pub existing_hash: Hash,
+    pub incoming_hash: Hash,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum McpPutStatus {
+    Inserted,
+    Duplicate,
+    Conflict(McpConflictMarker),
+}
+
 /// A "complete data set" is a range of [`Shred`]s that combined in sequence carry a single
 /// serialized [`Vec<Entry>`].
 ///
@@ -278,12 +293,15 @@ pub struct Blockstore {
     alt_index_cf: LedgerColumn<cf::AlternateIndex>,
     alt_data_shred_cf: LedgerColumn<cf::AlternateShredData>,
     alt_merkle_root_meta_cf: LedgerColumn<cf::AlternateMerkleRootMeta>,
+    mcp_shred_data_cf: LedgerColumn<cf::McpShredData>,
+    mcp_relay_attestation_cf: LedgerColumn<cf::McpRelayAttestation>,
     parent_meta_cf: LedgerColumn<cf::ParentMeta>,
     double_merkle_meta_cf: LedgerColumn<cf::DoubleMerkleMeta>,
 
     highest_primary_index_slot: RwLock<Option<Slot>>,
     max_root: AtomicU64,
     insert_shreds_lock: Mutex<()>,
+    insert_mcp_lock: Mutex<()>,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
     pub lowest_cleanup_slot: RwLock<Slot>,
@@ -461,6 +479,8 @@ impl Blockstore {
         let alt_index_cf = db.column();
         let alt_data_shred_cf = db.column();
         let alt_merkle_root_meta_cf = db.column();
+        let mcp_shred_data_cf = db.column();
+        let mcp_relay_attestation_cf = db.column();
         let parent_meta_cf = db.column();
         let double_merkle_meta_cf = db.column();
 
@@ -502,6 +522,8 @@ impl Blockstore {
             alt_index_cf,
             alt_data_shred_cf,
             alt_merkle_root_meta_cf,
+            mcp_shred_data_cf,
+            mcp_relay_attestation_cf,
             parent_meta_cf,
             double_merkle_meta_cf,
 
@@ -509,6 +531,7 @@ impl Blockstore {
             new_shreds_signals: Mutex::default(),
             completed_slots_senders: Mutex::default(),
             insert_shreds_lock: Mutex::<()>::default(),
+            insert_mcp_lock: Mutex::<()>::default(),
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
             slots_stats: SlotsStats::default(),
@@ -1229,6 +1252,8 @@ impl Blockstore {
         self.alt_index_cf.submit_rocksdb_cf_metrics();
         self.alt_data_shred_cf.submit_rocksdb_cf_metrics();
         self.alt_merkle_root_meta_cf.submit_rocksdb_cf_metrics();
+        self.mcp_shred_data_cf.submit_rocksdb_cf_metrics();
+        self.mcp_relay_attestation_cf.submit_rocksdb_cf_metrics();
     }
 
     /// Report the accumulated RPC API metrics
@@ -1652,7 +1677,7 @@ impl Blockstore {
 
         // Acquire the insertion lock
         let mut start = Measure::start("Blockstore lock");
-        let _lock = self.insert_shreds_lock.lock().unwrap();
+        let _lock = self.insert_mcp_lock.lock().unwrap();
         start.stop();
         metrics.insert_lock_elapsed_us += start.as_us();
 
@@ -3129,6 +3154,75 @@ impl Blockstore {
                 shred,
             ),
         }
+    }
+
+    fn put_mcp_bytes_if_absent<C>(
+        &self,
+        column: &LedgerColumn<C>,
+        index: C::Index,
+        value: &[u8],
+    ) -> Result<McpPutStatus>
+    where
+        C: Column + ColumnName,
+        C::Index: Clone,
+    {
+        let _lock = self.insert_mcp_lock.lock().unwrap();
+        if let Some(existing) = column.get_bytes(index.clone())? {
+            if existing.as_slice() == value {
+                return Ok(McpPutStatus::Duplicate);
+            }
+            return Ok(McpPutStatus::Conflict(McpConflictMarker {
+                existing_hash: hashv(&[existing.as_slice()]),
+                incoming_hash: hashv(&[value]),
+            }));
+        }
+        column.put_bytes(index, value)?;
+        Ok(McpPutStatus::Inserted)
+    }
+
+    pub fn get_mcp_shred_data(
+        &self,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.mcp_shred_data_cf
+            .get_bytes((slot, proposer_index, shred_index))
+    }
+
+    pub fn put_mcp_shred_data(
+        &self,
+        slot: Slot,
+        proposer_index: u32,
+        shred_index: u32,
+        shred: &[u8],
+    ) -> Result<McpPutStatus> {
+        self.put_mcp_bytes_if_absent(
+            &self.mcp_shred_data_cf,
+            (slot, proposer_index, shred_index),
+            shred,
+        )
+    }
+
+    pub fn get_mcp_relay_attestation(
+        &self,
+        slot: Slot,
+        relay_index: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.mcp_relay_attestation_cf.get_bytes((slot, relay_index))
+    }
+
+    pub fn put_mcp_relay_attestation(
+        &self,
+        slot: Slot,
+        relay_index: u32,
+        relay_attestation: &[u8],
+    ) -> Result<McpPutStatus> {
+        self.put_mcp_bytes_if_absent(
+            &self.mcp_relay_attestation_cf,
+            (slot, relay_index),
+            relay_attestation,
+        )
     }
 
     /// Checks all available block versions, if we have a *complete* block for
@@ -6297,6 +6391,20 @@ pub fn test_all_empty_or_min(blockstore: &Blockstore, min_slot: Slot) {
             .unwrap()
             .next()
             .map(|((slot, _, _), _)| slot >= min_slot)
+            .unwrap_or(true)
+        & blockstore
+            .mcp_shred_data_cf
+            .iter(IteratorMode::Start)
+            .unwrap()
+            .next()
+            .map(|((slot, _, _), _)| slot >= min_slot)
+            .unwrap_or(true)
+        & blockstore
+            .mcp_relay_attestation_cf
+            .iter(IteratorMode::Start)
+            .unwrap()
+            .next()
+            .map(|((slot, _), _)| slot >= min_slot)
             .unwrap_or(true);
 
     assert!(condition_met);
@@ -6461,6 +6569,107 @@ pub mod tests {
         let deserialized_shred = Shred::new_from_serialized_shred(serialized_shred).unwrap();
 
         assert_eq!(last_shred, deserialized_shred);
+    }
+
+    #[test]
+    fn test_mcp_shred_data_put_get_and_conflict() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let slot = 11;
+        let proposer_index = 3;
+        let shred_index = 77;
+        let payload = vec![1u8, 2, 3, 4];
+
+        assert_eq!(
+            blockstore
+                .put_mcp_shred_data(slot, proposer_index, shred_index, &payload)
+                .unwrap(),
+            McpPutStatus::Inserted
+        );
+        assert_eq!(
+            blockstore
+                .get_mcp_shred_data(slot, proposer_index, shred_index)
+                .unwrap(),
+            Some(payload.clone())
+        );
+        assert_eq!(
+            blockstore
+                .put_mcp_shred_data(slot, proposer_index, shred_index, &payload)
+                .unwrap(),
+            McpPutStatus::Duplicate
+        );
+
+        let conflicting_payload = vec![9u8, 9, 9, 9];
+        let status = blockstore
+            .put_mcp_shred_data(slot, proposer_index, shred_index, &conflicting_payload)
+            .unwrap();
+        match status {
+            McpPutStatus::Conflict(marker) => {
+                assert_eq!(marker.existing_hash, hashv(&[payload.as_slice()]));
+                assert_eq!(
+                    marker.incoming_hash,
+                    hashv(&[conflicting_payload.as_slice()])
+                );
+            }
+            _ => panic!("expected conflict status"),
+        }
+        assert_eq!(
+            blockstore
+                .get_mcp_shred_data(slot, proposer_index, shred_index)
+                .unwrap(),
+            Some(payload)
+        );
+    }
+
+    #[test]
+    fn test_mcp_relay_attestation_put_get_and_conflict() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let slot = 11;
+        let relay_index = 8;
+        let attestation = vec![10u8, 20, 30];
+
+        assert_eq!(
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation)
+                .unwrap(),
+            McpPutStatus::Inserted
+        );
+        assert_eq!(
+            blockstore
+                .get_mcp_relay_attestation(slot, relay_index)
+                .unwrap(),
+            Some(attestation.clone())
+        );
+        assert_eq!(
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation)
+                .unwrap(),
+            McpPutStatus::Duplicate
+        );
+
+        let conflicting_attestation = vec![1u8, 2, 3];
+        let status = blockstore
+            .put_mcp_relay_attestation(slot, relay_index, &conflicting_attestation)
+            .unwrap();
+        match status {
+            McpPutStatus::Conflict(marker) => {
+                assert_eq!(marker.existing_hash, hashv(&[attestation.as_slice()]));
+                assert_eq!(
+                    marker.incoming_hash,
+                    hashv(&[conflicting_attestation.as_slice()])
+                );
+            }
+            _ => panic!("expected conflict status"),
+        }
+        assert_eq!(
+            blockstore
+                .get_mcp_relay_attestation(slot, relay_index)
+                .unwrap(),
+            Some(attestation)
+        );
     }
 
     #[test]
