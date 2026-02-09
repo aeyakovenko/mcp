@@ -1,16 +1,20 @@
-use crate::mcp_transaction::{McpTransaction, McpTransactionParseError};
+use crate::{
+    mcp_transaction::{McpTransaction, McpTransactionParseError},
+    transaction_view::SanitizedTransactionView,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpPayloadTransactionFormat {
     Latest,
     Legacy,
+    StandardSolana,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpPayloadTransaction {
     pub format: McpPayloadTransactionFormat,
     pub wire_bytes: Vec<u8>,
-    pub transaction: McpTransaction,
+    pub mcp_transaction: Option<McpTransaction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,22 +47,27 @@ impl McpPayload {
                 .map_err(|_| McpPayloadParseError::LengthOverflow(tx_len_u32))?;
             let tx_bytes = take_bytes(bytes, &mut offset, tx_len)?;
 
-            let transaction = McpTransaction::from_bytes_compat(tx_bytes).map_err(|error| {
-                McpPayloadParseError::TransactionParse {
-                    tx_index,
-                    error,
+            let (format, mcp_transaction) = match McpTransaction::from_bytes_compat(tx_bytes) {
+                Ok(transaction) => {
+                    let format = if transaction.to_bytes() == tx_bytes {
+                        McpPayloadTransactionFormat::Latest
+                    } else {
+                        McpPayloadTransactionFormat::Legacy
+                    };
+                    (format, Some(transaction))
                 }
-            })?;
-            let format = if transaction.to_bytes() == tx_bytes {
-                McpPayloadTransactionFormat::Latest
-            } else {
-                McpPayloadTransactionFormat::Legacy
+                Err(error) => {
+                    SanitizedTransactionView::try_new_sanitized(tx_bytes).map_err(|_| {
+                        McpPayloadParseError::TransactionParse { tx_index, error }
+                    })?;
+                    (McpPayloadTransactionFormat::StandardSolana, None)
+                }
             };
 
             transactions.push(McpPayloadTransaction {
                 format,
                 wire_bytes: tx_bytes.to_vec(),
-                transaction,
+                mcp_transaction,
             });
         }
 
@@ -99,6 +108,11 @@ mod tests {
         crate::mcp_transaction::{
             InstructionHeader, InstructionPayload, LegacyHeader, MCP_TX_LATEST_VERSION,
         },
+        solana_hash::Hash,
+        solana_keypair::Keypair,
+        solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
+        solana_transaction::Transaction,
         solana_pubkey::Pubkey,
         solana_signature::Signature,
     };
@@ -150,8 +164,32 @@ mod tests {
         assert_eq!(parsed.transactions.len(), 2);
         assert_eq!(parsed.transactions[0].format, McpPayloadTransactionFormat::Latest);
         assert_eq!(parsed.transactions[0].wire_bytes, latest);
+        assert_eq!(parsed.transactions[0].mcp_transaction, Some(tx.clone()));
         assert_eq!(parsed.transactions[1].format, McpPayloadTransactionFormat::Legacy);
         assert_eq!(parsed.transactions[1].wire_bytes, legacy);
+        assert_eq!(parsed.transactions[1].mcp_transaction, Some(tx));
+    }
+
+    #[test]
+    fn test_from_bytes_accepts_standard_solana_wire_entries() {
+        let keypair = Keypair::new();
+        let to = Pubkey::new_unique();
+        let mut solana_tx = Transaction::new_with_payer(
+            &[system_instruction::transfer(&keypair.pubkey(), &to, 1)],
+            Some(&keypair.pubkey()),
+        );
+        solana_tx.sign(&[&keypair], Hash::new_unique());
+        let wire = bincode::serialize(&solana_tx).unwrap();
+        let payload = encode_payload(&[wire.clone()], &[]);
+
+        let parsed = McpPayload::from_bytes(&payload).unwrap();
+        assert_eq!(parsed.transactions.len(), 1);
+        assert_eq!(
+            parsed.transactions[0].format,
+            McpPayloadTransactionFormat::StandardSolana
+        );
+        assert_eq!(parsed.transactions[0].wire_bytes, wire);
+        assert_eq!(parsed.transactions[0].mcp_transaction, None);
     }
 
     #[test]
