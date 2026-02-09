@@ -15,9 +15,9 @@ use {
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
         shred::{
-            mcp_shred::{is_mcp_shred_bytes, McpShred},
             self,
             layout::{get_shred, resign_packet},
+            mcp_shred::is_mcp_shred_bytes,
             wire::is_retransmitter_signed_variant,
         },
         sigverify_shreds::{verify_shreds_gpu, LruCache, SlotPubkeys},
@@ -179,8 +179,11 @@ fn run_shred_sigverify<const K: usize>(
         let bank_forks = bank_forks.read().unwrap();
         (bank_forks.working_bank(), bank_forks.root_bank())
     };
-    let mcp_packets =
-        partition_mcp_packets(shred_buffer, &root_bank, &feature_set::mcp_protocol_v1::id());
+    let mcp_packets = partition_mcp_packets(
+        shred_buffer,
+        &root_bank,
+        &feature_set::mcp_protocol_v1::id(),
+    );
     // Repair shreds include a randomly generated u32 nonce, so it does not
     // make sense to deduplicate the entire packet payload (i.e. they are not
     // duplicate of any other packet.data(..)).
@@ -303,10 +306,10 @@ fn partition_mcp_packets(
                 if !is_mcp_shred_bytes(data) {
                     continue;
                 }
-                let Ok(mcp_shred) = McpShred::from_bytes(data) else {
-                    continue;
-                };
-                Some((mcp_shred.slot, data.to_vec()))
+                Some((
+                    Slot::from_le_bytes(data[..std::mem::size_of::<Slot>()].try_into().unwrap()),
+                    data.to_vec(),
+                ))
             }) else {
                 continue;
             };
@@ -647,9 +650,12 @@ mod tests {
         solana_keypair::Keypair,
         solana_ledger::{
             genesis_utils::create_genesis_config_with_leader,
-            shred::{Nonce, ProcessShredsStats, ReedSolomonCache, Shredder},
+            shred::{
+                mcp_shred::{MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN},
+                Nonce, ProcessShredsStats, ReedSolomonCache, Shredder,
+            },
         },
-        solana_perf::packet::{Packet, PacketFlags, PinnedPacketBatch},
+        solana_perf::packet::{Packet, PacketBatch, PacketFlags, PinnedPacketBatch},
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
@@ -721,6 +727,55 @@ mod tests {
         );
         assert!(!batches[0].get(0).unwrap().meta().discard());
         assert!(batches[0].get(1).unwrap().meta().discard());
+    }
+
+    #[test]
+    fn test_partition_mcp_packets_uses_layout_prefilter_and_feature_gate() {
+        let slot = 500_000u64;
+        let witness_len_offset = std::mem::size_of::<Slot>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<u32>()
+            + 32
+            + MCP_SHRED_DATA_BYTES;
+        let mut mcp_bytes = vec![0u8; MCP_SHRED_WIRE_SIZE];
+        mcp_bytes[..std::mem::size_of::<Slot>()].copy_from_slice(&slot.to_le_bytes());
+        mcp_bytes[witness_len_offset] = MCP_WITNESS_LEN as u8;
+
+        let mut packet = Packet::default();
+        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet.meta_mut().size = mcp_bytes.len();
+        packet.meta_mut().set_discard(false);
+        assert!(is_mcp_shred_bytes(packet.data(..).unwrap()));
+
+        let mut batch = PinnedPacketBatch::with_capacity(1);
+        batch.push(packet);
+
+        let mut active_bank = Bank::new_for_tests(
+            &create_genesis_config_with_leader(100, &Pubkey::new_unique(), 10).genesis_config,
+        );
+        active_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        assert!(cluster_nodes::check_feature_activation(
+            &feature_set::mcp_protocol_v1::id(),
+            slot,
+            &active_bank,
+        ));
+        let mut disabled_feature_batches = vec![PacketBatch::from(batch.clone())];
+        assert!(partition_mcp_packets(
+            &mut disabled_feature_batches,
+            &active_bank,
+            &Pubkey::new_unique(),
+        )
+        .is_empty());
+        assert!(!disabled_feature_batches[0].get(0).unwrap().meta().discard());
+
+        let mut active_batches = vec![PacketBatch::from(batch)];
+        let mcp_packets = partition_mcp_packets(
+            &mut active_batches,
+            &active_bank,
+            &feature_set::mcp_protocol_v1::id(),
+        );
+        assert_eq!(mcp_packets.len(), 1);
+        assert!(active_batches[0].get(0).unwrap().meta().discard());
     }
 
     #[test_matrix(
