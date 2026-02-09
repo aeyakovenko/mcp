@@ -76,6 +76,16 @@ pub struct RecordSummary {
     pub remaining_hashes_in_slot: u64,
 }
 
+pub struct BanklessRecordEntry {
+    pub entry: Entry,
+    pub tick_height: u64,
+}
+
+pub struct BanklessRecordSummary {
+    pub remaining_hashes_in_slot: u64,
+    pub recorded_entries: Vec<BanklessRecordEntry>,
+}
+
 pub struct Record {
     pub mixins: Vec<Hash>,
     pub transaction_batches: Vec<Vec<VersionedTransaction>>,
@@ -398,6 +408,71 @@ impl PohRecorder {
 
             // record() might fail if the next PoH hash needs to be a tick.  But that's ok, tick()
             // and re-record()
+            self.metrics.ticks_from_record += 1;
+            self.tick();
+        }
+    }
+
+    /// Bankless recording path for MCP: generates PoH-mixed entries without
+    /// requiring a working bank in PohRecorder.
+    pub fn record_bankless(
+        &mut self,
+        slot: Slot,
+        mixins: Vec<Hash>,
+        transaction_batches: Vec<Vec<VersionedTransaction>>,
+    ) -> Result<BanklessRecordSummary> {
+        assert!(
+            mixins.len() == transaction_batches.len(),
+            "mismatched mixin and transaction batch lengths"
+        );
+        assert!(
+            !transaction_batches.iter().any(|batch| batch.is_empty()),
+            "No transactions provided"
+        );
+
+        let ((), report_metrics_us) = measure_us!(self.metrics.report(slot));
+        self.metrics.report_metrics_us += report_metrics_us;
+
+        loop {
+            if self.has_bank() {
+                let (flush_cache_res, flush_cache_us) = measure_us!(self.flush_cache(false, None));
+                self.metrics.flush_cache_no_tick_us += flush_cache_us;
+                flush_cache_res?;
+            }
+
+            let tick_height = self.tick_height(); // cannot change until next loop iteration.
+            let (mut poh_lock, poh_lock_us) = measure_us!(self.poh.lock().unwrap());
+            self.metrics.record_lock_contention_us += poh_lock_us;
+
+            let (mixed_in, record_mixin_us) =
+                measure_us!(poh_lock.record_batches(&mixins, &mut self.entries));
+            self.metrics.record_us += record_mixin_us;
+            let remaining_hashes_in_slot = poh_lock.remaining_hashes_in_slot(self.ticks_per_slot);
+
+            drop(poh_lock);
+
+            if mixed_in {
+                debug_assert_eq!(self.entries.len(), mixins.len());
+                let recorded_entries = self
+                    .entries
+                    .drain(..)
+                    .zip(transaction_batches)
+                    .map(|(entry, transactions)| BanklessRecordEntry {
+                        entry: Entry {
+                            num_hashes: entry.num_hashes,
+                            hash: entry.hash,
+                            transactions,
+                        },
+                        tick_height,
+                    })
+                    .collect();
+
+                return Ok(BanklessRecordSummary {
+                    remaining_hashes_in_slot,
+                    recorded_entries,
+                });
+            }
+
             self.metrics.ticks_from_record += 1;
             self.tick();
         }
@@ -1264,6 +1339,37 @@ mod tests {
         assert_eq!(poh_recorder.tick_cache.len(), 1);
         assert_eq!(poh_recorder.tick_cache[0].1, 1);
         assert_eq!(poh_recorder.tick_height(), 1);
+    }
+
+    #[test]
+    fn test_record_bankless_without_working_bank() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert!(!poh_recorder.has_bank());
+        let summary = poh_recorder
+            .record_bankless(
+                bank.slot(),
+                vec![hash(&[1u8])],
+                vec![vec![test_tx().into()]],
+            )
+            .unwrap();
+        assert_eq!(summary.recorded_entries.len(), 1);
+        assert_eq!(summary.recorded_entries[0].entry.transactions.len(), 1);
     }
 
     #[test]

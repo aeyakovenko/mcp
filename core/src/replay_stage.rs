@@ -2420,6 +2420,7 @@ impl ReplayStage {
         bank_forks: &RwLock<BankForks>,
         maybe_my_leader_slot: Slot,
         has_new_vote_been_rooted: bool,
+        allow_bankless_start: bool,
     ) -> bool {
         if bank_forks
             .read()
@@ -2440,7 +2441,7 @@ impl ReplayStage {
         if let Some(next_leader) =
             leader_schedule_cache.slot_leader_at(maybe_my_leader_slot, Some(parent_bank))
         {
-            if !has_new_vote_been_rooted {
+            if !has_new_vote_been_rooted && !allow_bankless_start {
                 info!("Haven't landed a vote, so skipping my leader slot");
                 return false;
             }
@@ -2603,6 +2604,7 @@ impl ReplayStage {
             bank_forks,
             maybe_my_leader_slot,
             has_new_vote_been_rooted,
+            migration_status.is_alpenglow_enabled(),
         ) {
             return None;
         }
