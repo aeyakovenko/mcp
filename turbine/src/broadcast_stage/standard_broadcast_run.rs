@@ -575,7 +575,7 @@ impl StandardBroadcastRun {
         &mut self,
         sock: BroadcastSocket,
         cluster_info: &ClusterInfo,
-        shreds: Arc<Vec<Shred>>,
+        shreds: &Arc<Vec<Shred>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
         bank_forks: &RwLock<BankForks>,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
@@ -915,7 +915,7 @@ impl BroadcastRun for StandardBroadcastRun {
         self.broadcast(
             sock,
             cluster_info,
-            shreds.clone(),
+            &shreds,
             batch_info.clone(),
             bank_forks,
             quic_endpoint_sender,
