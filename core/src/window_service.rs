@@ -6,7 +6,9 @@ use {
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
         mcp_relay::{McpRelayOutcome, McpRelayProcessor, McpShredMessage},
-        mcp_relay_submit::{dispatch_relay_attestation_to_slot_leader, RelayAttestationV1},
+        mcp_relay_submit::{
+            dispatch_relay_attestation_to_slot_leader, RelayAttestationEntry, RelayAttestationV1,
+        },
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
@@ -18,6 +20,7 @@ use {
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::cluster_info::ClusterInfo,
+    solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{
             Blockstore, BlockstoreInsertionMetrics, McpPutStatus, PossibleDuplicateShred,
@@ -31,13 +34,15 @@ use {
     solana_pubkey::Pubkey,
     solana_rayon_threadlimit::get_thread_count,
     solana_runtime::bank_forks::BankForks,
+    solana_signature::Signature,
+    solana_signer::Signer,
     solana_streamer::evicting_sender::EvictingSender,
     solana_streamer::streamer::ChannelSend,
     solana_turbine::cluster_nodes,
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
-        collections::HashMap,
+        collections::{BTreeMap, HashMap},
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -210,7 +215,9 @@ fn run_insert<F>(
     retransmit_sender: &EvictingSender<Vec<shred::Payload>>,
     reed_solomon_cache: &ReedSolomonCache,
     accept_repairs_only: bool,
+    relay_signer: &Keypair,
     mcp_relay_processor: &mut McpRelayProcessor,
+    mcp_relay_attestation_sender: Option<&Sender<RelayAttestationV1>>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -228,6 +235,8 @@ where
     let mut mcp_shred_count = 0usize;
     let mut legacy_shreds = Vec::with_capacity(shreds.len());
     let mut proposer_pubkeys_cache: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
+    let mut attestation_entries_by_slot: HashMap<Slot, BTreeMap<u32, RelayAttestationEntry>> =
+        HashMap::new();
 
     for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
@@ -272,6 +281,12 @@ where
             legacy_shreds.push((shred, repair, block_location));
             continue;
         };
+        let proposer_index = mcp_shred.proposer_index;
+        let attestation_entry = RelayAttestationEntry {
+            proposer_index,
+            commitment: mcp_shred.commitment,
+            proposer_signature: mcp_shred.proposer_signature,
+        };
 
         match mcp_relay_processor.process_shred(&shred, &proposer_pubkey) {
             McpRelayOutcome::StoredAndBroadcast {
@@ -297,6 +312,11 @@ where
                         );
                     }
                 }
+                attestation_entries_by_slot
+                    .entry(slot)
+                    .or_default()
+                    .entry(proposer_index)
+                    .or_insert(attestation_entry);
             }
             McpRelayOutcome::Duplicate => {
                 mcp_shred_count += 1;
@@ -310,6 +330,36 @@ where
                     }
                     _ => legacy_shreds.push((shred, repair, block_location)),
                 }
+            }
+        }
+    }
+
+    if let Some(attestation_sender) = mcp_relay_attestation_sender {
+        for (slot, entries_by_proposer) in attestation_entries_by_slot {
+            let relay_index = leader_schedule_cache
+                .relays_at_slot(slot, Some(&root_bank))
+                .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
+                .and_then(|relays| relays.iter().position(|pubkey| pubkey == _local_pubkey))
+                .and_then(|index| u32::try_from(index).ok());
+            let Some(relay_index) = relay_index else {
+                continue;
+            };
+
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries: entries_by_proposer.into_values().collect(),
+                relay_signature: Signature::default(),
+            };
+            let Ok(signing_bytes) = attestation.signing_bytes() else {
+                continue;
+            };
+            attestation.relay_signature = relay_signer.sign_message(&signing_bytes);
+            if let Err(err) = attestation_sender.send(attestation) {
+                debug!(
+                    "failed to enqueue MCP relay attestation for slot {}: {}",
+                    slot, err
+                );
             }
         }
     }
@@ -360,6 +410,7 @@ pub struct WindowServiceChannels {
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
+    pub mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
     pub mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
     pub turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
 }
@@ -371,6 +422,7 @@ impl WindowServiceChannels {
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
+        mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
         mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
         turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> Self {
@@ -380,6 +432,7 @@ impl WindowServiceChannels {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
             turbine_quic_endpoint_sender,
         }
@@ -418,6 +471,7 @@ impl WindowService {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
             turbine_quic_endpoint_sender,
         } = window_service_channels;
@@ -457,6 +511,7 @@ impl WindowService {
             completed_data_sets_sender,
             retransmit_sender,
             accept_repairs_only,
+            mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
             turbine_quic_endpoint_sender,
         );
@@ -513,6 +568,7 @@ impl WindowService {
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         accept_repairs_only: bool,
+        mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
         mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
         turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> JoinHandle<()> {
@@ -540,6 +596,7 @@ impl WindowService {
                 let mut mcp_relay_processor = McpRelayProcessor::default();
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
+                    let relay_signer = cluster_info.keypair();
                     if let Err(e) = run_insert(
                         &thread_pool,
                         &verified_receiver,
@@ -554,7 +611,9 @@ impl WindowService {
                         &retransmit_sender,
                         &reed_solomon_cache,
                         accept_repairs_only,
+                        relay_signer.as_ref(),
                         &mut mcp_relay_processor,
+                        mcp_relay_attestation_sender.as_ref(),
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
