@@ -18,6 +18,7 @@ use {
         TOTAL_BUFFERED_PACKETS,
     },
     agave_feature_set as feature_set,
+    log::warn,
     solana_clock::MAX_PROCESSING_AGE,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -199,7 +200,18 @@ where
         mcp_fee_payer_tracker: &Mutex<McpFeePayerTracker>,
     ) {
         let mcp_enabled = bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id());
-        let mut mcp_fee_payer_tracker = mcp_fee_payer_tracker.lock().unwrap();
+        let mut mcp_fee_payer_tracker = match mcp_fee_payer_tracker.lock() {
+            Ok(guard) => guard,
+            Err(err) => {
+                warn!(
+                    "MCP fee tracker lock poisoned in scheduler pre-filter for slot {}: {}",
+                    bank.slot(),
+                    err
+                );
+                results.fill(false);
+                return;
+            }
+        };
         let lock_results = vec![Ok(()); transactions.len()];
         let mut error_counters = TransactionErrorMetrics::default();
         let check_results = bank.check_transactions::<R::Transaction>(

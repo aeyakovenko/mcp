@@ -518,8 +518,11 @@ impl Consumer {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(bank.feature_set.as_ref()),
         );
-        let mut fee_payer_account = bank
-            .get_account(fee_payer)
+        let (mut fee_payer_account, _slot) = bank
+            .rc
+            .accounts
+            .accounts_db
+            .load_with_fixed_root(&bank.ancestors, fee_payer)
             .ok_or(TransactionError::AccountNotFound)?;
 
         validate_fee_payer(
