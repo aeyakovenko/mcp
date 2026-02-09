@@ -64,5 +64,11 @@ pub enum BlockstoreError {
     UnexpectedBlockComponent,
     #[error("Block component mismatch slot {0}")]
     BlockComponentMismatch(Slot),
+    #[error("invalid MCP {kind} length: {actual} > {max}")]
+    InvalidMcpLength {
+        kind: &'static str,
+        actual: usize,
+        max: usize,
+    },
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
