@@ -21,7 +21,8 @@ use {
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
-    solana_gossip::cluster_info::ClusterInfo,
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
+    solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{
@@ -29,6 +30,10 @@ use {
         },
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp,
+        mcp_aggregate_attestation::{
+            AggregateAttestation, AggregateProposerEntry, AggregateRelayEntry,
+        },
         mcp_consensus_block::ConsensusBlock,
         shred::{self, ReedSolomonCache, Shred},
     },
@@ -45,7 +50,7 @@ use {
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap},
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -54,13 +59,14 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
-    tokio::sync::mpsc::Sender as AsyncSender,
+    tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
 const MCP_CONTROL_MSG_CONSENSUS_BLOCK: u8 = 0x02;
 const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
+const MCP_CONTROL_SEND_RETRY_LIMIT: usize = 3;
 
 fn relay_indices_for_pubkey(relays: &[Pubkey], local_pubkey: &Pubkey) -> Vec<u32> {
     relays
@@ -74,6 +80,217 @@ fn relay_indices_for_pubkey(relays: &[Pubkey], local_pubkey: &Pubkey) -> Vec<u32
             }
         })
         .collect()
+}
+
+fn try_send_mcp_control_frame(
+    quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+    remote_addr: SocketAddr,
+    payload: Bytes,
+) -> bool {
+    let mut send_item = (remote_addr, payload);
+    for attempt in 0..=MCP_CONTROL_SEND_RETRY_LIMIT {
+        match quic_endpoint_sender.try_send(send_item) {
+            Ok(()) => return true,
+            Err(AsyncTrySendError::Closed(_)) => return false,
+            Err(AsyncTrySendError::Full(returned)) => {
+                if attempt == MCP_CONTROL_SEND_RETRY_LIMIT {
+                    return false;
+                }
+                send_item = returned;
+                std::thread::yield_now();
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_finalize_and_broadcast_mcp_consensus_block(
+    slot: Slot,
+    local_pubkey: &Pubkey,
+    cluster_info: &ClusterInfo,
+    blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
+    turbine_quic_endpoint_sender: Option<&AsyncSender<(SocketAddr, Bytes)>>,
+) {
+    let Some(consensus_blocks) = mcp_consensus_blocks else {
+        return;
+    };
+    if consensus_blocks
+        .read()
+        .ok()
+        .is_some_and(|blocks| blocks.contains_key(&slot))
+    {
+        return;
+    }
+
+    let (root_bank, root_slot, working_bank, delayed_bankhash) = {
+        let bank_forks = bank_forks.read().unwrap();
+        let root_bank = bank_forks.root_bank();
+        if !cluster_nodes::check_feature_activation(
+            &feature_set::mcp_protocol_v1::id(),
+            slot,
+            &root_bank,
+        ) {
+            return;
+        }
+
+        let delayed_bankhash = bank_forks.get(slot.saturating_sub(1)).map(|bank| bank.hash());
+        let working_bank = bank_forks
+            .get(slot)
+            .unwrap_or_else(|| root_bank.clone());
+        (root_bank, bank_forks.root(), working_bank, delayed_bankhash)
+    };
+    let Some(delayed_bankhash) = delayed_bankhash else {
+        // Vote-gate requires delayed bankhash; do not publish partial consensus state.
+        return;
+    };
+
+    let proposer_schedule = leader_schedule_cache
+        .proposers_at_slot(slot, Some(&working_bank))
+        .or_else(|| leader_schedule_cache.proposers_at_slot(slot, Some(&root_bank)))
+        .or_else(|| leader_schedule_cache.proposers_at_slot(slot, None))
+        .unwrap_or_default();
+    if proposer_schedule.is_empty() {
+        return;
+    }
+    let relay_schedule = leader_schedule_cache
+        .relays_at_slot(slot, Some(&working_bank))
+        .or_else(|| leader_schedule_cache.relays_at_slot(slot, Some(&root_bank)))
+        .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
+        .unwrap_or_default();
+    if relay_schedule.len() < mcp::NUM_RELAYS {
+        return;
+    }
+
+    let leader_indices: Vec<u32> = proposer_schedule
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pubkey)| {
+            if pubkey == local_pubkey {
+                u32::try_from(index).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if leader_indices.is_empty() {
+        return;
+    }
+
+    let mut relay_entries = Vec::new();
+    for (relay_index, relay_pubkey) in relay_schedule.iter().enumerate() {
+        let Some(relay_index_u32) = u32::try_from(relay_index).ok() else {
+            continue;
+        };
+        let Ok(Some(attestation_bytes)) =
+            blockstore.get_mcp_relay_attestation(slot, relay_index_u32)
+        else {
+            continue;
+        };
+        let Ok(attestation) = RelayAttestationV1::from_bytes(&attestation_bytes) else {
+            continue;
+        };
+        if attestation.slot != slot || attestation.relay_index != relay_index_u32 {
+            continue;
+        }
+        if !attestation.verify_relay_signature(relay_pubkey) {
+            continue;
+        }
+
+        let entries: Vec<AggregateProposerEntry> = attestation
+            .valid_entries(|proposer_index| proposer_schedule.get(proposer_index as usize).copied())
+            .into_iter()
+            .map(|entry| AggregateProposerEntry {
+                proposer_index: entry.proposer_index,
+                commitment: Hash::new_from_array(entry.commitment),
+                proposer_signature: entry.proposer_signature,
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        relay_entries.push(AggregateRelayEntry {
+            relay_index: relay_index_u32,
+            entries,
+            relay_signature: attestation.relay_signature,
+        });
+    }
+
+    if relay_entries.len() < mcp::REQUIRED_ATTESTATIONS {
+        return;
+    }
+
+    let identity_keypair = cluster_info.keypair();
+    for leader_index in leader_indices {
+        let Ok(aggregate) =
+            AggregateAttestation::new_canonical(slot, leader_index, relay_entries.clone())
+        else {
+            continue;
+        };
+        let Ok(aggregate_bytes) = aggregate.to_wire_bytes() else {
+            continue;
+        };
+        let Ok(mut consensus_block) = ConsensusBlock::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            Vec::new(),
+            delayed_bankhash,
+        ) else {
+            continue;
+        };
+        if consensus_block
+            .sign_leader(identity_keypair.as_ref())
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(consensus_bytes) = consensus_block.to_wire_bytes() else {
+            continue;
+        };
+
+        let inserted = if let Ok(mut blocks) = consensus_blocks.write() {
+            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+            blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            if let Some(existing) = blocks.get(&slot) {
+                if existing != &consensus_bytes {
+                    warn!(
+                        "MCP consensus block conflict at slot {} (keeping first valid block)",
+                        slot
+                    );
+                }
+                false
+            } else {
+                blocks.insert(slot, consensus_bytes.clone());
+                true
+            }
+        } else {
+            false
+        };
+        if !inserted {
+            return;
+        }
+
+        if let Some(sender) = turbine_quic_endpoint_sender {
+            let mut frame = Vec::with_capacity(1 + consensus_bytes.len());
+            frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+            frame.extend_from_slice(&consensus_bytes);
+            let frame = Bytes::from(frame);
+            for peer_addr in cluster_info
+                .tvu_peers(|node| node.tvu(Protocol::QUIC))
+                .into_iter()
+                .flatten()
+            {
+                if !try_send_mcp_control_frame(sender, peer_addr, frame.clone()) {
+                    inc_new_counter_error!("mcp-consensus-block-send-dropped", 1, 1);
+                }
+            }
+        }
+        return;
+    }
 }
 
 #[derive(Default)]
@@ -463,18 +680,18 @@ fn ingest_mcp_control_message(
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
     mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
-) {
+) -> Option<Slot> {
     let Some(message_type) = frame.first().copied() else {
-        return;
+        return None;
     };
 
     match message_type {
         MCP_CONTROL_MSG_RELAY_ATTESTATION => {
             let Ok(payload) = decode_relay_attestation_frame(frame) else {
-                return;
+                return None;
             };
             let Ok(mut attestation) = RelayAttestationV1::from_bytes(payload) else {
-                return;
+                return None;
             };
 
             let root_bank = bank_forks.read().unwrap().root_bank();
@@ -483,7 +700,7 @@ fn ingest_mcp_control_message(
                 attestation.slot,
                 &root_bank,
             ) {
-                return;
+                return None;
             }
 
             let relay_pubkey = leader_schedule_cache
@@ -491,7 +708,7 @@ fn ingest_mcp_control_message(
                 .or_else(|| leader_schedule_cache.relays_at_slot(attestation.slot, None))
                 .and_then(|relays| relays.get(attestation.relay_index as usize).copied());
             let Some(relay_pubkey) = relay_pubkey else {
-                return;
+                return None;
             };
             if sender_pubkey != relay_pubkey {
                 debug!(
@@ -502,10 +719,10 @@ fn ingest_mcp_control_message(
                     sender_pubkey,
                     relay_pubkey,
                 );
-                return;
+                return None;
             }
             if !attestation.verify_relay_signature(&relay_pubkey) {
-                return;
+                return None;
             }
 
             let proposer_pubkeys = leader_schedule_cache
@@ -516,11 +733,11 @@ fn ingest_mcp_control_message(
                 proposer_pubkeys.get(proposer_index as usize).copied()
             });
             if filtered_entries.is_empty() {
-                return;
+                return None;
             }
             attestation.entries = filtered_entries;
             let Ok(attestation_bytes) = attestation.to_bytes() else {
-                return;
+                return None;
             };
 
             match blockstore.put_mcp_relay_attestation(
@@ -543,13 +760,15 @@ fn ingest_mcp_control_message(
                         "failed to store MCP relay attestation for slot {} relay {}: {}",
                         attestation.slot, attestation.relay_index, err
                     );
+                    return None;
                 }
             }
+            Some(attestation.slot)
         }
         MCP_CONTROL_MSG_CONSENSUS_BLOCK => {
             let payload = &frame[1..];
             let Ok(consensus_block) = ConsensusBlock::from_wire_bytes(payload) else {
-                return;
+                return None;
             };
 
             let root_bank = bank_forks.read().unwrap().root_bank();
@@ -558,7 +777,7 @@ fn ingest_mcp_control_message(
                 consensus_block.slot,
                 &root_bank,
             ) {
-                return;
+                return None;
             }
 
             let leader_pubkey = leader_schedule_cache
@@ -570,17 +789,17 @@ fn ingest_mcp_control_message(
                         .copied()
                 });
             let Some(leader_pubkey) = leader_pubkey else {
-                return;
+                return None;
             };
             if sender_pubkey != leader_pubkey {
                 debug!(
                     "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
                     consensus_block.slot, remote_address, sender_pubkey, leader_pubkey
                 );
-                return;
+                return None;
             }
             if !consensus_block.verify_leader_signature(&leader_pubkey) {
-                return;
+                return None;
             }
 
             if let Some(consensus_blocks) = mcp_consensus_blocks {
@@ -600,8 +819,9 @@ fn ingest_mcp_control_message(
                     }
                 }
             }
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -834,8 +1054,9 @@ impl WindowService {
                         }
                     }
                     if let Some(receiver) = mcp_control_message_receiver.as_ref() {
+                        let mut candidate_slots = BTreeSet::new();
                         for (sender_pubkey, remote_address, frame) in receiver.try_iter() {
-                            ingest_mcp_control_message(
+                            if let Some(slot) = ingest_mcp_control_message(
                                 sender_pubkey,
                                 remote_address,
                                 &frame,
@@ -843,6 +1064,21 @@ impl WindowService {
                                 &bank_forks,
                                 &leader_schedule_cache,
                                 mcp_consensus_blocks.as_ref(),
+                            ) {
+                                candidate_slots.insert(slot);
+                            }
+                        }
+
+                        for slot in candidate_slots {
+                            maybe_finalize_and_broadcast_mcp_consensus_block(
+                                slot,
+                                &local_pubkey,
+                                &cluster_info,
+                                &blockstore,
+                                &bank_forks,
+                                &leader_schedule_cache,
+                                mcp_consensus_blocks.as_ref(),
+                                turbine_quic_endpoint_sender.as_ref(),
                             );
                         }
                     }
@@ -906,6 +1142,7 @@ impl WindowService {
 mod test {
     use {
         super::*,
+        agave_feature_set as feature_set,
         rand::Rng,
         solana_entry::entry::{create_ticks, Entry},
         solana_gossip::contact_info::ContactInfo,
@@ -913,8 +1150,10 @@ mod test {
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::{make_many_slot_entries, Blockstore},
-            genesis_utils::create_genesis_config,
+            genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path_auto_delete,
+            mcp_aggregate_attestation::AggregateAttestation,
+            mcp_consensus_block::ConsensusBlock,
             shred::{ProcessShredsStats, Shredder},
         },
         solana_runtime::bank::Bank,
@@ -955,6 +1194,129 @@ mod test {
             local,
         ];
         assert_eq!(relay_indices_for_pubkey(&relays, &local), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_ingest_mcp_consensus_block_stores_valid_leader_frame() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_index = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .and_then(|proposers| {
+                proposers
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in MCP proposer schedule");
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_bankhash = Hash::new_unique();
+        let mut block =
+            ConsensusBlock::new_unsigned(
+                slot,
+                leader_index,
+                aggregate_bytes,
+                vec![],
+                delayed_bankhash,
+            )
+                .unwrap();
+        block.sign_leader(&leader).unwrap();
+        let payload = block.to_wire_bytes().unwrap();
+        let mut frame = Vec::with_capacity(1 + payload.len());
+        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame.extend_from_slice(&payload);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+
+        ingest_mcp_control_message(
+            leader.pubkey(),
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            &frame,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+        );
+
+        assert_eq!(
+            consensus_blocks.read().unwrap().get(&slot).cloned(),
+            Some(payload),
+        );
+    }
+
+    #[test]
+    fn test_ingest_mcp_consensus_block_rejects_wrong_sender() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_index = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .and_then(|proposers| {
+                proposers
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in MCP proposer schedule");
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_bankhash = Hash::new_unique();
+        let mut block =
+            ConsensusBlock::new_unsigned(
+                slot,
+                leader_index,
+                aggregate_bytes,
+                vec![],
+                delayed_bankhash,
+            )
+                .unwrap();
+        block.sign_leader(&leader).unwrap();
+        let payload = block.to_wire_bytes().unwrap();
+        let mut frame = Vec::with_capacity(1 + payload.len());
+        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame.extend_from_slice(&payload);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+
+        ingest_mcp_control_message(
+            Pubkey::new_unique(),
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            &frame,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+        );
+
+        assert!(consensus_blocks.read().unwrap().is_empty());
     }
 
     #[test]
