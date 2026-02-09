@@ -18,6 +18,7 @@ use {
         consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
+        mcp_relay_submit::RelayAttestationV1,
         repair::repair_service::{OutstandingShredRepairs, RepairInfo, RepairServiceChannels},
         replay_stage::{ReplayReceivers, ReplaySenders, ReplayStage, ReplayStageConfig},
         shred_fetch_stage::{ShredFetchStage, SHRED_FETCH_CHANNEL_SIZE},
@@ -102,6 +103,7 @@ pub struct Tvu {
     duplicate_shred_listener: DuplicateShredListener,
     alpenglow_sigverify_service: BLSSigverifyService,
     alpenglow_quic_t: thread::JoinHandle<()>,
+    _mcp_relay_attestation_sender: Sender<RelayAttestationV1>,
 }
 
 // The maximum number of alpenglow packets that can be processed in a single batch
@@ -313,7 +315,7 @@ impl Tvu {
             leader_schedule_cache.clone(),
             cluster_info.clone(),
             Arc::new(retransmit_sockets),
-            turbine_quic_endpoint_sender,
+            turbine_quic_endpoint_sender.clone(),
             retransmit_receiver,
             max_slots.clone(),
             rpc_subscriptions.clone(),
@@ -329,6 +331,7 @@ impl Tvu {
             unbounded();
         let (dumped_slots_sender, dumped_slots_receiver) = unbounded();
         let (popular_pruned_forks_sender, popular_pruned_forks_receiver) = unbounded();
+        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) = unbounded();
         let window_service = {
             let epoch_schedule = bank_forks
                 .read()
@@ -362,6 +365,8 @@ impl Tvu {
                 completed_data_sets_sender,
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
+                Some(mcp_relay_attestation_receiver),
+                Some(turbine_quic_endpoint_sender.clone()),
             );
             WindowService::new(
                 blockstore.clone(),
@@ -536,6 +541,7 @@ impl Tvu {
             duplicate_shred_listener,
             alpenglow_sigverify_service,
             alpenglow_quic_t,
+            _mcp_relay_attestation_sender: mcp_relay_attestation_sender,
         })
     }
 

@@ -5,12 +5,14 @@
 use {
     crate::{
         completed_data_sets_service::CompletedDataSetsSender,
+        mcp_relay_submit::{dispatch_relay_attestation_to_slot_leader, RelayAttestationV1},
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
         result::{Error, Result},
     },
     agave_feature_set as feature_set,
+    bytes::Bytes,
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
@@ -30,7 +32,7 @@ use {
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
-        net::UdpSocket,
+        net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, RwLock,
@@ -38,6 +40,7 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
+    tokio::sync::mpsc::Sender as AsyncSender,
 };
 
 type DuplicateSlotSender = Sender<Slot>;
@@ -253,6 +256,8 @@ pub struct WindowServiceChannels {
     pub completed_data_sets_sender: Option<CompletedDataSetsSender>,
     pub duplicate_slots_sender: DuplicateSlotSender,
     pub repair_service_channels: RepairServiceChannels,
+    pub mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+    pub turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
 }
 
 impl WindowServiceChannels {
@@ -262,6 +267,8 @@ impl WindowServiceChannels {
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         duplicate_slots_sender: DuplicateSlotSender,
         repair_service_channels: RepairServiceChannels,
+        mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+        turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> Self {
         Self {
             verified_receiver,
@@ -269,6 +276,8 @@ impl WindowServiceChannels {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_relay_attestation_receiver,
+            turbine_quic_endpoint_sender,
         }
     }
 }
@@ -304,6 +313,8 @@ impl WindowService {
             completed_data_sets_sender,
             duplicate_slots_sender,
             repair_service_channels,
+            mcp_relay_attestation_receiver,
+            turbine_quic_endpoint_sender,
         } = window_service_channels;
 
         let repair_service = RepairService::new(
@@ -320,12 +331,12 @@ impl WindowService {
         let (duplicate_sender, duplicate_receiver) = unbounded();
 
         let t_check_duplicate = Self::start_check_duplicate_thread(
-            cluster_info,
+            cluster_info.clone(),
             exit.clone(),
             blockstore.clone(),
             duplicate_receiver,
             duplicate_slots_sender,
-            bank_forks,
+            bank_forks.clone(),
             migration_status,
         );
 
@@ -334,10 +345,14 @@ impl WindowService {
             blockstore,
             leader_schedule_cache,
             verified_receiver,
+            cluster_info,
+            bank_forks,
             duplicate_sender,
             completed_data_sets_sender,
             retransmit_sender,
             accept_repairs_only,
+            mcp_relay_attestation_receiver,
+            turbine_quic_endpoint_sender,
         );
 
         WindowService {
@@ -385,10 +400,14 @@ impl WindowService {
         blockstore: Arc<Blockstore>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
+        cluster_info: Arc<ClusterInfo>,
+        bank_forks: Arc<RwLock<BankForks>>,
         check_duplicate_sender: Sender<PossibleDuplicateShred>,
         completed_data_sets_sender: Option<CompletedDataSetsSender>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
         accept_repairs_only: bool,
+        mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+        turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> JoinHandle<()> {
         let handle_error = || {
             inc_new_counter_error!("solana-window-insert-error", 1, 1);
@@ -429,6 +448,26 @@ impl WindowService {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
                             break;
+                        }
+                    }
+                    if let (Some(receiver), Some(quic_sender)) = (
+                        mcp_relay_attestation_receiver.as_ref(),
+                        turbine_quic_endpoint_sender.as_ref(),
+                    ) {
+                        for attestation in receiver.try_iter() {
+                            let root_bank = bank_forks.read().unwrap().root_bank();
+                            if let Err(err) = dispatch_relay_attestation_to_slot_leader(
+                                &attestation,
+                                &leader_schedule_cache,
+                                &root_bank,
+                                &cluster_info,
+                                quic_sender,
+                            ) {
+                                debug!(
+                                    "failed to dispatch MCP relay attestation for slot {}: {}",
+                                    attestation.slot, err
+                                );
+                            }
                         }
                     }
 
