@@ -80,6 +80,9 @@ pub enum PohRecorderError {
     )]
     BanklessBatchLengthMismatch { mixins: usize, batches: usize },
 
+    #[error("bankless recording requires at least one mixin/batch pair")]
+    BanklessEmptyInput,
+
     #[error("bankless recording received an empty transaction batch")]
     BanklessEmptyBatch,
 
@@ -462,6 +465,9 @@ impl PohRecorder {
                 mixins: mixins.len(),
                 batches: transaction_batches.len(),
             });
+        }
+        if mixins.is_empty() {
+            return Err(PohRecorderError::BanklessEmptyInput);
         }
         if transaction_batches.iter().any(|batch| batch.is_empty()) {
             return Err(PohRecorderError::BanklessEmptyBatch);
@@ -1531,6 +1537,31 @@ mod tests {
         assert_matches!(
             poh_recorder.record_bankless(true, bank.slot(), vec![hash(&[1u8])], vec![vec![]],),
             Err(PohRecorderError::BanklessEmptyBatch)
+        );
+    }
+
+    #[test]
+    fn test_record_bankless_rejects_empty_input() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path())
+            .expect("Expected to be able to open database ledger");
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            Some((4, 4)),
+            bank.ticks_per_slot(),
+            Arc::new(blockstore),
+            &Arc::new(LeaderScheduleCache::default()),
+            &PohConfig::default(),
+            Arc::new(AtomicBool::default()),
+        );
+
+        assert_matches!(
+            poh_recorder.record_bankless(true, bank.slot(), vec![], vec![]),
+            Err(PohRecorderError::BanklessEmptyInput)
         );
     }
 
