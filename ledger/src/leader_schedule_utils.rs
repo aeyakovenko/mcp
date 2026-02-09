@@ -12,6 +12,8 @@ use {
 const MCP_PROPOSER_DOMAIN: &[u8] = b"mcp:proposer";
 const MCP_RELAY_DOMAIN: &[u8] = b"mcp:relay";
 const MCP_SCHEDULE_REPEAT: u64 = 1;
+pub const MCP_PROPOSERS_PER_SLOT: usize = 16;
+pub const MCP_RELAYS_PER_SLOT: usize = 200;
 
 /// Return the leader schedule for the given epoch.
 pub fn leader_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
