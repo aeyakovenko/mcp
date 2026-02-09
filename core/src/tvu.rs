@@ -17,6 +17,7 @@ use {
         consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
+        mcp_relay_submit::RelayAttestationV1,
         repair::{
             block_id_repair_service::BlockIdRepairChannels,
             repair_service::{OutstandingShredRepairs, RepairInfo, RepairServiceChannels},
@@ -111,6 +112,7 @@ pub struct Tvu {
     alpenglow_quic_t: thread::JoinHandle<()>,
     votor: Votor,
     commitment_service: AggregateCommitmentService,
+    _mcp_relay_attestation_sender: Sender<RelayAttestationV1>,
 }
 
 pub struct TvuSockets {
@@ -358,7 +360,7 @@ impl Tvu {
             leader_schedule_cache.clone(),
             cluster_info.clone(),
             Arc::new(retransmit_sockets),
-            turbine_quic_endpoint_sender,
+            turbine_quic_endpoint_sender.clone(),
             retransmit_receiver,
             max_slots.clone(),
             rpc_subscriptions.clone(),
@@ -407,13 +409,9 @@ impl Tvu {
         };
 
         // Create switch block event channel for ReplayStage
-        // We emit a switch bank event when we observe a ParentReady.
-        // This event is filtered out if there are no duplicate blocks in this slot.
-        // However this filtering can only happen after we receive the shreds for the block.
-        // We overprovision at 100 leader windows - we would require almost 3 minutes of slow
-        // repair / turbine to hit the limit
         let (switch_bank_sender, switch_bank_receiver) = bounded(100);
 
+        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) = unbounded();
         let window_service = {
             let repair_service_channels = RepairServiceChannels::new(
                 repair_request_quic_sender,
@@ -431,6 +429,8 @@ impl Tvu {
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
                 block_id_repair_channels,
+                Some(mcp_relay_attestation_receiver),
+                Some(turbine_quic_endpoint_sender.clone()),
             );
             WindowService::new(
                 blockstore.clone(),
@@ -640,6 +640,7 @@ impl Tvu {
             alpenglow_quic_t,
             votor,
             commitment_service,
+            _mcp_relay_attestation_sender: mcp_relay_attestation_sender,
         })
     }
 
