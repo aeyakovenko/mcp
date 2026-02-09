@@ -6,8 +6,9 @@ use {
 };
 
 // Keep in sync with `solana_ledger::mcp::NUM_PROPOSERS`; duplicated here to
-// avoid introducing a `fee -> ledger` dependency edge.
-const MCP_NUM_PROPOSERS: u64 = 16;
+// avoid introducing a `fee -> ledger` dependency edge. A cross-crate unit test
+// in `solana-core` enforces this invariant.
+pub const MCP_NUM_PROPOSERS: u64 = 16;
 
 /// Bools indicating the activation of features relevant
 /// to the fee calculation.
