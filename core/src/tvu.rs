@@ -70,7 +70,7 @@ use {
     },
     solana_votor_messages::migration::MigrationStatus,
     std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
         sync::{atomic::AtomicBool, Arc, RwLock},
@@ -464,6 +464,8 @@ impl Tvu {
             consensus_metrics_sender: consensus_metrics_sender.clone(),
             consensus_metrics_receiver,
             migration_status,
+            mcp_vote_gate_inputs: Arc::new(RwLock::new(HashMap::new())),
+            mcp_vote_gate_included_proposers: Arc::new(RwLock::new(HashMap::new())),
             reward_votes_receiver,
             build_reward_certs_receiver,
             reward_certs_sender,
