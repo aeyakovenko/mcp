@@ -82,6 +82,9 @@ pub enum PohRecorderError {
 
     #[error("bankless recording received an empty transaction batch")]
     BanklessEmptyBatch,
+
+    #[error("bankless recording made no PoH progress in slot {slot}")]
+    BanklessProgressStalled { slot: Slot },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, PohRecorderError>;
@@ -513,7 +516,11 @@ impl PohRecorder {
             }
 
             self.metrics.ticks_from_record += 1;
+            let tick_height_before_tick = self.tick_height();
             self.tick();
+            if self.tick_height() == tick_height_before_tick {
+                return Err(PohRecorderError::BanklessProgressStalled { slot });
+            }
         }
     }
 
