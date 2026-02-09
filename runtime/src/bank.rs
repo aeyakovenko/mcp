@@ -97,7 +97,7 @@ use {
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
-    solana_fee::FeeFeatures,
+    solana_fee::{FeeFeatures, MCP_NUM_PROPOSERS},
     solana_fee_calculator::FeeRateGovernor,
     solana_fee_structure::{FeeBudgetLimits, FeeDetails, FeeStructure},
     solana_genesis_config::GenesisConfig,
@@ -3476,10 +3476,6 @@ impl Bank {
         max_age: usize,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Vec<Result<FeeDetails>> {
-        // Keep in sync with `solana_ledger::mcp::NUM_PROPOSERS`; duplicated here to
-        // avoid introducing a `runtime -> ledger` dependency edge.
-        const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
-
         let sanitized_txs = batch.sanitized_transactions();
         let check_results =
             self.check_transactions(sanitized_txs, batch.lock_results(), max_age, error_counters);
@@ -3519,7 +3515,7 @@ impl Bank {
             let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
             let mut fee = match fee_details
                 .total_fee()
-                .checked_mul(MCP_NUM_PROPOSERS_FEE_MULTIPLIER)
+                .checked_mul(MCP_NUM_PROPOSERS)
             {
                 Some(fee) => fee,
                 None => {

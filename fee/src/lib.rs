@@ -4,6 +4,8 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
 };
 
+pub const MCP_NUM_PROPOSERS: u64 = 16;
+
 /// Bools indicating the activation of features relevant
 /// to the fee calculation.
 // DEVELOPER NOTE:
