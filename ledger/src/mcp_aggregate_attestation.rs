@@ -308,6 +308,9 @@ impl AggregateAttestation {
                 .entries
                 .retain(|entry| !equivocating_proposers.contains(&entry.proposer_index));
         }
+        // Relays with no remaining valid proposer entries must not count toward
+        // downstream threshold checks.
+        relay_entries.retain(|relay_entry| !relay_entry.entries.is_empty());
 
         Ok(FilteredAggregateAttestation {
             slot: self.slot,
@@ -824,6 +827,60 @@ mod tests {
         assert_eq!(filtered.relay_entries[1].entries.len(), 1);
         assert_eq!(filtered.relay_entries[1].entries[0].proposer_index, 1);
         assert_eq!(filtered.relay_entries[1].entries[0].commitment, proposer1_commitment);
+    }
+
+    #[test]
+    fn test_canonical_filtered_drops_relays_that_become_empty_after_equivocation_filtering() {
+        let relay0 = Keypair::new();
+        let relay1 = Keypair::new();
+        let proposer0 = Keypair::new();
+
+        let proposer0_commitment_a = Hash::new_unique();
+        let proposer0_commitment_b = Hash::new_unique();
+
+        let mut relay_entry0 = AggregateRelayEntry {
+            relay_index: 1,
+            entries: vec![AggregateProposerEntry {
+                proposer_index: 0,
+                commitment: proposer0_commitment_a,
+                proposer_signature: proposer0.sign_message(proposer0_commitment_a.as_ref()),
+            }],
+            relay_signature: Signature::default(),
+        };
+        relay_entry0
+            .sign(AGGREGATE_ATTESTATION_V1, 91, &relay0)
+            .unwrap();
+
+        let mut relay_entry1 = AggregateRelayEntry {
+            relay_index: 2,
+            entries: vec![AggregateProposerEntry {
+                proposer_index: 0,
+                commitment: proposer0_commitment_b,
+                proposer_signature: proposer0.sign_message(proposer0_commitment_b.as_ref()),
+            }],
+            relay_signature: Signature::default(),
+        };
+        relay_entry1
+            .sign(AGGREGATE_ATTESTATION_V1, 91, &relay1)
+            .unwrap();
+
+        let aggregate =
+            AggregateAttestation::new_canonical(91, 3, vec![relay_entry1, relay_entry0]).unwrap();
+        let filtered = aggregate
+            .canonical_filtered(
+                |relay_index| match relay_index {
+                    1 => Some(relay0.pubkey()),
+                    2 => Some(relay1.pubkey()),
+                    _ => None,
+                },
+                |proposer_index| match proposer_index {
+                    0 => Some(proposer0.pubkey()),
+                    _ => None,
+                },
+            )
+            .unwrap();
+
+        assert!(filtered.relay_entries.is_empty());
     }
 
     #[test]
