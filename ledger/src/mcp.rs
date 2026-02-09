@@ -57,13 +57,12 @@ pub const MAX_PROPOSER_PAYLOAD: usize =
 
 /// Compatibility alias retained for existing MCP helpers.
 pub const MAX_PAYLOAD_BYTES: usize = MAX_PROPOSER_PAYLOAD;
-
 /// Expected witness length for MCP Merkle proofs.
 pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
 /// ceil((numerator / denominator) * total), integer-only.
 pub const fn ceil_threshold_count(numerator: usize, denominator: usize, total: usize) -> usize {
-    assert!(denominator != 0);
+    assert!(denominator != 0, "threshold denominator must be non-zero");
     // ceil(a / b) for integers is (a + b - 1) / b.
     let scaled = numerator * total;
     (scaled + denominator - 1) / denominator
@@ -118,8 +117,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_ceil_threshold_count_zero_denominator() {
-        let _ = ceil_threshold_count(3, 0, NUM_RELAYS);
+    #[should_panic(expected = "threshold denominator must be non-zero")]
+    fn test_threshold_count_guard_zero_denominator() {
+        let _ = ceil_threshold_count(3, 0, 200);
+    }
+
+    #[test]
+    fn test_ceil_log2_edge_cases() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+    }
+
+    #[test]
+    fn test_threshold_count_handles_ratio_above_one() {
+        assert_eq!(ceil_threshold_count(6, 5, 200), 240);
     }
 }
