@@ -55,6 +55,9 @@ pub const MAX_PROPOSER_PAYLOAD: usize =
         DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES
     };
 
+/// Compatibility alias retained for existing MCP helpers.
+pub const MAX_PAYLOAD_BYTES: usize = MAX_PROPOSER_PAYLOAD;
+
 /// Expected witness length for MCP Merkle proofs.
 pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
@@ -105,6 +108,7 @@ mod tests {
         let upper_spec_bound = NUM_RELAYS * SHRED_DATA_BYTES;
         let rs_capacity_bound = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES;
         assert_eq!(MAX_PROPOSER_PAYLOAD, rs_capacity_bound);
+        assert_eq!(MAX_PAYLOAD_BYTES, MAX_PROPOSER_PAYLOAD);
         assert!(MAX_PROPOSER_PAYLOAD <= upper_spec_bound);
     }
 
