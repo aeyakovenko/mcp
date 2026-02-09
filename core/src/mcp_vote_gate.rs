@@ -48,6 +48,8 @@ pub enum VoteGateRejection {
     DelayedBankhashMismatch,
     #[error("insufficient relay attestations: got {actual}, need {required}")]
     InsufficientRelayAttestations { actual: usize, required: usize },
+    #[error("no proposers passed inclusion and equivocation checks")]
+    NoIncludedProposers,
     #[error(
         "insufficient local shreds for proposer {proposer_index}: got {actual}, need {required}"
     )]
@@ -135,6 +137,9 @@ pub fn evaluate_vote_gate(input: &VoteGateInput) -> VoteGateDecision {
                 required: REQUIRED_RECONSTRUCTION,
             });
         }
+    }
+    if included_proposers.is_empty() {
+        return VoteGateDecision::Reject(VoteGateRejection::NoIncludedProposers);
     }
 
     VoteGateDecision::Vote { included_proposers }
@@ -286,9 +291,7 @@ mod tests {
 
         assert_eq!(
             evaluate_vote_gate(&input),
-            VoteGateDecision::Vote {
-                included_proposers: BTreeMap::new(),
-            }
+            VoteGateDecision::Reject(VoteGateRejection::NoIncludedProposers)
         );
     }
 
@@ -323,9 +326,7 @@ mod tests {
 
         assert_eq!(
             evaluate_vote_gate(&input),
-            VoteGateDecision::Vote {
-                included_proposers: BTreeMap::new(),
-            }
+            VoteGateDecision::Reject(VoteGateRejection::NoIncludedProposers)
         );
     }
 }
