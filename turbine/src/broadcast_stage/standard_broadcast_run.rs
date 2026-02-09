@@ -22,6 +22,7 @@ use {
             Shredder, MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
         },
     },
+    solana_metrics::inc_new_counter_error,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_sha256_hasher::hashv,
@@ -839,6 +840,7 @@ impl StandardBroadcastRun {
                     .try_send((*relay_addr, Bytes::copy_from_slice(message)))
                     .is_err()
                 {
+                    inc_new_counter_error!("mcp-proposer-dispatch-send-dropped", 1, 1);
                     warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
                 }
             }
