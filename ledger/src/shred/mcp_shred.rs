@@ -203,6 +203,10 @@ impl McpShred {
             .verify(proposer_pubkey.as_ref(), &self.commitment)
     }
 
+    pub fn verify(&self, proposer_pubkey: &Pubkey) -> bool {
+        self.verify_signature(proposer_pubkey) && self.verify_witness()
+    }
+
     pub fn verify_witness(&self) -> bool {
         mcp_merkle::verify_witness(
             self.slot,
@@ -315,6 +319,7 @@ mod tests {
         assert_eq!(decoded, shred);
         assert!(decoded.verify_signature(&keypair.pubkey()));
         assert!(decoded.verify_witness());
+        assert!(decoded.verify(&keypair.pubkey()));
     }
 
     #[test]
@@ -385,6 +390,55 @@ mod tests {
             proposer_signature,
         };
         assert!(!is_mcp_shred_bytes(&shred.to_bytes()));
+    }
+
+    #[test]
+    fn test_classifier_accepts_max_in_range_indices() {
+        let slot = 42;
+        let proposer_index = (MCP_NUM_PROPOSERS - 1) as u32;
+        let shred_index = MCP_NUM_RELAYS - 1;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let keypair = Keypair::new();
+        let proposer_signature = keypair.sign_message(&commitment);
+        let shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index: shred_index as u32,
+            commitment,
+            shred_data: leaves[shred_index],
+            witness,
+            proposer_signature,
+        };
+        assert!(is_mcp_shred_bytes(&shred.to_bytes()));
+        assert!(shred.verify(&keypair.pubkey()));
+    }
+
+    #[test]
+    fn test_classifier_rejects_shred_index_at_upper_bound() {
+        let slot = 42;
+        let proposer_index = 0u32;
+        let shred_index = 0usize;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let keypair = Keypair::new();
+        let proposer_signature = keypair.sign_message(&commitment);
+        let shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index: shred_index as u32,
+            commitment,
+            shred_data: leaves[shred_index],
+            witness,
+            proposer_signature,
+        };
+        let mut bytes = shred.to_bytes();
+        let shred_index_offset = std::mem::size_of::<Slot>() + std::mem::size_of::<u32>();
+        bytes[shred_index_offset..shred_index_offset + std::mem::size_of::<u32>()]
+            .copy_from_slice(&(MCP_NUM_RELAYS as u32).to_le_bytes());
+        assert!(!is_mcp_shred_bytes(&bytes));
     }
 
     #[test]
