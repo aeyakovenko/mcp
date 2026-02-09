@@ -84,4 +84,40 @@ mod tests {
         let ids: Vec<_> = ordered.into_iter().map(|tx| tx.id).collect();
         assert_eq!(ids, vec!["p0-0", "p0-1", "p1-0", "p1-1"]);
     }
+
+    #[test]
+    fn test_duplicate_proposer_indices_preserve_input_batch_order() {
+        let batches = vec![
+            (3, vec![Tx { id: "first", fee: 1 }]),
+            (3, vec![Tx { id: "second", fee: 1 }]),
+            (2, vec![Tx { id: "p2", fee: 1 }]),
+        ];
+
+        let ordered = concat_batches_by_proposer_index(batches);
+        let ids: Vec<_> = ordered.into_iter().map(|tx| tx.id).collect();
+        assert_eq!(ids, vec!["p2", "first", "second"]);
+    }
+
+    #[test]
+    fn test_concat_handles_empty_and_single_batches() {
+        let ordered_empty: Vec<Tx> = concat_batches_by_proposer_index(Vec::new());
+        assert!(ordered_empty.is_empty());
+
+        let ordered_single =
+            concat_batches_by_proposer_index(vec![(9, vec![Tx { id: "only", fee: 42 }])]);
+        let ids: Vec<_> = ordered_single.into_iter().map(|tx| tx.id).collect();
+        assert_eq!(ids, vec!["only"]);
+    }
+
+    #[test]
+    fn test_order_handles_empty_and_single_batches() {
+        let empty_batches: Vec<(u32, Vec<Tx>)> = Vec::new();
+        let ordered_empty: Vec<Tx> = order_batches_by_fee_desc(empty_batches, |tx| tx.fee);
+        assert!(ordered_empty.is_empty());
+
+        let ordered_single =
+            order_batches_by_fee_desc(vec![(9, vec![Tx { id: "only", fee: 42 }])], |tx| tx.fee);
+        let ids: Vec<_> = ordered_single.into_iter().map(|tx| tx.id).collect();
+        assert_eq!(ids, vec!["only"]);
+    }
 }
