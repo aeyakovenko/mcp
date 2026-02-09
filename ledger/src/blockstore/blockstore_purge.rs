@@ -331,6 +331,9 @@ impl Blockstore {
                 .is_ok()
             & self
                 .mcp_relay_attestation_cf
+                .delete_range_in_batch(write_batch, from_slot, to_slot)
+                .is_ok()
+            & self
                 .mcp_execution_output_cf
                 .delete_range_in_batch(write_batch, from_slot, to_slot)
                 .is_ok()
@@ -448,6 +451,9 @@ impl Blockstore {
                 .is_ok()
             & self
                 .mcp_relay_attestation_cf
+                .delete_file_in_range(from_slot, to_slot)
+                .is_ok()
+            & self
                 .mcp_execution_output_cf
                 .delete_file_in_range(from_slot, to_slot)
                 .is_ok()
