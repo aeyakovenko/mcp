@@ -1533,6 +1533,52 @@ fn test_collect_fees_only_for_nonce_transaction_debits_scaled_fee_plus_nonce_ren
 }
 
 #[test]
+fn test_collect_fees_only_for_nonce_transaction_accepts_exact_scaled_plus_nonce_rent_balance() {
+    const MCP_NUM_PROPOSERS_FEE_MULTIPLIER: u64 = 16;
+    let (bank, _mint_keypair, _custodian_keypair, nonce_keypair, _bank_forks) = setup_nonce_with_bank(
+        10_000_000,
+        |genesis_config| {
+            genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+            genesis_config.rent.lamports_per_byte_year = 42;
+        },
+        5_000_000,
+        1_000_000,
+        None,
+        FeatureSet::all_enabled(),
+    )
+    .unwrap();
+
+    let nonce_pubkey = nonce_keypair.pubkey();
+    let nonce_min_balance = bank.get_minimum_balance_for_rent_exemption(nonce::state::State::size());
+    let exact_required_balance =
+        (5_000 * MCP_NUM_PROPOSERS_FEE_MULTIPLIER) + nonce_min_balance;
+
+    let mut nonce_account = bank.get_account_with_fixed_root(&nonce_pubkey).unwrap();
+    nonce_account.set_lamports(exact_required_balance);
+    bank.store_account(&nonce_pubkey, &nonce_account);
+
+    let nonce_hash = get_nonce_blockhash(&bank, &nonce_pubkey).unwrap();
+    let tx = RuntimeTransaction::from_transaction_for_tests(Transaction::new_signed_with_payer(
+        &[system_instruction::advance_nonce_account(
+            &nonce_pubkey,
+            &nonce_pubkey,
+        )],
+        Some(&nonce_pubkey),
+        &[&nonce_keypair],
+        nonce_hash,
+    ));
+    let batch = bank.prepare_unlocked_batch_from_single_tx(&tx);
+
+    let mut error_counters = TransactionErrorMetrics::default();
+    let fee_results =
+        bank.collect_fees_only_for_transactions(&batch, MAX_PROCESSING_AGE, &mut error_counters);
+
+    assert_eq!(fee_results.len(), 1);
+    assert!(fee_results[0].is_ok());
+    assert_eq!(bank.get_balance(&nonce_pubkey), 0);
+}
+
+#[test]
 fn test_bank_tx_fee() {
     agave_logger::setup();
 
