@@ -355,6 +355,7 @@ impl Consumer {
                     recording_config: ExecutionRecordingConfig::new_single_setting(
                         transaction_status_sender_enabled
                     ),
+                    skip_fee_collection: false,
                 }
             ));
         execute_and_commit_timings.load_execute_us = load_execute_us;
