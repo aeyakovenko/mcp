@@ -66,5 +66,11 @@ pub enum BlockstoreError {
     BlockComponentMismatch(Slot),
     #[error("Update parent on invalid slot {0}")]
     UpdateParentOnInvalidSlot(Slot),
+    #[error("invalid MCP {kind} length: {actual} > {max}")]
+    InvalidMcpLength {
+        kind: &'static str,
+        actual: usize,
+        max: usize,
+    },
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
