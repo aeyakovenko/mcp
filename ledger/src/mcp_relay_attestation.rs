@@ -1,4 +1,5 @@
 use {
+    crate::mcp,
     solana_clock::Slot,
     solana_hash::{Hash, HASH_BYTES},
     solana_pubkey::Pubkey,
@@ -11,6 +12,7 @@ const HEADER_LEN: usize = 1 + 8 + 4 + 1;
 const ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
 const FOOTER_LEN: usize = SIGNATURE_BYTES;
 const MIN_WIRE_LEN: usize = HEADER_LEN + FOOTER_LEN;
+const MAX_RELAY_ATTESTATION_ENTRIES: usize = mcp::NUM_PROPOSERS;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayAttestationEntry {
@@ -32,8 +34,14 @@ pub struct RelayAttestation {
 pub enum RelayAttestationError {
     #[error("unknown relay attestation version: {0}")]
     UnknownVersion(u8),
-    #[error("relay attestation entries exceed u8::MAX: {0}")]
+    #[error("relay attestation entries exceed MCP proposer limit: {0}")]
     TooManyEntries(usize),
+    #[error("relay attestation must include at least one proposer entry")]
+    EmptyEntries,
+    #[error("relay index out of range: {0}")]
+    RelayIndexOutOfRange(u32),
+    #[error("proposer index out of range: {0}")]
+    ProposerIndexOutOfRange(u32),
     #[error("relay attestation entries must be strictly sorted by proposer_index")]
     EntriesNotStrictlySorted,
     #[error("relay attestation is truncated")]
@@ -48,9 +56,14 @@ impl RelayAttestation {
         relay_index: u32,
         mut entries: Vec<RelayAttestationEntry>,
     ) -> Result<Self, RelayAttestationError> {
-        if entries.len() > u8::MAX as usize {
+        ensure_relay_index_in_range(relay_index)?;
+        if entries.is_empty() {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
+        if entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(entries.len()));
         }
+        ensure_proposer_indices_in_range(&entries)?;
         entries.sort_unstable_by_key(|entry| entry.proposer_index);
         ensure_entries_strictly_sorted(&entries)?;
         Ok(Self {
@@ -63,16 +76,23 @@ impl RelayAttestation {
     }
 
     pub fn signing_bytes(&self) -> Result<Vec<u8>, RelayAttestationError> {
-        if self.entries.len() > u8::MAX as usize {
+        ensure_relay_index_in_range(self.relay_index)?;
+        if self.entries.is_empty() {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
+        if self.entries.len() > MAX_RELAY_ATTESTATION_ENTRIES {
             return Err(RelayAttestationError::TooManyEntries(self.entries.len()));
         }
+        ensure_proposer_indices_in_range(&self.entries)?;
         ensure_entries_strictly_sorted(&self.entries)?;
 
         let mut bytes = Vec::with_capacity(HEADER_LEN + self.entries.len() * ENTRY_LEN);
         bytes.push(self.version);
         bytes.extend_from_slice(&self.slot.to_le_bytes());
         bytes.extend_from_slice(&self.relay_index.to_le_bytes());
-        bytes.push(self.entries.len() as u8);
+        let entries_len = u8::try_from(self.entries.len())
+            .map_err(|_| RelayAttestationError::TooManyEntries(self.entries.len()))?;
+        bytes.push(entries_len);
 
         for entry in &self.entries {
             bytes.extend_from_slice(&entry.proposer_index.to_le_bytes());
@@ -102,11 +122,23 @@ impl RelayAttestation {
 
         let slot = read_u64_le(bytes, &mut cursor)?;
         let relay_index = read_u32_le(bytes, &mut cursor)?;
+        ensure_relay_index_in_range(relay_index)?;
         let entries_len = read_u8(bytes, &mut cursor)? as usize;
+        if entries_len == 0 {
+            return Err(RelayAttestationError::EmptyEntries);
+        }
+        if entries_len > MAX_RELAY_ATTESTATION_ENTRIES {
+            return Err(RelayAttestationError::TooManyEntries(entries_len));
+        }
 
         let mut entries = Vec::with_capacity(entries_len);
         for _ in 0..entries_len {
             let proposer_index = read_u32_le(bytes, &mut cursor)?;
+            if proposer_index as usize >= mcp::NUM_PROPOSERS {
+                return Err(RelayAttestationError::ProposerIndexOutOfRange(
+                    proposer_index,
+                ));
+            }
             let commitment = Hash::new_from_array(read_array::<HASH_BYTES>(bytes, &mut cursor)?);
             let proposer_signature =
                 Signature::from(read_array::<SIGNATURE_BYTES>(bytes, &mut cursor)?);
@@ -171,6 +203,26 @@ fn ensure_entries_strictly_sorted(
         return Ok(());
     }
     Err(RelayAttestationError::EntriesNotStrictlySorted)
+}
+
+fn ensure_relay_index_in_range(relay_index: u32) -> Result<(), RelayAttestationError> {
+    if relay_index as usize >= mcp::NUM_RELAYS {
+        return Err(RelayAttestationError::RelayIndexOutOfRange(relay_index));
+    }
+    Ok(())
+}
+
+fn ensure_proposer_indices_in_range(
+    entries: &[RelayAttestationEntry],
+) -> Result<(), RelayAttestationError> {
+    for entry in entries {
+        if entry.proposer_index as usize >= mcp::NUM_PROPOSERS {
+            return Err(RelayAttestationError::ProposerIndexOutOfRange(
+                entry.proposer_index,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, RelayAttestationError> {
@@ -388,6 +440,182 @@ mod tests {
         assert_eq!(
             RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
             RelayAttestationError::TrailingBytes,
+        );
+    }
+
+    #[test]
+    fn test_new_unsigned_rejects_too_many_entries() {
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries: Vec<_> = (0..=MAX_RELAY_ATTESTATION_ENTRIES as u32)
+            .map(|proposer_index| RelayAttestationEntry {
+                proposer_index,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            })
+            .collect();
+        assert_eq!(
+            RelayAttestation::new_unsigned(1, 2, entries).unwrap_err(),
+            RelayAttestationError::TooManyEntries(MAX_RELAY_ATTESTATION_ENTRIES + 1)
+        );
+    }
+
+    #[test]
+    fn test_new_unsigned_rejects_empty_entries() {
+        assert_eq!(
+            RelayAttestation::new_unsigned(1, 2, Vec::new()).unwrap_err(),
+            RelayAttestationError::EmptyEntries,
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_too_many_entries() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push((MAX_RELAY_ATTESTATION_ENTRIES + 1) as u8);
+        for proposer_index in 0..=MAX_RELAY_ATTESTATION_ENTRIES as u32 {
+            bytes.extend_from_slice(&proposer_index.to_le_bytes());
+            bytes.extend_from_slice(commitment.as_ref());
+            bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        }
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::TooManyEntries(MAX_RELAY_ATTESTATION_ENTRIES + 1),
+        );
+    }
+
+    #[test]
+    fn test_new_unsigned_rejects_out_of_range_relay_index() {
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries = vec![RelayAttestationEntry {
+            proposer_index: 0,
+            commitment,
+            proposer_signature: proposer.sign_message(commitment.as_ref()),
+        }];
+        assert_eq!(
+            RelayAttestation::new_unsigned(1, mcp::NUM_RELAYS as u32, entries).unwrap_err(),
+            RelayAttestationError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
+        );
+    }
+
+    #[test]
+    fn test_new_unsigned_accepts_max_valid_relay_index() {
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+        let entries = vec![RelayAttestationEntry {
+            proposer_index: 0,
+            commitment,
+            proposer_signature: proposer.sign_message(commitment.as_ref()),
+        }];
+
+        let attestation =
+            RelayAttestation::new_unsigned(1, (mcp::NUM_RELAYS - 1) as u32, entries).unwrap();
+        assert_eq!(attestation.relay_index, (mcp::NUM_RELAYS - 1) as u32);
+    }
+
+    #[test]
+    fn test_from_wire_rejects_out_of_range_relay_index() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&(mcp::NUM_RELAYS as u32).to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(commitment.as_ref());
+        bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_out_of_range_proposer_index() {
+        let relay = Keypair::new();
+        let proposer = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&(mcp::NUM_PROPOSERS as u32).to_le_bytes());
+        bytes.extend_from_slice(commitment.as_ref());
+        bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::ProposerIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_empty_entries() {
+        let relay = Keypair::new();
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::EmptyEntries,
+        );
+    }
+
+    #[test]
+    fn test_verify_proposer_signatures_fails_when_pubkey_lookup_missing() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let commitment = Hash::new_unique();
+        let mut attestation = RelayAttestation::new_unsigned(
+            77,
+            9,
+            vec![RelayAttestationEntry {
+                proposer_index: 2,
+                commitment,
+                proposer_signature: proposer.sign_message(commitment.as_ref()),
+            }],
+        )
+        .unwrap();
+        attestation.sign_relay(&relay).unwrap();
+        assert!(!attestation.verify_proposer_signatures(|_| None));
+    }
+
+    #[test]
+    fn test_from_wire_rejects_truncated_mid_entry() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let commitment = Hash::new_unique();
+
+        let mut bytes = vec![RELAY_ATTESTATION_V1];
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(commitment.as_ref());
+        bytes.extend_from_slice(proposer.sign_message(commitment.as_ref()).as_ref());
+        bytes.extend_from_slice(relay.sign_message(&bytes).as_ref());
+
+        bytes.truncate(HEADER_LEN + ENTRY_LEN - 1);
+        assert_eq!(
+            RelayAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            RelayAttestationError::Truncated,
         );
     }
 }
