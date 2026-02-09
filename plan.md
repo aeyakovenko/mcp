@@ -11,14 +11,14 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - MCP shreds use a separate wire format and dedicated column families.
 - Invalid MCP messages are dropped and MUST NOT advance protocol state.
 
-## Release Blockers (`UNVERIFIED` until resolved)
+## Release Blockers (status)
 
-- Vote-gate input producer wiring:
-  - Replay vote gate requires per-slot `VoteGateInput` populated from MCP consensus/attestation ingestion.
-  - Until this path is wired, MCP-gated voting can fail closed due to missing inputs.
-- Bankless recording caller wiring:
-  - `PohRecorder::record_bankless` requires an explicit production caller in the MCP leader path.
-  - Until wired, bankless recording semantics are implemented but not exercised end-to-end.
+- Vote-gate input producer wiring: `RESOLVED`
+  - Per-slot `VoteGateInput` is populated from ingested `ConsensusBlock` state and refreshed in replay before MCP vote-gate evaluation.
+  - Wiring points: `core/src/window_service.rs`, `core/src/mcp_replay.rs`, `core/src/replay_stage.rs`.
+- Bankless recording caller wiring: `RESOLVED`
+  - `PohRecorder::record_bankless` is called from production block recording when no working bank is installed.
+  - Wiring point: `core/src/block_creation_loop.rs`.
 
 ## Resolved Policy Decisions
 
