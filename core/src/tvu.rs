@@ -459,6 +459,7 @@ impl Tvu {
             consensus_metrics_receiver,
             migration_status,
             mcp_vote_gate_inputs: Arc::new(RwLock::new(HashMap::new())),
+            mcp_vote_gate_included_proposers: Arc::new(RwLock::new(HashMap::new())),
             reward_votes_receiver,
             build_reward_certs_receiver,
             reward_certs_sender,
