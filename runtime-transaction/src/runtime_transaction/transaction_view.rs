@@ -70,12 +70,16 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
             true => match McpTransaction::from_bytes_compat(transaction.data()) {
                 Ok(mcp_tx) => {
                     if mcp_tx.to_bytes().as_slice() == transaction.data() {
-                        let inclusion_fee = mcp_tx
-                            .inclusion_fee()
-                            .ok_or(TransactionError::SanitizeFailure)?;
-                        let ordering_fee =
-                            mcp_tx.ordering_fee().ok_or(TransactionError::SanitizeFailure)?;
-                        Some((u64::from(inclusion_fee), u64::from(ordering_fee)))
+                        // Latest MCP format may omit fee fields; missing values default to v0
+                        // behavior so sanitization remains backward-compatible.
+                        let inclusion_fee = u64::from(mcp_tx.inclusion_fee().unwrap_or_default());
+                        let ordering_fee = mcp_tx
+                            .ordering_fee()
+                            .map(u64::from)
+                            .unwrap_or_else(|| {
+                                compute_budget_instruction_details.requested_compute_unit_price()
+                            });
+                        Some((inclusion_fee, ordering_fee))
                     } else {
                         // Legacy MCP layout has no ordering_fee field; use CU price.
                         Some((0, compute_budget_instruction_details.requested_compute_unit_price()))

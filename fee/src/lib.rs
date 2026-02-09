@@ -5,6 +5,8 @@ use {
     solana_svm_transaction::svm_message::SVMMessage,
 };
 
+// Keep in sync with `solana_ledger::mcp::NUM_PROPOSERS`; duplicated here to
+// avoid introducing a `fee -> ledger` dependency edge.
 const MCP_NUM_PROPOSERS: u64 = 16;
 
 /// Bools indicating the activation of features relevant
