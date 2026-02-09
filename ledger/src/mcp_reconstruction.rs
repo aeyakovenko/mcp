@@ -209,6 +209,9 @@ fn map_merkle_error(err: mcp_merkle::McpMerkleError) -> McpReconstructionError {
         mcp_merkle::McpMerkleError::TooManyShreds(count) => {
             McpReconstructionError::TooManyShreds(count)
         }
+        mcp_merkle::McpMerkleError::InvalidLeafIndex { index, .. } => {
+            McpReconstructionError::InvalidShredIndex(index)
+        }
         mcp_merkle::McpMerkleError::InvalidWitnessLength { .. } => {
             unreachable!("reconstruction commitment_root does not verify witnesses")
         }
