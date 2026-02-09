@@ -28,7 +28,7 @@ use {
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
     std::{borrow::Cow, collections::HashMap, sync::RwLock},
-    tokio::sync::mpsc::Sender as AsyncSender,
+    tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
 #[derive(Clone)]
@@ -124,6 +124,8 @@ fn encode_mcp_payload(transactions: Vec<Vec<u8>>) -> Option<Vec<u8>> {
 }
 
 impl StandardBroadcastRun {
+    const MCP_DISPATCH_SEND_RETRY_LIMIT: usize = 3;
+
     pub(super) fn new(
         identity: Pubkey,
         shred_version: u16,
@@ -839,15 +841,38 @@ impl StandardBroadcastRun {
                 let Some(relay_addr) = relay_addr else {
                     continue;
                 };
-                if quic_endpoint_sender
-                    .try_send((*relay_addr, Bytes::copy_from_slice(message)))
-                    .is_err()
-                {
+                if !Self::try_send_mcp_dispatch_message(
+                    quic_endpoint_sender,
+                    *relay_addr,
+                    Bytes::copy_from_slice(message),
+                ) {
                     inc_new_counter_error!("mcp-proposer-dispatch-send-dropped", 1, 1);
                     warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
                 }
             }
         }
+    }
+
+    fn try_send_mcp_dispatch_message(
+        quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
+        relay_addr: SocketAddr,
+        bytes: Bytes,
+    ) -> bool {
+        let mut send_item = (relay_addr, bytes);
+        for attempt in 0..=Self::MCP_DISPATCH_SEND_RETRY_LIMIT {
+            match quic_endpoint_sender.try_send(send_item) {
+                Ok(()) => return true,
+                Err(AsyncTrySendError::Closed(_)) => return false,
+                Err(AsyncTrySendError::Full(returned)) => {
+                    if attempt == Self::MCP_DISPATCH_SEND_RETRY_LIMIT {
+                        return false;
+                    }
+                    send_item = returned;
+                    std::thread::yield_now();
+                }
+            }
+        }
+        false
     }
 }
 
@@ -1071,6 +1096,60 @@ mod test {
             .get(&bank.slot())
             .is_none());
         assert!(quic_endpoint_receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_succeeds_when_channel_has_capacity() {
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 1);
+        let relay_addr = "127.0.0.1:1234".parse().unwrap();
+        let payload = Bytes::from_static(&[1u8, 2, 3]);
+
+        assert!(StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            relay_addr,
+            payload.clone(),
+        ));
+
+        let (received_addr, received_payload) = quic_endpoint_receiver.try_recv().unwrap();
+        assert_eq!(received_addr, relay_addr);
+        assert_eq!(received_payload, payload);
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_retries_then_fails_on_full_channel() {
+        let (quic_endpoint_sender, mut quic_endpoint_receiver) =
+            tokio::sync::mpsc::channel(/*capacity:*/ 1);
+        let first_addr = "127.0.0.1:1234".parse().unwrap();
+        let first_payload = Bytes::from_static(&[7u8]);
+        quic_endpoint_sender
+            .try_send((first_addr, first_payload.clone()))
+            .unwrap();
+
+        let second_addr = "127.0.0.1:5678".parse().unwrap();
+        let second_payload = Bytes::from_static(&[9u8]);
+        assert!(!StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            second_addr,
+            second_payload,
+        ));
+
+        // The original queued message remains intact when retries are exhausted.
+        let (received_addr, received_payload) = quic_endpoint_receiver.try_recv().unwrap();
+        assert_eq!(received_addr, first_addr);
+        assert_eq!(received_payload, first_payload);
+    }
+
+    #[test]
+    fn test_try_send_mcp_dispatch_message_fails_when_channel_closed() {
+        let (quic_endpoint_sender, quic_endpoint_receiver) = tokio::sync::mpsc::channel(1);
+        drop(quic_endpoint_receiver);
+
+        assert!(!StandardBroadcastRun::try_send_mcp_dispatch_message(
+            &quic_endpoint_sender,
+            "127.0.0.1:1234".parse().unwrap(),
+            Bytes::from_static(&[1u8]),
+        ));
     }
 
     #[test_case(MigrationStatus::default(); "pre_migration")]
