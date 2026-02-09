@@ -25,6 +25,7 @@ pub mod genesis_utils;
 pub mod leader_schedule;
 pub mod leader_schedule_cache;
 pub mod leader_schedule_utils;
+pub mod mcp;
 pub mod mcp_consensus_block;
 pub mod next_slots_iterator;
 pub mod rooted_slot_iterator;
