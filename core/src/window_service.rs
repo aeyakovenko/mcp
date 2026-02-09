@@ -97,7 +97,8 @@ fn try_send_mcp_control_frame(
                     return false;
                 }
                 send_item = returned;
-                std::thread::yield_now();
+                let backoff_micros = 50u64.saturating_mul((attempt + 1) as u64);
+                std::thread::sleep(Duration::from_micros(backoff_micros));
             }
         }
     }

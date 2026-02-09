@@ -2,7 +2,7 @@ use {
     crate::{
         blockstore::Blockstore,
         leader_schedule::{FixedSchedule, LeaderSchedule},
-        leader_schedule_utils,
+        leader_schedule_utils, mcp,
     },
     agave_feature_set as feature_set,
     itertools::Itertools,
@@ -128,22 +128,12 @@ impl LeaderScheduleCache {
 
     /// Returns the ordered proposer list for `slot`.
     pub fn proposers_at_slot(&self, slot: Slot, bank: Option<&Bank>) -> Option<Vec<Pubkey>> {
-        self.mcp_roles_at_slot(
-            slot,
-            bank,
-            McpScheduleKind::Proposer,
-            leader_schedule_utils::MCP_PROPOSERS_PER_SLOT,
-        )
+        self.mcp_roles_at_slot(slot, bank, McpScheduleKind::Proposer, mcp::NUM_PROPOSERS)
     }
 
     /// Returns the ordered relay list for `slot`.
     pub fn relays_at_slot(&self, slot: Slot, bank: Option<&Bank>) -> Option<Vec<Pubkey>> {
-        self.mcp_roles_at_slot(
-            slot,
-            bank,
-            McpScheduleKind::Relay,
-            leader_schedule_utils::MCP_RELAYS_PER_SLOT,
-        )
+        self.mcp_roles_at_slot(slot, bank, McpScheduleKind::Relay, mcp::NUM_RELAYS)
     }
 
     /// Returns all proposer indices owned by `pubkey` for `slot`.
@@ -794,8 +784,8 @@ mod tests {
 
         let proposers = cache.proposers_at_slot(slot, Some(&bank)).unwrap();
         let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
-        assert_eq!(proposers.len(), leader_schedule_utils::MCP_PROPOSERS_PER_SLOT);
-        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
+        assert_eq!(proposers.len(), mcp::NUM_PROPOSERS);
+        assert_eq!(relays.len(), mcp::NUM_RELAYS);
 
         // No-compute path should hit caches populated by the first call.
         assert_eq!(cache.proposers_at_slot(slot, None).unwrap(), proposers);
@@ -832,11 +822,11 @@ mod tests {
 
         assert_eq!(
             proposer_indices,
-            (0..leader_schedule_utils::MCP_PROPOSERS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..mcp::NUM_PROPOSERS as u32).collect::<Vec<_>>()
         );
         assert_eq!(
             relay_indices,
-            (0..leader_schedule_utils::MCP_RELAYS_PER_SLOT as u32).collect::<Vec<_>>()
+            (0..mcp::NUM_RELAYS as u32).collect::<Vec<_>>()
         );
     }
 
@@ -855,7 +845,7 @@ mod tests {
         let relays = cache.relays_at_slot(slot, Some(&bank)).unwrap();
 
         assert!(genesis_config.epoch_schedule.slots_per_epoch < relays.len() as u64);
-        assert_eq!(relays.len(), leader_schedule_utils::MCP_RELAYS_PER_SLOT);
+        assert_eq!(relays.len(), mcp::NUM_RELAYS);
 
         let unique_relays: HashSet<_> = relays.iter().collect();
         assert!(unique_relays.len() <= genesis_config.epoch_schedule.slots_per_epoch as usize);

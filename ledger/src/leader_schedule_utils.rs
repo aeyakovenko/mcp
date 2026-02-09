@@ -3,7 +3,6 @@ use {
         stake_weighted_slot_leaders_domain_separated, IdentityKeyedLeaderSchedule, LeaderSchedule,
         VoteKeyedLeaderSchedule,
     },
-    crate::mcp,
     solana_clock::{Epoch, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -13,8 +12,6 @@ use {
 const MCP_PROPOSER_DOMAIN: &[u8] = b"mcp:proposer";
 const MCP_RELAY_DOMAIN: &[u8] = b"mcp:relay";
 const MCP_SCHEDULE_REPEAT: u64 = 1;
-pub const MCP_PROPOSERS_PER_SLOT: usize = mcp::NUM_PROPOSERS;
-pub const MCP_RELAYS_PER_SLOT: usize = mcp::NUM_RELAYS;
 
 /// Return the leader schedule for the given epoch.
 pub fn leader_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
