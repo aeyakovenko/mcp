@@ -413,7 +413,9 @@ Staged rollout guard:
   - stable tie-break by concatenated position
 
 - Replay execution wiring:
-  - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path when feature active.
+  - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
+    - block-verification execution path
+    - `mcp_protocol_v1` is slot-effective active
   - Phase A calls `Bank::collect_fees_only_for_transactions`.
   - Phase B calls `Bank::load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback`.
 
@@ -424,7 +426,9 @@ Two-phase fee handling (spec §8):
   - required debit:
     - standard tx: `base_fee * NUM_PROPOSERS`
     - nonce tx: `base_fee * NUM_PROPOSERS + nonce_min_rent`
-  - use `Bank::withdraw()` for debit
+  - debit implementation:
+    - standard tx: `Bank::withdraw()`
+    - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
   - drop only failing transaction; continue others
 - Phase B (execution):
   - execute filtered tx list with fee deduction disabled
