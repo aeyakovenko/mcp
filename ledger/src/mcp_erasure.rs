@@ -71,8 +71,8 @@ pub fn recover_data_shards(
     }
 
     let mut rs_shards: Vec<Option<Vec<u8>>> = shards
-        .iter_mut()
-        .map(|shard| shard.take().map(Vec::from))
+        .iter()
+        .map(|shard| shard.as_ref().map(|bytes| bytes.to_vec()))
         .collect();
 
     reed_solomon()?
