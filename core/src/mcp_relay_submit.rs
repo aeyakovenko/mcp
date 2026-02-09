@@ -209,6 +209,13 @@ fn map_ledger_error(err: LedgerRelayAttestationError) -> RelaySubmitError {
             actual,
             max: mcp::NUM_PROPOSERS,
         },
+        LedgerRelayAttestationError::EmptyEntries => RelaySubmitError::EmptyEntries,
+        LedgerRelayAttestationError::RelayIndexOutOfRange(relay_index) => {
+            RelaySubmitError::RelayIndexOutOfRange(relay_index)
+        }
+        LedgerRelayAttestationError::ProposerIndexOutOfRange(proposer_index) => {
+            RelaySubmitError::ProposerIndexOutOfRange(proposer_index)
+        }
         LedgerRelayAttestationError::EntriesNotStrictlySorted => {
             RelaySubmitError::UnsortedOrDuplicateEntries
         }
