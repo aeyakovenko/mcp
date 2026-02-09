@@ -7207,48 +7207,60 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         SocketAddrSpace::Unspecified,
     );
 
-    let leader_pubkey = cluster.entry_point_info.pubkey();
-    let leader_info = cluster
+    let blockstores: Vec<(Pubkey, Blockstore)> = cluster
         .validators
-        .get(leader_pubkey)
-        .expect("entry validator should be present");
-    let blockstore = open_blockstore(&leader_info.info.ledger_path);
+        .iter()
+        .map(|(pubkey, validator_info)| (*pubkey, open_blockstore(&validator_info.info.ledger_path)))
+        .collect();
 
     let deadline = Instant::now() + Duration::from_secs(45);
-    let mut observed_slot = None;
+    let mut observed_artifacts = None;
     while Instant::now() < deadline {
-        let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
-        let min_slot = highest_slot.saturating_sub(64);
-        let candidate_slots: Vec<_> = (min_slot..=highest_slot)
-            .rev()
-            .filter(|slot| slot_has_non_empty_execution_output(&blockstore, *slot))
-            .take(8)
-            .collect();
+        for (validator_pubkey, blockstore) in &blockstores {
+            let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
+            let min_slot = highest_slot.saturating_sub(64);
+            let candidate_slots: Vec<_> = (min_slot..=highest_slot)
+                .rev()
+                .filter(|slot| slot_has_non_empty_execution_output(blockstore, *slot))
+                .take(8)
+                .collect();
 
-        for slot in candidate_slots {
-            if slot_has_relay_attestation(&blockstore, slot)
-                && slot_has_shred_data(&blockstore, slot)
-            {
-                observed_slot = Some(slot);
+            for slot in candidate_slots {
+                if slot_has_relay_attestation(blockstore, slot)
+                    && slot_has_shred_data(blockstore, slot)
+                {
+                    observed_artifacts = Some((*validator_pubkey, slot));
+                    break;
+                }
+            }
+            if observed_artifacts.is_some() {
                 break;
             }
         }
-        if observed_slot.is_some() {
+        if observed_artifacts.is_some() {
             break;
         }
         sleep(Duration::from_millis(500));
     }
 
-    let observed_slot = observed_slot.unwrap_or_else(|| {
-        let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
+    let (validator_pubkey, observed_slot) = observed_artifacts.unwrap_or_else(|| {
+        let highest_slots = blockstores
+            .iter()
+            .map(|(pubkey, blockstore)| {
+                (
+                    *pubkey,
+                    blockstore.highest_slot().unwrap().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
         panic!(
-            "timed out waiting for MCP artifacts in blockstore; highest observed slot {}",
-            highest_slot
+            "timed out waiting for MCP artifacts in blockstore; highest observed slots {:?}",
+            highest_slots,
         );
     });
     info!(
-        "observed MCP shred/attestation/execution artifacts at slot {}",
-        observed_slot
+        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}",
+        observed_slot, validator_pubkey
     );
 }
 
