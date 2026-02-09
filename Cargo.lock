@@ -8619,6 +8619,7 @@ name = "solana-fee"
 version = "3.1.0"
 dependencies = [
  "agave-feature-set",
+ "agave-transaction-view",
  "solana-fee-structure",
  "solana-svm-transaction",
 ]

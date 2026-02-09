@@ -1144,6 +1144,10 @@ pub mod alpenglow_vat_and_limit_validators {
     solana_pubkey::declare_id!("3SJUjJgvYwdH5auT45RXwRnZ5VJVyQCvFU9rFvNpjgsC");
 }
 
+pub mod mcp_protocol_v1 {
+    solana_pubkey::declare_id!("C1wDHYXhWwaiJPeha2hVq3QvrSxMWn96tWiSnX49xhSf");
+}
+
 pub static FEATURE_NAMES: LazyLock<AHashMap<Pubkey, &'static str>> = LazyLock::new(|| {
     [
         (secp256k1_program_enabled::id(), "secp256k1 program"),
