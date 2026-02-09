@@ -64,11 +64,15 @@ pub enum AggregateAttestationError {
     UnknownVersion(u8),
     #[error("too many relay entries: {0}")]
     TooManyRelayEntries(usize),
+    #[error("relay index out of range: {0}")]
+    RelayIndexOutOfRange(u32),
     #[error("too many proposer entries for relay {relay_index}: {entries_len}")]
     TooManyProposerEntries {
         relay_index: u32,
         entries_len: usize,
     },
+    #[error("proposer index out of range: {0}")]
+    ProposerIndexOutOfRange(u32),
     #[error("relay entries must be strictly sorted by relay_index")]
     RelayEntriesNotStrictlySorted,
     #[error("proposer entries must be strictly sorted by proposer_index")]
@@ -95,12 +99,14 @@ impl AggregateAttestation {
 
         relay_entries.sort_unstable_by_key(|entry| entry.relay_index);
         for relay_entry in &mut relay_entries {
+            ensure_relay_index_in_range(relay_entry.relay_index)?;
             if relay_entry.entries.len() > mcp::NUM_PROPOSERS {
                 return Err(AggregateAttestationError::TooManyProposerEntries {
                     relay_index: relay_entry.relay_index,
                     entries_len: relay_entry.entries.len(),
                 });
             }
+            ensure_proposer_indices_in_range(&relay_entry.entries)?;
             relay_entry
                 .entries
                 .sort_unstable_by_key(|entry| entry.proposer_index);
@@ -182,6 +188,7 @@ impl AggregateAttestation {
         let mut relay_entries = Vec::with_capacity(relays_len);
         for _ in 0..relays_len {
             let relay_index = read_u32_le(bytes, &mut cursor)?;
+            ensure_relay_index_in_range(relay_index)?;
             let entries_len = read_u8(bytes, &mut cursor)? as usize;
             if entries_len > mcp::NUM_PROPOSERS {
                 return Err(AggregateAttestationError::TooManyProposerEntries {
@@ -193,6 +200,11 @@ impl AggregateAttestation {
             let mut entries = Vec::with_capacity(entries_len);
             for _ in 0..entries_len {
                 let proposer_index = read_u32_le(bytes, &mut cursor)?;
+                if proposer_index as usize >= mcp::NUM_PROPOSERS {
+                    return Err(AggregateAttestationError::ProposerIndexOutOfRange(
+                        proposer_index,
+                    ));
+                }
                 let commitment =
                     Hash::new_from_array(read_array::<HASH_BYTES>(bytes, &mut cursor)?);
                 let proposer_signature =
@@ -304,12 +316,14 @@ impl AggregateAttestation {
         }
         ensure_relay_entries_strictly_sorted(&self.relay_entries)?;
         for relay_entry in &self.relay_entries {
+            ensure_relay_index_in_range(relay_entry.relay_index)?;
             if relay_entry.entries.len() > mcp::NUM_PROPOSERS {
                 return Err(AggregateAttestationError::TooManyProposerEntries {
                     relay_index: relay_entry.relay_index,
                     entries_len: relay_entry.entries.len(),
                 });
             }
+            ensure_proposer_indices_in_range(&relay_entry.entries)?;
             ensure_proposer_entries_strictly_sorted(&relay_entry.entries)?;
         }
         Ok(())
@@ -345,12 +359,14 @@ fn relay_signing_bytes(
     relay_index: u32,
     entries: &[AggregateProposerEntry],
 ) -> Result<Vec<u8>, AggregateAttestationError> {
+    ensure_relay_index_in_range(relay_index)?;
     if entries.len() > mcp::NUM_PROPOSERS {
         return Err(AggregateAttestationError::TooManyProposerEntries {
             relay_index,
             entries_len: entries.len(),
         });
     }
+    ensure_proposer_indices_in_range(entries)?;
     let mut out = Vec::with_capacity(1 + 8 + 4 + 1 + entries.len() * PROPOSER_ENTRY_LEN);
     out.push(version);
     out.extend_from_slice(&slot.to_le_bytes());
@@ -370,12 +386,14 @@ fn append_relay_entry_bytes(
     entries: &[AggregateProposerEntry],
     relay_signature: &Signature,
 ) -> Result<(), AggregateAttestationError> {
+    ensure_relay_index_in_range(relay_index)?;
     if entries.len() > mcp::NUM_PROPOSERS {
         return Err(AggregateAttestationError::TooManyProposerEntries {
             relay_index,
             entries_len: entries.len(),
         });
     }
+    ensure_proposer_indices_in_range(entries)?;
     out.extend_from_slice(&relay_index.to_le_bytes());
     out.push(
         entries
@@ -416,6 +434,26 @@ fn ensure_proposer_entries_strictly_sorted(
     Err(AggregateAttestationError::ProposerEntriesNotStrictlySorted)
 }
 
+fn ensure_relay_index_in_range(relay_index: u32) -> Result<(), AggregateAttestationError> {
+    if relay_index as usize >= mcp::NUM_RELAYS {
+        return Err(AggregateAttestationError::RelayIndexOutOfRange(relay_index));
+    }
+    Ok(())
+}
+
+fn ensure_proposer_indices_in_range(
+    entries: &[AggregateProposerEntry],
+) -> Result<(), AggregateAttestationError> {
+    for entry in entries {
+        if entry.proposer_index as usize >= mcp::NUM_PROPOSERS {
+            return Err(AggregateAttestationError::ProposerIndexOutOfRange(
+                entry.proposer_index,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn collect_equivocating_proposers(relay_entries: &[FilteredRelayEntry]) -> BTreeSet<u32> {
     let mut proposer_commitments = BTreeMap::new();
     let mut equivocating_proposers = BTreeSet::new();
@@ -436,11 +474,14 @@ fn collect_equivocating_proposers(relay_entries: &[FilteredRelayEntry]) -> BTree
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, AggregateAttestationError> {
-    if *cursor + 1 > bytes.len() {
+    let Some(end) = cursor.checked_add(1) else {
+        return Err(AggregateAttestationError::Truncated);
+    };
+    if end > bytes.len() {
         return Err(AggregateAttestationError::Truncated);
     }
     let value = bytes[*cursor];
-    *cursor += 1;
+    *cursor = end;
     Ok(value)
 }
 
@@ -460,12 +501,15 @@ fn read_array<const N: usize>(
     bytes: &[u8],
     cursor: &mut usize,
 ) -> Result<[u8; N], AggregateAttestationError> {
-    if *cursor + N > bytes.len() {
+    let Some(end) = cursor.checked_add(N) else {
+        return Err(AggregateAttestationError::Truncated);
+    };
+    if end > bytes.len() {
         return Err(AggregateAttestationError::Truncated);
     }
     let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[*cursor..*cursor + N]);
-    *cursor += N;
+    out.copy_from_slice(&bytes[*cursor..end]);
+    *cursor = end;
     Ok(out)
 }
 
@@ -793,5 +837,38 @@ mod tests {
     #[test]
     fn test_max_wire_fits_quic_control_payload_bound() {
         assert!(MAX_AGGREGATE_WIRE_BYTES <= MAX_QUIC_CONTROL_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn test_new_canonical_rejects_out_of_range_relay_index() {
+        let relay = AggregateRelayEntry {
+            relay_index: mcp::NUM_RELAYS as u32,
+            entries: vec![],
+            relay_signature: Signature::default(),
+        };
+        assert_eq!(
+            AggregateAttestation::new_canonical(1, 0, vec![relay]).unwrap_err(),
+            AggregateAttestationError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
+        );
+    }
+
+    #[test]
+    fn test_from_wire_rejects_out_of_range_proposer_index() {
+        let mut bytes = Vec::new();
+        bytes.push(AGGREGATE_ATTESTATION_V1);
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // slot
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // leader_index
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // relay_entries_len
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // relay_index
+        bytes.push(1); // proposer entries len
+        bytes.extend_from_slice(&(mcp::NUM_PROPOSERS as u32).to_le_bytes()); // proposer_index
+        bytes.extend_from_slice(Hash::new_unique().as_ref());
+        bytes.extend_from_slice(Signature::default().as_ref());
+        bytes.extend_from_slice(Signature::default().as_ref());
+
+        assert_eq!(
+            AggregateAttestation::from_wire_bytes(&bytes).unwrap_err(),
+            AggregateAttestationError::ProposerIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
+        );
     }
 }
