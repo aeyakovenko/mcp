@@ -282,29 +282,19 @@ Non-reusable for MCP wire correctness:
 
 ## Pass 5 — Proposer Pipeline + Forwarding
 
-**Goal:** proposer nodes build MCP shred sets from verified transactions; non-proposers forward txs to proposers.
+**Goal:** proposer nodes build MCP shred sets from produced entry batches using existing broadcast flow; non-proposers forward txs to proposers.
 
-### 5.1 Sigverify clone path and Vortexor parity
+### 5.1 Proposer dispatch in broadcast run
 
-- `core/src/ed25519_sigverifier.rs`:
-  - add optional MCP proposer sender clone.
-- `core/src/vortexor_receiver_adapter.rs`:
-  - add same clone behavior, or hard-disable MCP when Vortexor is enabled.
+- `turbine/src/broadcast_stage/standard_broadcast_run.rs`:
+  - use existing broadcast entry-batch flow (no new TPU stage/worker).
+  - collect per-slot transaction wire bytes and enforce `MAX_PROPOSER_PAYLOAD` with framing overhead.
+  - on slot completion, encode MCP shreds and dispatch to relay schedule over existing QUIC endpoint sender.
+  - proposer activation: local pubkey must appear in `proposer_indices_at_slot`.
+  - duplicate proposer indices are valid and dispatch once per owned index.
 
-### 5.2 TPU proposer worker
+### 5.2 Bankless recording guardrails
 
-- `core/src/tpu.rs`:
-  - create MCP proposer receiver and worker when feature active.
-  - derive current slot from `tick_height()/ticks_per_slot()` (no `PohRecorder::slot()`).
-  - proposer activation: node is proposer for current slot if own pubkey appears in proposer indices.
-- Worker steps:
-  1. drain verified tx packets from MCP channel.
-  2. parse ordering key using dual-format rules from resolved `B1` and descending-fee policy from `B2`.
-  3. enforce per-proposer admission control with `CostModel` + local `CostTracker` budgets for CU and loaded account data (spec §3.2 resource partitioning).
-  4. order transactions deterministically.
-  5. serialize payload and enforce `MAX_PROPOSER_PAYLOAD`; emit latest §7.1 format where available, otherwise legacy bytes.
-  6. call ledger MCP encode helper -> 200 shreds + witnesses.
-  7. send shred `i` to relay index `i` address.
 - Bankless recording guardrails:
   - record path is explicit opt-in from replay-stage call sites
   - reject if a working bank is installed
@@ -327,8 +317,7 @@ Non-reusable for MCP wire correctness:
 
 ### 5.5 Tests
 
-- MCP clone path in normal sigverify and Vortexor modes.
-- Proposer worker emits exactly one shred per relay index.
+- MCP dispatch removes completed slot state and emits one shred per relay index per owned proposer index.
 - Payload bound enforcement.
 - Forwarding routes to proposer addresses in MCP mode for both forwarding clients.
 
@@ -338,18 +327,14 @@ Non-reusable for MCP wire correctness:
 
 **Goal:** aggregate relay attestations and distribute leader-signed `ConsensusBlock`.
 
-### 6.1 Replay receivers
+### 6.1 Control-path ingestion in window service
 
-- `core/src/replay_stage.rs`:
-  - extend `ReplayReceivers` with MCP attestation and consensus-block channels.
-  - keep replay-loop diff minimal by delegating MCP logic to helper module.
-
-### 6.2 MCP replay helper
-
-- Add `core/src/mcp_replay.rs`:
-  - drain and validate relay attestations.
-  - maintain per-slot aggregate state.
-  - expose entrypoints called by replay loop.
+- `core/src/shred_fetch_stage.rs`:
+  - classify MCP control frames (`0x01` relay attestation, `0x02` consensus block) and forward to TVU control channel.
+- `core/src/window_service.rs`:
+  - ingest and validate control frames with slot-effective feature gating.
+  - store validated relay attestations in MCP CF.
+  - store validated consensus blocks in shared in-memory slot map for replay consumption.
 
 Validation rules:
 - invalid relay signature => drop relay message
@@ -359,27 +344,34 @@ Validation rules:
 - threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation and retain at least one valid proposer entry after proposer filtering
 - relay entries that become empty after proposer-signature filtering are dropped and MUST NOT count toward attestation thresholds
 
-### 6.3 Leader finalization
+### 6.2 Leader finalization
 
-When this node is leader for slot `s` at aggregation deadline:
+When this node is leader for slot `s` and attestation quorum is present:
 1. filter invalid entries as above
-2. if valid relay entries < `REQUIRED_ATTESTATIONS` -> submit empty result
+2. if valid relay entries < `REQUIRED_ATTESTATIONS` -> do not finalize/broadcast a consensus block
 3. build `AggregateAttestation`
 4. construct/sign `ConsensusBlock` with:
    - `consensus_meta` and authoritative `block_id` from Alpenglow consensus (`B3`)
    - `delayed_bankhash` for the consensus-defined delayed slot; if unavailable locally, defer finalization and do not submit yet
 
-### 6.4 Distribution
+Implementation point:
+- `core/src/window_service.rs::maybe_finalize_and_broadcast_mcp_consensus_block`
 
-- Leader broadcasts `ConsensusBlock` directly to validators over MCP QUIC.
-- Optional pull-recovery protocol is deferred unless required by loss testing.
+### 6.3 Distribution
+
+- Leader broadcasts `ConsensusBlock` (`0x02` control frame) to TVU QUIC peers using existing turbine QUIC endpoint sender.
+
+### 6.4 Replay consumption
+
+- `core/src/replay_stage.rs` + `core/src/mcp_replay.rs`:
+  - refresh per-slot `VoteGateInput` from validated consensus-block bytes before MCP vote-gate evaluation.
 
 ### 6.5 Tests
 
 - threshold behavior (`< REQUIRED_ATTESTATIONS` => empty)
 - relay/proposer filtering semantics
 - canonical aggregate ordering
-- direct QUIC block distribution
+- direct QUIC block distribution + frame typing
 
 ---
 
