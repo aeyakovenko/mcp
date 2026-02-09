@@ -429,6 +429,7 @@ impl Tvu {
                 duplicate_slots_sender.clone(),
                 repair_service_channels,
                 block_id_repair_channels,
+                Some(mcp_relay_attestation_sender.clone()),
                 Some(mcp_relay_attestation_receiver),
                 Some(turbine_quic_endpoint_sender.clone()),
             );
