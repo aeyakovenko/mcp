@@ -1160,6 +1160,7 @@ mod test {
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         solana_time_utils::timestamp,
+        tokio::sync::mpsc,
     };
 
     fn local_entries_to_shred(
@@ -1498,6 +1499,108 @@ mod test {
         );
 
         assert!(consensus_blocks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_maybe_finalize_consensus_block_broadcasts_quic_control_frame() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Arc::new(Keypair::new());
+        let mut genesis =
+            create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+
+        let delayed_bank = Bank::new_from_parent(
+            root_bank.clone(),
+            &Pubkey::new_unique(),
+            slot.saturating_sub(1),
+        );
+        bank_forks.write().unwrap().insert(delayed_bank);
+
+        let proposer_schedule = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .expect("MCP proposer schedule missing");
+        let proposer_index = proposer_schedule
+            .iter()
+            .position(|pubkey| *pubkey == leader.pubkey())
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("leader should appear in MCP proposer schedule");
+        let relay_schedule = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .expect("MCP relay schedule missing");
+
+        let commitment = [23u8; 32];
+        let proposer_signature = leader.sign_message(&commitment);
+        let relay_indices: Vec<u32> = relay_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(relay_index, pubkey)| {
+                if *pubkey == leader.pubkey() {
+                    u32::try_from(relay_index).ok()
+                } else {
+                    None
+                }
+            })
+            .take(mcp::REQUIRED_ATTESTATIONS)
+            .collect();
+        assert_eq!(relay_indices.len(), mcp::REQUIRED_ATTESTATIONS);
+
+        for relay_index in relay_indices {
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries: vec![RelayAttestationEntry {
+                    proposer_index,
+                    commitment,
+                    proposer_signature,
+                }],
+                relay_signature: Signature::default(),
+            };
+            let signing_bytes = attestation.signing_bytes().unwrap();
+            attestation.relay_signature = leader.sign_message(&signing_bytes);
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation.to_bytes().unwrap())
+                .unwrap();
+        }
+
+        let local_contact_info = ContactInfo::new_localhost(&leader.pubkey(), timestamp());
+        let cluster_info = ClusterInfo::new(
+            local_contact_info,
+            leader.clone(),
+            SocketAddrSpace::Unspecified,
+        );
+        let peer_pubkey = Pubkey::new_unique();
+        let peer_contact_info = ContactInfo::new_localhost(&peer_pubkey, timestamp());
+        let expected_peer_tvu_quic = peer_contact_info.tvu(Protocol::QUIC).unwrap();
+        cluster_info.insert_info(peer_contact_info);
+
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let (sender, mut receiver) = mpsc::channel(8);
+        maybe_finalize_and_broadcast_mcp_consensus_block(
+            slot,
+            &leader.pubkey(),
+            &cluster_info,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            Some(&sender),
+        );
+
+        let (remote_addr, frame) = receiver.try_recv().unwrap();
+        assert_eq!(remote_addr, expected_peer_tvu_quic);
+        assert_eq!(frame.first().copied(), Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK));
+        let broadcast_block = ConsensusBlock::from_wire_bytes(&frame[1..]).unwrap();
+        assert_eq!(broadcast_block.slot, slot);
     }
 
     #[test]
