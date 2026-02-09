@@ -117,4 +117,16 @@ mod tests {
     fn test_threshold_count_guard_zero_denominator() {
         assert_eq!(ceil_threshold_count(3, 0, 200), 0);
     }
+
+    #[test]
+    fn test_ceil_log2_edge_cases() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+    }
+
+    #[test]
+    fn test_threshold_count_handles_ratio_above_one() {
+        assert_eq!(ceil_threshold_count(6, 5, 200), 240);
+    }
 }
