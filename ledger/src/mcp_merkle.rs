@@ -129,6 +129,79 @@ pub fn witness_for_leaf<const SHRED_DATA_BYTES: usize>(
     Ok((levels.last().unwrap()[0], witness))
 }
 
+pub fn commitment_and_witnesses<const SHRED_DATA_BYTES: usize, const WITNESS_LEN: usize>(
+    slot: u64,
+    proposer_index: u32,
+    shreds: &[[u8; SHRED_DATA_BYTES]],
+) -> Result<([u8; 32], Vec<[[u8; 32]; WITNESS_LEN]>), McpMerkleError> {
+    let levels = build_levels(slot, proposer_index, shreds)?;
+    let expected_witness_len = levels.len().saturating_sub(1);
+    if expected_witness_len != WITNESS_LEN {
+        return Err(McpMerkleError::InvalidWitnessLength {
+            expected: expected_witness_len,
+            actual: WITNESS_LEN,
+        });
+    }
+
+    let num_leaves = levels.first().map(Vec::len).unwrap_or(0);
+    let mut witnesses = Vec::with_capacity(num_leaves);
+    for leaf_index in 0..num_leaves {
+        let mut witness = [[0u8; 32]; WITNESS_LEN];
+        let mut index = leaf_index;
+        for (depth, level) in levels.iter().take(WITNESS_LEN).enumerate() {
+            let sibling_index = index ^ 1;
+            witness[depth] = level.get(sibling_index).copied().unwrap_or(level[index]);
+            index >>= 1;
+        }
+        witnesses.push(witness);
+    }
+
+    Ok((levels.last().unwrap()[0], witnesses))
+}
+
+fn build_levels<const SHRED_DATA_BYTES: usize>(
+    slot: u64,
+    proposer_index: u32,
+    shreds: &[[u8; SHRED_DATA_BYTES]],
+) -> Result<Vec<Vec<[u8; 32]>>, McpMerkleError> {
+    if shreds.is_empty() {
+        return Err(McpMerkleError::EmptyShredSet);
+    }
+    if shreds.len() > u32::MAX as usize {
+        return Err(McpMerkleError::TooManyShreds(shreds.len()));
+    }
+
+    let mut levels = vec![shreds
+        .iter()
+        .enumerate()
+        .map(|(shred_index, shred_data)| {
+            let shred_index =
+                u32::try_from(shred_index).map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
+            Ok(hashv(&[
+                &LEAF_DOMAIN,
+                &slot.to_le_bytes(),
+                &proposer_index.to_le_bytes(),
+                &shred_index.to_le_bytes(),
+                shred_data,
+            ])
+            .to_bytes())
+        })
+        .collect::<Result<Vec<_>, McpMerkleError>>()?];
+
+    while levels.last().unwrap().len() > 1 {
+        let prev = levels.last().unwrap();
+        let mut next = Vec::with_capacity(prev.len().div_ceil(2));
+        for pair in prev.chunks(2) {
+            let left = pair[0];
+            let right = pair.get(1).copied().unwrap_or(left);
+            next.push(hashv(&[&NODE_DOMAIN, &left, &right]).to_bytes());
+        }
+        levels.push(next);
+    }
+
+    Ok(levels)
+}
+
 pub fn verify_witness<const SHRED_DATA_BYTES: usize>(
     slot: u64,
     proposer_index: u32,
@@ -237,5 +310,16 @@ mod tests {
                 num_leaves: shreds.len(),
             }
         );
+    }
+
+    #[test]
+    fn test_commitment_and_witnesses_matches_single_witness_generation() {
+        let shreds = vec![[9u8; 4], [8u8; 4], [7u8; 4], [6u8; 4]];
+        let (root, witnesses) = commitment_and_witnesses::<4, 2>(5, 1, &shreds).unwrap();
+        assert_eq!(witnesses.len(), shreds.len());
+
+        let (single_root, single_witness) = witness_for_leaf(5, 1, &shreds, 2).unwrap();
+        assert_eq!(root, single_root);
+        assert_eq!(witnesses[2].as_slice(), single_witness.as_slice());
     }
 }
