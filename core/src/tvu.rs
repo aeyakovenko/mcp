@@ -238,6 +238,7 @@ impl Tvu {
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let (bls_packet_sender, bls_packet_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
+        let (mcp_control_message_sender, mcp_control_message_receiver) = unbounded();
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);
@@ -246,6 +247,7 @@ impl Tvu {
         let fetch_stage = ShredFetchStage::new(
             fetch_sockets,
             turbine_quic_endpoint_receiver,
+            Some(mcp_control_message_sender),
             repair_response_quic_receiver,
             repair_socket.clone(),
             fetch_sender,
@@ -332,6 +334,7 @@ impl Tvu {
         let (dumped_slots_sender, dumped_slots_receiver) = unbounded();
         let (popular_pruned_forks_sender, popular_pruned_forks_receiver) = unbounded();
         let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) = unbounded();
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
         let window_service = {
             let epoch_schedule = bank_forks
                 .read()
@@ -367,6 +370,8 @@ impl Tvu {
                 repair_service_channels,
                 Some(mcp_relay_attestation_sender.clone()),
                 Some(mcp_relay_attestation_receiver),
+                Some(mcp_control_message_receiver),
+                Some(mcp_consensus_blocks.clone()),
                 Some(turbine_quic_endpoint_sender.clone()),
             );
             WindowService::new(
@@ -464,6 +469,7 @@ impl Tvu {
             consensus_metrics_sender: consensus_metrics_sender.clone(),
             consensus_metrics_receiver,
             migration_status,
+            mcp_consensus_blocks: mcp_consensus_blocks.clone(),
             mcp_vote_gate_inputs: Arc::new(RwLock::new(HashMap::new())),
             mcp_vote_gate_included_proposers: Arc::new(RwLock::new(HashMap::new())),
             reward_votes_receiver,

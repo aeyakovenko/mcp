@@ -7,8 +7,10 @@ use {
         completed_data_sets_service::CompletedDataSetsSender,
         mcp_relay::{McpRelayOutcome, McpRelayProcessor, McpShredMessage},
         mcp_relay_submit::{
-            dispatch_relay_attestation_to_slot_leader, RelayAttestationEntry, RelayAttestationV1,
+            decode_relay_attestation_frame, dispatch_relay_attestation_to_slot_leader,
+            RelayAttestationEntry, RelayAttestationV1, MCP_CONTROL_MSG_RELAY_ATTESTATION,
         },
+        mcp_replay::McpConsensusBlockStore,
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
@@ -27,6 +29,7 @@ use {
         },
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp_consensus_block::ConsensusBlock,
         shred::{self, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
@@ -56,6 +59,22 @@ use {
 
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
+const MCP_CONTROL_MSG_CONSENSUS_BLOCK: u8 = 0x02;
+const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
+
+fn relay_indices_for_pubkey(relays: &[Pubkey], local_pubkey: &Pubkey) -> Vec<u32> {
+    relays
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pubkey)| {
+            if pubkey == local_pubkey {
+                u32::try_from(index).ok()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 #[derive(Default)]
 struct WindowServiceMetrics {
@@ -336,30 +355,62 @@ where
 
     if let Some(attestation_sender) = mcp_relay_attestation_sender {
         for (slot, entries_by_proposer) in attestation_entries_by_slot {
-            let relay_index = leader_schedule_cache
+            let relay_indices = leader_schedule_cache
                 .relays_at_slot(slot, Some(&root_bank))
                 .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
-                .and_then(|relays| relays.iter().position(|pubkey| pubkey == _local_pubkey))
-                .and_then(|index| u32::try_from(index).ok());
-            let Some(relay_index) = relay_index else {
+                .map(|relays| relay_indices_for_pubkey(&relays, _local_pubkey))
+                .unwrap_or_default();
+            if relay_indices.is_empty() {
                 continue;
-            };
+            }
 
-            let mut attestation = RelayAttestationV1 {
-                slot,
-                relay_index,
-                entries: entries_by_proposer.into_values().collect(),
-                relay_signature: Signature::default(),
-            };
-            let Ok(signing_bytes) = attestation.signing_bytes() else {
+            let entries: Vec<RelayAttestationEntry> = entries_by_proposer.into_values().collect();
+            if entries.is_empty() {
                 continue;
-            };
-            attestation.relay_signature = relay_signer.sign_message(&signing_bytes);
-            if let Err(err) = attestation_sender.send(attestation) {
-                debug!(
-                    "failed to enqueue MCP relay attestation for slot {}: {}",
-                    slot, err
-                );
+            }
+
+            for relay_index in relay_indices {
+                let mut attestation = RelayAttestationV1 {
+                    slot,
+                    relay_index,
+                    entries: entries.clone(),
+                    relay_signature: Signature::default(),
+                };
+                let Ok(signing_bytes) = attestation.signing_bytes() else {
+                    continue;
+                };
+                attestation.relay_signature = relay_signer.sign_message(&signing_bytes);
+
+                // Record locally generated attestation as soon as it is finalized.
+                if let Ok(attestation_bytes) = attestation.to_bytes() {
+                    match blockstore.put_mcp_relay_attestation(
+                        slot,
+                        relay_index,
+                        &attestation_bytes,
+                    ) {
+                        Ok(McpPutStatus::Conflict(marker)) => {
+                            warn!(
+                                "local MCP relay attestation conflict at ({slot}, {relay_index}); \
+                             existing={}, incoming={}",
+                                marker.existing_hash, marker.incoming_hash,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            debug!(
+                                "failed to store local MCP relay attestation for slot {} relay {}: {}",
+                                slot, relay_index, err
+                            );
+                        }
+                    }
+                }
+
+                if let Err(err) = attestation_sender.send(attestation) {
+                    debug!(
+                        "failed to enqueue MCP relay attestation for slot {}: {}",
+                        slot, err
+                    );
+                }
             }
         }
     }
@@ -404,6 +455,156 @@ where
     Ok(())
 }
 
+fn ingest_mcp_control_message(
+    sender_pubkey: Pubkey,
+    remote_address: SocketAddr,
+    frame: &[u8],
+    blockstore: &Blockstore,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
+) {
+    let Some(message_type) = frame.first().copied() else {
+        return;
+    };
+
+    match message_type {
+        MCP_CONTROL_MSG_RELAY_ATTESTATION => {
+            let Ok(payload) = decode_relay_attestation_frame(frame) else {
+                return;
+            };
+            let Ok(mut attestation) = RelayAttestationV1::from_bytes(payload) else {
+                return;
+            };
+
+            let root_bank = bank_forks.read().unwrap().root_bank();
+            if !cluster_nodes::check_feature_activation(
+                &feature_set::mcp_protocol_v1::id(),
+                attestation.slot,
+                &root_bank,
+            ) {
+                return;
+            }
+
+            let relay_pubkey = leader_schedule_cache
+                .relays_at_slot(attestation.slot, Some(&root_bank))
+                .or_else(|| leader_schedule_cache.relays_at_slot(attestation.slot, None))
+                .and_then(|relays| relays.get(attestation.relay_index as usize).copied());
+            let Some(relay_pubkey) = relay_pubkey else {
+                return;
+            };
+            if sender_pubkey != relay_pubkey {
+                debug!(
+                    "dropping MCP relay attestation for slot {} relay {} from {} (claimed {}, expected {})",
+                    attestation.slot,
+                    attestation.relay_index,
+                    remote_address,
+                    sender_pubkey,
+                    relay_pubkey,
+                );
+                return;
+            }
+            if !attestation.verify_relay_signature(&relay_pubkey) {
+                return;
+            }
+
+            let proposer_pubkeys = leader_schedule_cache
+                .proposers_at_slot(attestation.slot, Some(&root_bank))
+                .or_else(|| leader_schedule_cache.proposers_at_slot(attestation.slot, None))
+                .unwrap_or_default();
+            let filtered_entries = attestation.valid_entries(|proposer_index| {
+                proposer_pubkeys.get(proposer_index as usize).copied()
+            });
+            if filtered_entries.is_empty() {
+                return;
+            }
+            attestation.entries = filtered_entries;
+            let Ok(attestation_bytes) = attestation.to_bytes() else {
+                return;
+            };
+
+            match blockstore.put_mcp_relay_attestation(
+                attestation.slot,
+                attestation.relay_index,
+                &attestation_bytes,
+            ) {
+                Ok(McpPutStatus::Conflict(marker)) => {
+                    warn!(
+                        "MCP relay attestation conflict at ({}, {}); existing={}, incoming={}",
+                        attestation.slot,
+                        attestation.relay_index,
+                        marker.existing_hash,
+                        marker.incoming_hash,
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    debug!(
+                        "failed to store MCP relay attestation for slot {} relay {}: {}",
+                        attestation.slot, attestation.relay_index, err
+                    );
+                }
+            }
+        }
+        MCP_CONTROL_MSG_CONSENSUS_BLOCK => {
+            let payload = &frame[1..];
+            let Ok(consensus_block) = ConsensusBlock::from_wire_bytes(payload) else {
+                return;
+            };
+
+            let root_bank = bank_forks.read().unwrap().root_bank();
+            if !cluster_nodes::check_feature_activation(
+                &feature_set::mcp_protocol_v1::id(),
+                consensus_block.slot,
+                &root_bank,
+            ) {
+                return;
+            }
+
+            let leader_pubkey = leader_schedule_cache
+                .proposers_at_slot(consensus_block.slot, Some(&root_bank))
+                .or_else(|| leader_schedule_cache.proposers_at_slot(consensus_block.slot, None))
+                .and_then(|proposers| {
+                    proposers
+                        .get(consensus_block.leader_index as usize)
+                        .copied()
+                });
+            let Some(leader_pubkey) = leader_pubkey else {
+                return;
+            };
+            if sender_pubkey != leader_pubkey {
+                debug!(
+                    "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
+                    consensus_block.slot, remote_address, sender_pubkey, leader_pubkey
+                );
+                return;
+            }
+            if !consensus_block.verify_leader_signature(&leader_pubkey) {
+                return;
+            }
+
+            if let Some(consensus_blocks) = mcp_consensus_blocks {
+                let root_slot = root_bank.slot();
+                if let Ok(mut consensus_blocks) = consensus_blocks.write() {
+                    let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+                    consensus_blocks.retain(|slot, _| *slot >= min_slot);
+                    if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
+                        if existing != payload {
+                            warn!(
+                                "MCP consensus block conflict at slot {} (keeping first valid block)",
+                                consensus_block.slot
+                            );
+                        }
+                    } else {
+                        consensus_blocks.insert(consensus_block.slot, payload.to_vec());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct WindowServiceChannels {
     pub verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     pub retransmit_sender: EvictingSender<Vec<shred::Payload>>,
@@ -412,6 +613,8 @@ pub struct WindowServiceChannels {
     pub repair_service_channels: RepairServiceChannels,
     pub mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
     pub mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+    pub mcp_control_message_receiver: Option<Receiver<(Pubkey, SocketAddr, Bytes)>>,
+    pub mcp_consensus_blocks: Option<McpConsensusBlockStore>,
     pub turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
 }
 
@@ -424,6 +627,8 @@ impl WindowServiceChannels {
         repair_service_channels: RepairServiceChannels,
         mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
         mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+        mcp_control_message_receiver: Option<Receiver<(Pubkey, SocketAddr, Bytes)>>,
+        mcp_consensus_blocks: Option<McpConsensusBlockStore>,
         turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> Self {
         Self {
@@ -434,6 +639,8 @@ impl WindowServiceChannels {
             repair_service_channels,
             mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
+            mcp_control_message_receiver,
+            mcp_consensus_blocks,
             turbine_quic_endpoint_sender,
         }
     }
@@ -473,6 +680,8 @@ impl WindowService {
             repair_service_channels,
             mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
+            mcp_control_message_receiver,
+            mcp_consensus_blocks,
             turbine_quic_endpoint_sender,
         } = window_service_channels;
 
@@ -513,6 +722,8 @@ impl WindowService {
             accept_repairs_only,
             mcp_relay_attestation_sender,
             mcp_relay_attestation_receiver,
+            mcp_control_message_receiver,
+            mcp_consensus_blocks,
             turbine_quic_endpoint_sender,
         );
 
@@ -570,6 +781,8 @@ impl WindowService {
         accept_repairs_only: bool,
         mcp_relay_attestation_sender: Option<Sender<RelayAttestationV1>>,
         mcp_relay_attestation_receiver: Option<Receiver<RelayAttestationV1>>,
+        mcp_control_message_receiver: Option<Receiver<(Pubkey, SocketAddr, Bytes)>>,
+        mcp_consensus_blocks: Option<McpConsensusBlockStore>,
         turbine_quic_endpoint_sender: Option<AsyncSender<(SocketAddr, Bytes)>>,
     ) -> JoinHandle<()> {
         let handle_error = || {
@@ -618,6 +831,19 @@ impl WindowService {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
                             break;
+                        }
+                    }
+                    if let Some(receiver) = mcp_control_message_receiver.as_ref() {
+                        for (sender_pubkey, remote_address, frame) in receiver.try_iter() {
+                            ingest_mcp_control_message(
+                                sender_pubkey,
+                                remote_address,
+                                &frame,
+                                &blockstore,
+                                &bank_forks,
+                                &leader_schedule_cache,
+                                mcp_consensus_blocks.as_ref(),
+                            );
                         }
                     }
                     if let (Some(receiver), Some(quic_sender)) = (
@@ -716,6 +942,19 @@ mod test {
             &mut ProcessShredsStats::default(),
         );
         data_shreds
+    }
+
+    #[test]
+    fn test_relay_indices_for_pubkey_returns_all_positions() {
+        let local = Pubkey::new_unique();
+        let relays = vec![
+            Pubkey::new_unique(),
+            local,
+            Pubkey::new_unique(),
+            local,
+            local,
+        ];
+        assert_eq!(relay_indices_for_pubkey(&relays, &local), vec![1, 3, 4]);
     }
 
     #[test]

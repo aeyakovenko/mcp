@@ -109,6 +109,8 @@ use {
     solana_measure::{measure::Measure, measure_time, measure_us},
     solana_message::{inner_instruction::InnerInstructions, AccountKeys, SanitizedMessage},
     solana_native_token::LAMPORTS_PER_SOL,
+    solana_nonce as nonce,
+    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_packet::PACKET_DATA_SIZE,
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
@@ -188,8 +190,6 @@ use {
     solana_accounts_db::accounts_db::{
         ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, ACCOUNTS_DB_CONFIG_FOR_TESTING,
     },
-    solana_nonce as nonce,
-    solana_nonce_account::{get_system_account_kind, SystemAccountKind},
     solana_program_runtime::{loaded_programs::ProgramCacheForTxBatch, sysvar_cache::SysvarCache},
 };
 pub use {partitioned_epoch_rewards::KeyedRewardsAndNumPartitions, solana_reward_info::RewardType};
@@ -3513,10 +3513,7 @@ impl Bank {
                 continue;
             };
             let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
-            let mut fee = match fee_details
-                .total_fee()
-                .checked_mul(MCP_NUM_PROPOSERS)
-            {
+            let mut fee = match fee_details.total_fee().checked_mul(MCP_NUM_PROPOSERS) {
                 Some(fee) => fee,
                 None => {
                     *fee_result = Err(TransactionError::InsufficientFundsForFee);
@@ -3546,6 +3543,47 @@ impl Bank {
         }
 
         fee_results
+    }
+
+    fn withdraw(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
+        match self.get_account_with_fixed_root(pubkey) {
+            Some(mut account) => {
+                let min_balance = match get_system_account_kind(&account) {
+                    Some(SystemAccountKind::Nonce) => self
+                        .rent_collector
+                        .rent
+                        .minimum_balance(nonce::state::State::size()),
+                    _ => 0,
+                };
+
+                lamports
+                    .checked_add(min_balance)
+                    .filter(|required_balance| *required_balance <= account.lamports())
+                    .ok_or(TransactionError::InsufficientFundsForFee)?;
+                account
+                    .checked_sub_lamports(lamports)
+                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+                self.store_account(pubkey, &account);
+
+                Ok(())
+            }
+            None => Err(TransactionError::AccountNotFound),
+        }
+    }
+
+    fn withdraw_for_mcp_phase_a_nonce(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
+        match self.get_account_with_fixed_root(pubkey) {
+            Some(mut account) => {
+                // Phase-A nonce charging already includes the nonce rent floor in `lamports`.
+                // Avoid re-applying the nonce reserve check from `withdraw()`.
+                account
+                    .checked_sub_lamports(lamports)
+                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
+                self.store_account(pubkey, &account);
+                Ok(())
+            }
+            None => Err(TransactionError::AccountNotFound),
+        }
     }
 
     /// MCP second-pass helper: execute transactions without fee re-deduction.
@@ -6198,47 +6236,6 @@ impl Bank {
             &mut ExecuteTimings::default(), // Called by ledger-tool, metrics not accumulated.
             reload,
         )
-    }
-
-    pub fn withdraw(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
-        match self.get_account_with_fixed_root(pubkey) {
-            Some(mut account) => {
-                let min_balance = match get_system_account_kind(&account) {
-                    Some(SystemAccountKind::Nonce) => self
-                        .rent_collector
-                        .rent
-                        .minimum_balance(nonce::state::State::size()),
-                    _ => 0,
-                };
-
-                lamports
-                    .checked_add(min_balance)
-                    .filter(|required_balance| *required_balance <= account.lamports())
-                    .ok_or(TransactionError::InsufficientFundsForFee)?;
-                account
-                    .checked_sub_lamports(lamports)
-                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
-                self.store_account(pubkey, &account);
-
-                Ok(())
-            }
-            None => Err(TransactionError::AccountNotFound),
-        }
-    }
-
-    fn withdraw_for_mcp_phase_a_nonce(&self, pubkey: &Pubkey, lamports: u64) -> Result<()> {
-        match self.get_account_with_fixed_root(pubkey) {
-            Some(mut account) => {
-                // Phase-A nonce charging already includes the nonce rent floor in `lamports`.
-                // Avoid re-applying the nonce reserve check from `withdraw()`.
-                account
-                    .checked_sub_lamports(lamports)
-                    .map_err(|_| TransactionError::InsufficientFundsForFee)?;
-                self.store_account(pubkey, &account);
-                Ok(())
-            }
-            None => Err(TransactionError::AccountNotFound),
-        }
     }
 
     pub fn set_hash_overrides(&self, hash_overrides: HashOverrides) {

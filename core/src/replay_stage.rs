@@ -20,6 +20,7 @@ use {
             VotedStakes, SWITCH_FORK_THRESHOLD,
         },
         cost_update_service::CostUpdate,
+        mcp_replay,
         mcp_vote_gate::{self, VoteGateDecision, VoteGateInput},
         repair::{
             ancestor_hashes_service::AncestorHashesReplayUpdateSender,
@@ -302,6 +303,7 @@ pub struct ReplayStageConfig {
     pub consensus_metrics_sender: ConsensusMetricsEventSender,
     pub consensus_metrics_receiver: ConsensusMetricsEventReceiver,
     pub migration_status: Arc<MigrationStatus>,
+    pub mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
     pub mcp_vote_gate_inputs: Arc<RwLock<HashMap<Slot, VoteGateInput>>>,
     pub mcp_vote_gate_included_proposers:
         Arc<RwLock<HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>>>,
@@ -629,6 +631,7 @@ impl ReplayStage {
             consensus_metrics_sender,
             consensus_metrics_receiver,
             migration_status,
+            mcp_consensus_blocks,
             mcp_vote_gate_inputs,
             mcp_vote_gate_included_proposers,
             reward_votes_receiver,
@@ -1187,6 +1190,7 @@ impl ReplayStage {
                         if let Err(e) = Self::handle_votable_bank(
                             vote_bank,
                             switch_fork_decision,
+                            &mcp_consensus_blocks,
                             &mcp_vote_gate_inputs,
                             &mcp_vote_gate_included_proposers,
                             &bank_forks,
@@ -2812,6 +2816,7 @@ impl ReplayStage {
     fn handle_votable_bank(
         bank: &Arc<Bank>,
         switch_fork_decision: &SwitchForkDecision,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
         mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
         mcp_vote_gate_included_proposers: &RwLock<
             HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
@@ -2842,6 +2847,15 @@ impl ReplayStage {
             .feature_set
             .is_active(&agave_feature_set::mcp_protocol_v1::id());
         if mcp_vote_gate_enabled {
+            mcp_replay::refresh_vote_gate_input(
+                bank.slot(),
+                bank,
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_consensus_blocks,
+                mcp_vote_gate_inputs,
+            );
             if !Self::should_vote_mcp_slot(
                 bank.slot(),
                 mcp_vote_gate_inputs,
