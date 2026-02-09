@@ -285,6 +285,7 @@ pub struct Blockstore {
     highest_primary_index_slot: RwLock<Option<Slot>>,
     max_root: AtomicU64,
     insert_shreds_lock: Mutex<()>,
+    insert_mcp_lock: Mutex<()>,
     new_shreds_signals: Mutex<Vec<Sender<bool>>>,
     completed_slots_senders: Mutex<Vec<CompletedSlotsSender>>,
     pub lowest_cleanup_slot: RwLock<Slot>,
@@ -512,6 +513,7 @@ impl Blockstore {
             new_shreds_signals: Mutex::default(),
             completed_slots_senders: Mutex::default(),
             insert_shreds_lock: Mutex::<()>::default(),
+            insert_mcp_lock: Mutex::<()>::default(),
             max_root,
             lowest_cleanup_slot: RwLock::<Slot>::default(),
             slots_stats: SlotsStats::default(),
@@ -3243,7 +3245,7 @@ impl Blockstore {
     }
 
     pub fn put_mcp_execution_output(&self, slot: Slot, output: &[u8]) -> Result<()> {
-        let _lock = self.insert_shreds_lock.lock().unwrap();
+        let _lock = self.insert_mcp_lock.lock().unwrap();
         match self.mcp_execution_output_cf.get_bytes(slot)? {
             None => self.mcp_execution_output_cf.put_bytes(slot, output),
             Some(existing) if existing.as_slice() == output => Ok(()),
@@ -3262,7 +3264,7 @@ impl Blockstore {
     /// Stores an empty MCP execution output if no output is currently present.
     /// Returns `true` when the stored value is empty after this call.
     pub fn put_mcp_empty_execution_output_if_absent(&self, slot: Slot) -> Result<bool> {
-        let _lock = self.insert_shreds_lock.lock().unwrap();
+        let _lock = self.insert_mcp_lock.lock().unwrap();
         match self.mcp_execution_output_cf.get_bytes(slot)? {
             Some(existing) => Ok(existing.is_empty()),
             None => {
