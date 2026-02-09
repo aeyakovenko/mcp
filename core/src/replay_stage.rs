@@ -2825,12 +2825,17 @@ impl ReplayStage {
         migration_status: &MigrationStatus,
         tbft_structs: &mut TowerBFTStructures,
     ) -> Result<(), SetRootError> {
-        if bank
+        let mcp_vote_gate_enabled = bank
             .feature_set
-            .is_active(&agave_feature_set::mcp_protocol_v1::id())
-            && !Self::should_vote_mcp_slot(bank.slot(), mcp_vote_gate_inputs)
-        {
-            return Ok(());
+            .is_active(&agave_feature_set::mcp_protocol_v1::id());
+        if mcp_vote_gate_enabled {
+            if !Self::should_vote_mcp_slot(bank.slot(), mcp_vote_gate_inputs) {
+                return Ok(());
+            }
+        } else {
+            // Preserve pre-MCP behavior: Alpenglow migration should not progress through
+            // ReplayStage vote handling unless MCP vote gating is explicitly enabled.
+            assert!(!migration_status.is_alpenglow_enabled());
         }
 
         if bank.is_empty() {
@@ -2948,7 +2953,7 @@ impl ReplayStage {
         };
 
         if slot % MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS == 0 {
-            if let Ok(mut inputs) = mcp_vote_gate_inputs.write() {
+            if let Ok(mut inputs) = mcp_vote_gate_inputs.try_write() {
                 let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
                 inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
             }
