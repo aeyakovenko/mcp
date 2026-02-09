@@ -60,9 +60,7 @@ pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
 /// ceil((numerator / denominator) * total), integer-only.
 pub const fn ceil_threshold_count(numerator: usize, denominator: usize, total: usize) -> usize {
-    if denominator == 0 {
-        return 0;
-    }
+    assert!(denominator != 0, "threshold denominator must be non-zero");
     // ceil(a / b) for integers is (a + b - 1) / b.
     let scaled = numerator * total;
     (scaled + denominator - 1) / denominator
@@ -116,8 +114,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ceil_threshold_count_zero_denominator() {
-        assert_eq!(ceil_threshold_count(3, 0, NUM_RELAYS), 0);
+<<<<<<< HEAD
+    #[should_panic(expected = "threshold denominator must be non-zero")]
+    fn test_threshold_count_guard_zero_denominator() {
+        let _ = ceil_threshold_count(3, 0, 200);
     }
 
     #[test]
