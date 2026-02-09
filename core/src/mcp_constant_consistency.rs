@@ -5,3 +5,19 @@ fn test_mcp_num_proposers_constant_matches_ledger() {
         solana_ledger::mcp::NUM_PROPOSERS
     );
 }
+
+#[test]
+fn test_mcp_shred_constants_match_ledger_protocol_constants() {
+    assert_eq!(
+        solana_ledger::shred::mcp_shred::MCP_NUM_PROPOSERS,
+        solana_ledger::mcp::NUM_PROPOSERS
+    );
+    assert_eq!(
+        solana_ledger::shred::mcp_shred::MCP_NUM_RELAYS,
+        solana_ledger::mcp::NUM_RELAYS
+    );
+    assert_eq!(
+        solana_ledger::shred::mcp_shred::MCP_SHRED_DATA_BYTES,
+        solana_ledger::mcp::SHRED_DATA_BYTES
+    );
+}
