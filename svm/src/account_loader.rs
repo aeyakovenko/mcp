@@ -17,6 +17,7 @@ use {
         PROGRAM_OWNERS,
     },
     solana_clock::Slot,
+    solana_fee::MCP_NUM_PROPOSERS,
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
@@ -385,8 +386,6 @@ pub fn validate_fee_payer(
         1,
     )
 }
-
-pub const MCP_NUM_PROPOSERS: u64 = 16;
 
 pub fn validate_fee_payer_for_mcp(
     payer_address: &Pubkey,
