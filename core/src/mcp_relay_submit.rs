@@ -68,6 +68,8 @@ pub enum RelaySubmitError {
     EmptyEntries,
     #[error("relay attestation contains too many entries: {actual} > {max}")]
     TooManyEntries { actual: usize, max: usize },
+    #[error("relay index out of range: {0}")]
+    RelayIndexOutOfRange(u32),
     #[error("relay attestation proposer_index out of range: {0}")]
     ProposerIndexOutOfRange(u32),
     #[error("unknown MCP control message type: {0:#x}")]
@@ -87,6 +89,13 @@ pub enum RelaySubmitError {
 }
 
 impl RelayAttestationV1 {
+    fn validate_relay_index(relay_index: u32) -> Result<(), RelaySubmitError> {
+        if relay_index as usize >= mcp::NUM_RELAYS {
+            return Err(RelaySubmitError::RelayIndexOutOfRange(relay_index));
+        }
+        Ok(())
+    }
+
     fn validate_entries(entries: &[RelayAttestationEntry]) -> Result<(), RelaySubmitError> {
         if entries.is_empty() {
             return Err(RelaySubmitError::EmptyEntries);
@@ -124,6 +133,7 @@ impl RelayAttestationV1 {
         let attestation =
             LedgerRelayAttestation::from_wire_bytes(bytes).map_err(map_ledger_error)?;
         let out = Self::from_ledger(attestation);
+        Self::validate_relay_index(out.relay_index)?;
         Self::validate_entries(&out.entries)?;
         Ok(out)
     }
@@ -152,6 +162,7 @@ impl RelayAttestationV1 {
     }
 
     fn as_ledger(&self) -> Result<LedgerRelayAttestation, RelaySubmitError> {
+        Self::validate_relay_index(self.relay_index)?;
         Self::validate_entries(&self.entries)?;
         Ok(LedgerRelayAttestation {
             version: RELAY_ATTESTATION_VERSION_V1,
@@ -284,10 +295,8 @@ pub fn dispatch_relay_attestation_to_slot_leader(
     let payload = Bytes::copy_from_slice(&dispatch.frame);
     match quic_endpoint_sender.try_send((leader_addr, payload)) {
         Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full((leader_addr, payload))) => {
-            quic_endpoint_sender
-                .blocking_send((leader_addr, payload))
-                .map_err(|_| RelaySubmitError::SendChannelClosed)?;
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            return Err(RelaySubmitError::SendChannelFull);
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             return Err(RelaySubmitError::SendChannelClosed);
@@ -309,7 +318,7 @@ mod tests {
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
-        std::{collections::HashMap, sync::Arc},
+        std::{collections::HashMap, net::SocketAddr, sync::Arc},
     };
 
     fn signed_entry(
@@ -435,6 +444,22 @@ mod tests {
     }
 
     #[test]
+    fn test_relay_index_out_of_range_rejected() {
+        let proposer = Keypair::new();
+        let relay = Keypair::new();
+        let attestation = RelayAttestationV1 {
+            slot: 9,
+            relay_index: mcp::NUM_RELAYS as u32,
+            entries: vec![signed_entry(1, [1u8; 32], &proposer)],
+            relay_signature: relay.sign_message(b"placeholder"),
+        };
+        assert_eq!(
+            attestation.signing_bytes().unwrap_err(),
+            RelaySubmitError::RelayIndexOutOfRange(mcp::NUM_RELAYS as u32),
+        );
+    }
+
+    #[test]
     fn test_truncated_payload_rejected() {
         let relay = Keypair::new();
         let proposer = Keypair::new();
@@ -545,5 +570,47 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, RelaySubmitError::FeatureNotActive { slot: 0 });
+    }
+
+    #[test]
+    fn test_dispatch_relay_attestation_to_slot_leader_rejects_full_queue() {
+        let relay = Arc::new(Keypair::new());
+        let proposer = Keypair::new();
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let mut root_bank = Bank::new_for_tests(&genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let leader_pubkey = leader_schedule_cache
+            .slot_leader_at(0, Some(&root_bank))
+            .unwrap();
+        let leader_info = Node::new_localhost_with_pubkey(&leader_pubkey).info;
+        let relay_info = Node::new_localhost_with_pubkey(&relay.pubkey()).info;
+        let cluster_info = ClusterInfo::new(relay_info, relay, SocketAddrSpace::Unspecified);
+        cluster_info.insert_info(leader_info);
+
+        let attestation = signed_attestation(
+            0,
+            12,
+            vec![signed_entry(1, [7u8; 32], &proposer)],
+            &Keypair::new(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"x")))
+            .unwrap();
+        assert!(receiver.try_recv().is_ok());
+        sender
+            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"y")))
+            .unwrap();
+
+        let err = dispatch_relay_attestation_to_slot_leader(
+            &attestation,
+            &leader_schedule_cache,
+            &root_bank,
+            &cluster_info,
+            &sender,
+        )
+        .unwrap_err();
+        assert_eq!(err, RelaySubmitError::SendChannelFull);
     }
 }
