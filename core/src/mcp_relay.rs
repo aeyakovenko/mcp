@@ -17,6 +17,7 @@ const MCP_RELAY_CACHE_SLOT_WINDOW: Slot = 64;
 pub enum McpDropReason {
     DecodeError,
     ProposerIndexOutOfRange,
+    ShredIndexOutOfRange,
     InvalidProposerSignature,
     InvalidWitness,
     ConflictingShred,
@@ -56,6 +57,9 @@ impl McpRelayProcessor {
         };
         if message.proposer_index as usize >= MCP_NUM_PROPOSERS {
             return McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange);
+        }
+        if message.shred_index as usize >= MCP_NUM_RELAYS {
+            return McpRelayOutcome::Dropped(McpDropReason::ShredIndexOutOfRange);
         }
         if !message.verify_signature(proposer_pubkey) {
             return McpRelayOutcome::Dropped(McpDropReason::InvalidProposerSignature);
@@ -438,6 +442,33 @@ mod tests {
         assert_eq!(
             outcome,
             McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange)
+        );
+    }
+
+    #[test]
+    fn test_out_of_range_shred_index_is_dropped() {
+        let proposer = Keypair::new();
+        let proposer_index = 2u32;
+        let relay_index = MCP_NUM_RELAYS as u32;
+        let slot = 34;
+        let shreds = make_shreds();
+        let (commitment, witnesses) =
+            derive_commitment_and_witnesses(slot, proposer_index, &shreds);
+        let payload = build_message(
+            slot,
+            proposer_index,
+            relay_index,
+            commitment,
+            shreds[0],
+            witnesses[0],
+            &proposer,
+        );
+
+        let mut relay = McpRelayProcessor::default();
+        let outcome = relay.process_shred(&payload, &proposer.pubkey());
+        assert_eq!(
+            outcome,
+            McpRelayOutcome::Dropped(McpDropReason::ShredIndexOutOfRange)
         );
     }
 
