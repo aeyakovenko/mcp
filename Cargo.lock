@@ -10978,6 +10978,7 @@ dependencies = [
  "solana-compute-budget-program",
  "solana-ed25519-program",
  "solana-epoch-schedule",
+ "solana-fee",
  "solana-fee-calculator",
  "solana-fee-structure",
  "solana-frozen-abi",
