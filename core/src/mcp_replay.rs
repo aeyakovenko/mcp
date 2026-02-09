@@ -2,7 +2,9 @@ use {
     crate::mcp_vote_gate::{
         Commitment, RelayAttestationObservation, RelayProposerEntry, VoteGateInput,
     },
-    agave_transaction_view::transaction_view::SanitizedTransactionView,
+    agave_transaction_view::{
+        mcp_payload::McpPayloadTransaction, transaction_view::SanitizedTransactionView,
+    },
     solana_clock::Slot,
     solana_ledger::{
         blockstore::Blockstore,
@@ -292,8 +294,15 @@ pub(crate) fn refresh_vote_gate_input(
     }
 }
 
-fn ordering_fee_for_transaction(wire_bytes: &[u8]) -> Option<u64> {
-    let view = SanitizedTransactionView::try_new_sanitized(wire_bytes).ok()?;
+fn ordering_fee_for_payload_transaction(transaction: &McpPayloadTransaction) -> Option<u64> {
+    if let Some(mcp_transaction) = transaction.mcp_transaction.as_ref() {
+        return Some(u64::from(
+            mcp_transaction.ordering_fee().unwrap_or_default(),
+        ));
+    }
+
+    let view =
+        SanitizedTransactionView::try_new_sanitized(transaction.wire_bytes.as_slice()).ok()?;
     let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
         view,
         MessageHash::Compute,
@@ -302,13 +311,8 @@ fn ordering_fee_for_transaction(wire_bytes: &[u8]) -> Option<u64> {
     .ok()?;
     Some(
         runtime_tx
-            .mcp_fee_components()
-            .map(|(_, ordering_fee)| ordering_fee)
-            .unwrap_or_else(|| {
-                runtime_tx
-                    .compute_budget_instruction_details()
-                    .requested_compute_unit_price()
-            }),
+            .compute_budget_instruction_details()
+            .requested_compute_unit_price(),
     )
 }
 
@@ -406,7 +410,7 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             .transactions
             .into_iter()
             .filter_map(|tx| {
-                let ordering_fee = ordering_fee_for_transaction(&tx.wire_bytes)?;
+                let ordering_fee = ordering_fee_for_payload_transaction(&tx)?;
                 Some(ReconstructedTransaction {
                     ordering_fee,
                     wire_bytes: tx.wire_bytes,
