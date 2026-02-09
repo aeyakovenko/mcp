@@ -871,4 +871,32 @@ mod tests {
             AggregateAttestationError::ProposerIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
         );
     }
+
+    #[test]
+    fn test_new_canonical_rejects_duplicate_relay_indices() {
+        let duplicate_a = AggregateRelayEntry {
+            relay_index: 5,
+            entries: vec![],
+            relay_signature: Signature::default(),
+        };
+        let duplicate_b = AggregateRelayEntry {
+            relay_index: 5,
+            entries: vec![],
+            relay_signature: Signature::default(),
+        };
+
+        assert_eq!(
+            AggregateAttestation::new_canonical(1, 0, vec![duplicate_a, duplicate_b]).unwrap_err(),
+            AggregateAttestationError::RelayEntriesNotStrictlySorted,
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_empty_aggregate() {
+        let aggregate = AggregateAttestation::new_canonical(9, 1, Vec::new()).unwrap();
+        let bytes = aggregate.to_wire_bytes().unwrap();
+        let decoded = AggregateAttestation::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(decoded, aggregate);
+        assert!(decoded.relay_entries.is_empty());
+    }
 }
