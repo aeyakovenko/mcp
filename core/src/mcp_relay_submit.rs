@@ -25,7 +25,6 @@ use {
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
 pub const RELAY_ATTESTATION_VERSION_V1: u8 = RELAY_ATTESTATION_V1;
-const RELAY_SUBMIT_SEND_RETRY_LIMIT: usize = 3;
 pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
     + 8
     + 4
@@ -317,23 +316,7 @@ fn try_send_dispatch_frame_with_retry(
     leader_addr: SocketAddr,
     payload: Bytes,
 ) -> Result<(), AsyncTrySendError<(SocketAddr, Bytes)>> {
-    let mut send_item = (leader_addr, payload);
-    for attempt in 0..=RELAY_SUBMIT_SEND_RETRY_LIMIT {
-        match quic_endpoint_sender.try_send(send_item) {
-            Ok(()) => return Ok(()),
-            Err(AsyncTrySendError::Closed(returned)) => {
-                return Err(AsyncTrySendError::Closed(returned));
-            }
-            Err(AsyncTrySendError::Full(returned)) => {
-                if attempt == RELAY_SUBMIT_SEND_RETRY_LIMIT {
-                    return Err(AsyncTrySendError::Full(returned));
-                }
-                send_item = returned;
-                std::thread::yield_now();
-            }
-        }
-    }
-    unreachable!("retry loop should always return on success or terminal send error")
+    quic_endpoint_sender.try_send((leader_addr, payload))
 }
 
 #[cfg(test)]
@@ -545,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_send_dispatch_frame_with_retry_rejects_full_channel_after_retries() {
+    fn test_try_send_dispatch_frame_with_retry_rejects_full_channel_immediately() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender
             .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"x")))
@@ -559,7 +542,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AsyncTrySendError::Full(_)));
 
-        // Ensure the initial payload remains queued after retry exhaustion.
+        // Ensure the initial payload remains queued when the queue is full.
         let (addr, payload) = receiver.try_recv().unwrap();
         assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 12345)));
         assert_eq!(payload, Bytes::from_static(b"x"));

@@ -253,23 +253,30 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             continue;
         };
 
-        let inserted = if let Ok(mut blocks) = consensus_blocks.write() {
-            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
-            blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-            if let Some(existing) = blocks.get(&slot) {
-                if existing != &consensus_bytes {
-                    warn!(
-                        "MCP consensus block conflict at slot {} (keeping first valid block)",
-                        slot
-                    );
+        let inserted = match consensus_blocks.write() {
+            Ok(mut blocks) => {
+                let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+                blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+                if let Some(existing) = blocks.get(&slot) {
+                    if existing != &consensus_bytes {
+                        warn!(
+                            "MCP consensus block conflict at slot {} (keeping first valid block)",
+                            slot
+                        );
+                    }
+                    false
+                } else {
+                    blocks.insert(slot, consensus_bytes.clone());
+                    true
                 }
-                false
-            } else {
-                blocks.insert(slot, consensus_bytes.clone());
-                true
             }
-        } else {
-            false
+            Err(err) => {
+                warn!(
+                    "failed to cache locally finalized MCP consensus block for slot {}: {}",
+                    slot, err
+                );
+                false
+            }
         };
         if !inserted {
             return;
@@ -443,7 +450,7 @@ fn run_insert<F>(
     verified_receiver: &Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
     blockstore: &Blockstore,
     bank_forks: &RwLock<BankForks>,
-    _local_pubkey: &Pubkey,
+    local_pubkey: &Pubkey,
     leader_schedule_cache: &LeaderScheduleCache,
     handle_duplicate: F,
     metrics: &mut BlockstoreInsertionMetrics,
@@ -576,7 +583,7 @@ where
             let relay_indices = leader_schedule_cache
                 .relays_at_slot(slot, Some(&root_bank))
                 .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
-                .map(|relays| relay_indices_for_pubkey(&relays, _local_pubkey))
+                .map(|relays| relay_indices_for_pubkey(&relays, local_pubkey))
                 .unwrap_or_default();
             if relay_indices.is_empty() {
                 continue;
@@ -805,18 +812,27 @@ fn ingest_mcp_control_message(
 
             if let Some(consensus_blocks) = mcp_consensus_blocks {
                 let root_slot = root_bank.slot();
-                if let Ok(mut consensus_blocks) = consensus_blocks.write() {
-                    let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
-                    consensus_blocks.retain(|slot, _| *slot >= min_slot);
-                    if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
-                        if existing != payload {
-                            warn!(
-                                "MCP consensus block conflict at slot {} (keeping first valid block)",
-                                consensus_block.slot
-                            );
+                match consensus_blocks.write() {
+                    Ok(mut consensus_blocks) => {
+                        let min_slot =
+                            root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+                        consensus_blocks.retain(|slot, _| *slot >= min_slot);
+                        if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
+                            if existing != payload {
+                                warn!(
+                                    "MCP consensus block conflict at slot {} (keeping first valid block)",
+                                    consensus_block.slot
+                                );
+                            }
+                        } else {
+                            consensus_blocks.insert(consensus_block.slot, payload.to_vec());
                         }
-                    } else {
-                        consensus_blocks.insert(consensus_block.slot, payload.to_vec());
+                    }
+                    Err(err) => {
+                        warn!(
+                            "failed to ingest MCP consensus block for slot {} due to poisoned lock: {}",
+                            consensus_block.slot, err
+                        );
                     }
                 }
             }
