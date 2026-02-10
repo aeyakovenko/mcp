@@ -82,7 +82,10 @@ impl McpReconstructionState {
         shred_data: [u8; MCP_RECON_SHRED_BYTES],
     ) -> Result<(), McpReconstructionError> {
         if self.poisoned {
-            return Err(McpReconstructionError::PoisonedState);
+            // A commitment mismatch indicates that at least one prior shard was invalid.
+            // Clear in-memory shard state and restart accumulation on the next insert.
+            self.shards.iter_mut().for_each(|shard| *shard = None);
+            self.poisoned = false;
         }
         if shred_index >= MCP_RECON_NUM_SHREDS {
             return Err(McpReconstructionError::InvalidShredIndex(shred_index));
@@ -456,13 +459,14 @@ mod tests {
     #[test]
     fn test_state_is_poisoned_after_commitment_mismatch() {
         let payload: Vec<u8> = (0..4_000).map(|i| (i % 256) as u8).collect();
-        let mut shreds = encode_payload(&payload);
-        let root = commitment_root(31, 2, &shreds).unwrap();
-        shreds[0][0] ^= 1;
+        let valid_shreds = encode_payload(&payload);
+        let mut invalid_shreds = valid_shreds.clone();
+        let root = commitment_root(31, 2, &valid_shreds).unwrap();
+        invalid_shreds[0][0] ^= 1;
 
         let mut state = McpReconstructionState::new(31, 2, payload.len(), root).unwrap();
         for i in 0..MCP_RECON_DATA_SHREDS {
-            state.insert_shard(i, shreds[i]).unwrap();
+            state.insert_shard(i, invalid_shreds[i]).unwrap();
         }
 
         assert_eq!(
@@ -473,9 +477,16 @@ mod tests {
             state.try_reconstruct().unwrap_err(),
             McpReconstructionError::PoisonedState
         );
+
+        // First insert after poisoning clears stale shards and restarts accumulation.
+        state.insert_shard(0, valid_shreds[0]).unwrap();
+        assert_eq!(state.present_shards(), 1);
+        for i in 1..MCP_RECON_DATA_SHREDS {
+            state.insert_shard(i, valid_shreds[i]).unwrap();
+        }
         assert_eq!(
-            state.insert_shard(0, shreds[0]).unwrap_err(),
-            McpReconstructionError::PoisonedState
+            state.try_reconstruct().unwrap(),
+            McpReconstructionAttempt::Reconstructed(payload)
         );
     }
 

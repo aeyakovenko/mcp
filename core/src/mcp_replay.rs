@@ -257,8 +257,16 @@ pub(crate) fn refresh_vote_gate_input(
         };
         let Ok(consensus_block) = ConsensusBlock::from_wire_bytes(payload) else {
             drop(consensus_blocks);
-            if let Ok(mut consensus_blocks) = mcp_consensus_blocks.write() {
-                consensus_blocks.remove(&slot);
+            match mcp_consensus_blocks.write() {
+                Ok(mut consensus_blocks) => {
+                    consensus_blocks.remove(&slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to prune invalid MCP consensus block at slot {}: {}",
+                        slot, err
+                    );
+                }
             }
             return;
         };
@@ -282,15 +290,32 @@ pub(crate) fn refresh_vote_gate_input(
         return;
     };
 
-    if let Ok(mut inputs) = mcp_vote_gate_inputs.write() {
-        let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
-        inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-        inputs.insert(slot, vote_gate_input);
+    match mcp_vote_gate_inputs.write() {
+        Ok(mut inputs) => {
+            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+            inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            inputs.insert(slot, vote_gate_input);
+        }
+        Err(err) => {
+            warn!(
+                "failed to persist MCP vote gate input at slot {} due to poisoned lock: {}",
+                slot, err
+            );
+            return;
+        }
     }
 
-    if let Ok(mut consensus_blocks) = mcp_consensus_blocks.write() {
-        let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
-        consensus_blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+    match mcp_consensus_blocks.write() {
+        Ok(mut consensus_blocks) => {
+            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+            consensus_blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+        }
+        Err(err) => {
+            warn!(
+                "failed to prune MCP consensus block cache after slot {} due to poisoned lock: {}",
+                slot, err
+            );
+        }
     }
 }
 
