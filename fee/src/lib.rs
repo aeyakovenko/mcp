@@ -8,7 +8,7 @@ use {
 // Keep in sync with `solana_ledger::mcp::NUM_PROPOSERS`; duplicated here to
 // avoid introducing a `fee -> ledger` dependency edge. A cross-crate unit test
 // in `solana-core` enforces this invariant.
-pub const MCP_NUM_PROPOSERS: u64 = 16;
+pub const MCP_NUM_PROPOSERS: usize = 16;
 
 /// Bools indicating the activation of features relevant
 /// to the fee calculation.
@@ -106,8 +106,8 @@ pub fn apply_mcp_fee_component_values(
     inclusion_fee: u64,
     ordering_fee: u64,
 ) -> FeeDetails {
-    let scaled_inclusion_fee = inclusion_fee.saturating_mul(MCP_NUM_PROPOSERS);
-    let scaled_ordering_fee = ordering_fee.saturating_mul(MCP_NUM_PROPOSERS);
+    let scaled_inclusion_fee = inclusion_fee.saturating_mul(MCP_NUM_PROPOSERS as u64);
+    let scaled_ordering_fee = ordering_fee.saturating_mul(MCP_NUM_PROPOSERS as u64);
     FeeDetails::new(
         base.transaction_fee().saturating_add(scaled_inclusion_fee),
         base.prioritization_fee()
@@ -247,11 +247,17 @@ mod tests {
 
         let base = FeeDetails::new(100, 5);
         let with_mcp = apply_mcp_fee_components(base, Some(&mcp_tx));
-        assert_eq!(with_mcp.transaction_fee(), 100 + (17 * MCP_NUM_PROPOSERS));
-        assert_eq!(with_mcp.prioritization_fee(), 5 + (29 * MCP_NUM_PROPOSERS));
+        assert_eq!(
+            with_mcp.transaction_fee(),
+            100 + (17 * MCP_NUM_PROPOSERS as u64)
+        );
+        assert_eq!(
+            with_mcp.prioritization_fee(),
+            5 + (29 * MCP_NUM_PROPOSERS as u64)
+        );
         assert_eq!(
             with_mcp.total_fee(),
-            100 + (17 * MCP_NUM_PROPOSERS) + 5 + (29 * MCP_NUM_PROPOSERS)
+            100 + (17 * MCP_NUM_PROPOSERS as u64) + 5 + (29 * MCP_NUM_PROPOSERS as u64)
         );
     }
 
@@ -265,11 +271,17 @@ mod tests {
     fn test_apply_mcp_fee_component_values_adds_fee_components() {
         let base = FeeDetails::new(9, 4);
         let updated = apply_mcp_fee_component_values(base, 6, 2);
-        assert_eq!(updated.transaction_fee(), 9 + (6 * MCP_NUM_PROPOSERS));
-        assert_eq!(updated.prioritization_fee(), 4 + (2 * MCP_NUM_PROPOSERS));
+        assert_eq!(
+            updated.transaction_fee(),
+            9 + (6 * MCP_NUM_PROPOSERS as u64)
+        );
+        assert_eq!(
+            updated.prioritization_fee(),
+            4 + (2 * MCP_NUM_PROPOSERS as u64)
+        );
         assert_eq!(
             updated.total_fee(),
-            9 + (6 * MCP_NUM_PROPOSERS) + 4 + (2 * MCP_NUM_PROPOSERS)
+            9 + (6 * MCP_NUM_PROPOSERS as u64) + 4 + (2 * MCP_NUM_PROPOSERS as u64)
         );
     }
 }

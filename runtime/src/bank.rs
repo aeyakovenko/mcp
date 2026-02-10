@@ -3513,7 +3513,10 @@ impl Bank {
                 continue;
             };
             let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
-            let mut fee = match fee_details.total_fee().checked_mul(MCP_NUM_PROPOSERS) {
+            let mut fee = match fee_details
+                .total_fee()
+                .checked_mul(MCP_NUM_PROPOSERS as u64)
+            {
                 Some(fee) => fee,
                 None => {
                     *fee_result = Err(TransactionError::InsufficientFundsForFee);
