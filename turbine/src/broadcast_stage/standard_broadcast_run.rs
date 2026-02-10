@@ -651,6 +651,7 @@ impl StandardBroadcastRun {
         let proposer_indices = {
             let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
             let cache = cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(bank));
+            cache.set_root(bank);
             cache.proposer_indices_at_slot(bank.slot(), &self.identity, Some(bank))
         };
         if proposer_indices.is_empty() {
@@ -693,7 +694,6 @@ impl StandardBroadcastRun {
 
     fn maybe_dispatch_mcp_shreds(
         &self,
-        _shreds: &[Shred],
         batch_info: &Option<BroadcastShredBatchInfo>,
         cluster_info: &ClusterInfo,
         bank_forks: &RwLock<BankForks>,
@@ -922,7 +922,6 @@ impl BroadcastRun for StandardBroadcastRun {
             quic_endpoint_sender,
         )?;
         self.maybe_dispatch_mcp_shreds(
-            &shreds,
             &batch_info,
             cluster_info,
             bank_forks,
@@ -1093,7 +1092,6 @@ mod test {
             was_interrupted: false,
         });
         standard_broadcast_run.maybe_dispatch_mcp_shreds(
-            &[],
             &batch_info,
             &cluster_info,
             &bank_forks,
