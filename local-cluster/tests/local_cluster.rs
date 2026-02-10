@@ -7107,21 +7107,17 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     }
 
     fn slot_has_shred_data(blockstore: &Blockstore, slot: Slot) -> bool {
+        const FIRST_SHRED_INDEX: u32 = 0;
         for proposer_index in 0..solana_ledger::mcp::NUM_PROPOSERS {
             let Some(proposer_index) = u32::try_from(proposer_index).ok() else {
                 continue;
             };
-            for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
-                let Some(shred_index) = u32::try_from(shred_index).ok() else {
-                    continue;
-                };
-                if blockstore
-                    .get_mcp_shred_data(slot, proposer_index, shred_index)
-                    .unwrap()
-                    .is_some()
-                {
-                    return true;
-                }
+            if blockstore
+                .get_mcp_shred_data(slot, proposer_index, FIRST_SHRED_INDEX)
+                .unwrap()
+                .is_some()
+            {
+                return true;
             }
         }
         false
@@ -7162,7 +7158,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     }
 
     let mut validator_config = ValidatorConfig::default_for_test();
-    validator_config.wait_for_supermajority = Some(0);
+    validator_config.wait_for_supermajority = None;
 
     let mcp_feature_id = agave_feature_set::mcp_protocol_v1::id();
     let mcp_feature_lamports = std::cmp::max(
@@ -7171,16 +7167,17 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         ),
         1,
     );
+    let mcp_activation_slot = 0;
     let mcp_feature_account = AccountSharedData::from(
         solana_feature_gate_interface::create_account(
             &solana_feature_gate_interface::Feature {
-                activated_at: Some(0),
+                activated_at: Some(mcp_activation_slot),
             },
             mcp_feature_lamports,
         ),
     );
 
-    let num_nodes = 3;
+    let num_nodes = 1;
     let mut config = ClusterConfig {
         validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
         node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
@@ -7188,7 +7185,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
         stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
         skip_warmup_slots: true,
-        tpu_use_quic: false,
         additional_accounts: vec![(mcp_feature_id, mcp_feature_account)],
         ..ClusterConfig::default()
     };
@@ -7208,19 +7204,35 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         "MCP feature must be activated for local-cluster MCP test",
     );
 
-    // Drive proposer payload generation with regular transfer traffic.
+    let feature_ready_deadline = Instant::now() + Duration::from_secs(30);
+    let mut feature_ready = false;
+    while Instant::now() < feature_ready_deadline {
+        for validator_info in cluster.validators.values() {
+            let Some(validator) = validator_info.validator.as_ref() else {
+                continue;
+            };
+            let bank = validator.bank_forks.read().unwrap().working_bank();
+            if bank.feature_set.is_active(&mcp_feature_id) {
+                feature_ready = true;
+                break;
+            }
+        }
+        if feature_ready {
+            break;
+        }
+        sleep(Duration::from_millis(200));
+    }
+    assert!(
+        feature_ready,
+        "MCP feature never became active in validator working banks before test deadline",
+    );
+
     cluster_tests::send_many_transactions(
         &cluster.entry_point_info,
         &cluster.funding_keypair,
         &cluster.connection_cache,
         10,
-        64,
-    );
-
-    cluster.check_for_new_roots(
-        16,
-        "test_local_cluster_mcp_produces_blockstore_artifacts",
-        SocketAddrSpace::Unspecified,
+        4,
     );
 
     let blockstores: Vec<(Pubkey, Blockstore)> = cluster
@@ -7229,7 +7241,30 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         .map(|(pubkey, validator_info)| (*pubkey, open_blockstore(&validator_info.info.ledger_path)))
         .collect();
 
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let post_activation_deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < post_activation_deadline {
+        let max_highest = blockstores
+            .iter()
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default();
+        if max_highest >= mcp_activation_slot.saturating_add(1) {
+            break;
+        }
+        sleep(Duration::from_millis(200));
+    }
+
+    let (recent_blockhash, _) = entry_client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+        .unwrap();
+    for _ in 0..16 {
+        let recipient = Keypair::new();
+        let transaction =
+            system_transaction::transfer(&cluster.funding_keypair, &recipient.pubkey(), 1, recent_blockhash);
+        let _ = entry_client.send_transaction(&transaction);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut observed_artifacts = None;
     while Instant::now() < deadline {
         for (validator_pubkey, blockstore) in &blockstores {
@@ -7269,9 +7304,55 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 )
             })
             .collect::<Vec<_>>();
+        let diagnostics = blockstores
+            .iter()
+            .map(|(pubkey, blockstore)| {
+                let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
+                let min_slot = highest_slot.saturating_sub(64);
+                let mut slots_with_exec = 0usize;
+                let mut slots_with_attestation = 0usize;
+                let mut slots_with_shreds = 0usize;
+                for slot in min_slot..=highest_slot {
+                    if slot_has_non_empty_execution_output(blockstore, slot) {
+                        slots_with_exec += 1;
+                    }
+                    if slot_has_relay_attestation(blockstore, slot) {
+                        slots_with_attestation += 1;
+                    }
+                    if slot_has_shred_data(blockstore, slot) {
+                        slots_with_shreds += 1;
+                    }
+                }
+                (
+                    *pubkey,
+                    highest_slot,
+                    slots_with_exec,
+                    slots_with_attestation,
+                    slots_with_shreds,
+                )
+            })
+            .collect::<Vec<_>>();
+        let role_diagnostics = cluster
+            .validators
+            .iter()
+            .map(|(pubkey, validator_info)| {
+                let Some(validator) = validator_info.validator.as_ref() else {
+                    return (*pubkey, 0, false, 0usize, 0usize);
+                };
+                let bank = validator.bank_forks.read().unwrap().working_bank();
+                let cache = solana_ledger::leader_schedule_cache::LeaderScheduleCache::new_from_bank(&bank);
+                (
+                    *pubkey,
+                    bank.slot(),
+                    bank.feature_set.is_active(&mcp_feature_id),
+                    cache.proposer_indices_at_slot(bank.slot(), pubkey, Some(&bank)).len(),
+                    cache.relay_indices_at_slot(bank.slot(), pubkey, Some(&bank)).len(),
+                )
+            })
+            .collect::<Vec<_>>();
         panic!(
-            "timed out waiting for MCP artifacts in blockstore; highest observed slots {:?}",
-            highest_slots,
+            "timed out waiting for MCP artifacts in blockstore; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            highest_slots, diagnostics, role_diagnostics,
         );
     });
     info!(

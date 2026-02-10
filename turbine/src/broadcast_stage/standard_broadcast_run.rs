@@ -651,12 +651,11 @@ impl StandardBroadcastRun {
             return;
         }
 
-        let proposer_indices = {
-            let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
-            let cache = cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(bank));
-            cache.set_root(bank);
-            cache.proposer_indices_at_slot(bank.slot(), &self.identity, Some(bank))
-        };
+        let proposer_indices = LeaderScheduleCache::new_from_bank(bank).proposer_indices_at_slot(
+            bank.slot(),
+            &self.identity,
+            Some(bank),
+        );
         if proposer_indices.is_empty() {
             return;
         }
@@ -715,12 +714,7 @@ impl StandardBroadcastRun {
             let feature_active = bank
                 .feature_set
                 .is_active(&feature_set::mcp_protocol_v1::id());
-            (
-                feature_active,
-                bank,
-                bank_forks.root_bank(),
-                bank_forks.root(),
-            )
+            (feature_active, bank, bank_forks.root_bank(), bank_forks.root())
         };
         if !feature_active {
             return;
@@ -730,7 +724,7 @@ impl StandardBroadcastRun {
         let (proposer_indices, relay_schedule) = {
             let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
             let cache =
-                cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&working_bank));
+                cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&root_bank));
             cache.set_root(&root_bank);
             (
                 cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
