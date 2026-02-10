@@ -235,21 +235,27 @@ pub(crate) fn refresh_vote_gate_input(
     mcp_consensus_blocks: &McpConsensusBlockStore,
     mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
 ) {
-    let (root_bank, root_slot, local_delayed_bankhash) = {
+    let delayed_slot = slot.saturating_sub(1);
+    let (root_bank, root_slot, mut local_delayed_bankhash) = {
         let bank_forks = bank_forks.read().unwrap();
         (
             bank_forks.root_bank(),
             bank_forks.root(),
             // Until consensus metadata explicitly carries delayed-slot semantics, use the
             // immediately delayed slot as the local availability gate.
-            bank_forks
-                .get(slot.saturating_sub(1))
-                .map(|bank| bank.hash()),
+            bank_forks.get(delayed_slot).map(|bank| bank.hash()),
         )
     };
+    if local_delayed_bankhash.is_none() {
+        local_delayed_bankhash = blockstore.get_bank_hash(delayed_slot);
+    }
 
     let consensus_block = {
         let Ok(consensus_blocks) = mcp_consensus_blocks.read() else {
+            warn!(
+                "failed to read MCP consensus block cache at slot {} due to poisoned lock",
+                slot
+            );
             return;
         };
         let Some(payload) = consensus_blocks.get(&slot) else {
@@ -375,11 +381,26 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
 
     let included_proposers = match mcp_vote_gate_included_proposers.read() {
         Ok(included) => included.get(&slot).cloned().unwrap_or_default(),
-        Err(_) => return,
+        Err(err) => {
+            warn!(
+                "failed to read MCP vote-gate proposer outputs at slot {} due to poisoned lock: {}",
+                slot, err
+            );
+            return;
+        }
     };
     if included_proposers.is_empty() {
+        debug!(
+            "MCP reconstruction skipped for slot {}: no included proposers",
+            slot
+        );
         return;
     }
+    debug!(
+        "MCP reconstruction entered for slot {} with {} included proposers",
+        slot,
+        included_proposers.len()
+    );
 
     let root_bank = bank_forks.read().unwrap().root_bank();
     let proposers = load_proposer_schedule(slot, bank, &root_bank, leader_schedule_cache);
@@ -418,6 +439,7 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             }
             shards[mcp_shred.shred_index as usize] = Some(mcp_shred.shred_data);
         }
+        let available_shards = shards.iter().flatten().count();
 
         let Ok(payload) = reconstruct_payload(
             slot,
@@ -426,9 +448,17 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             commitment,
             &mut shards,
         ) else {
+            debug!(
+                "MCP reconstruction failed for slot {} proposer {}: {} valid shards",
+                slot, proposer_index, available_shards
+            );
             continue;
         };
         let Ok(decoded_payload) = decode_reconstructed_payload(&payload) else {
+            debug!(
+                "MCP reconstruction produced undecodable payload for slot {} proposer {}",
+                slot, proposer_index
+            );
             continue;
         };
         reconstructed_any_proposer = true;
@@ -451,6 +481,10 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
     }
 
     if reconstructed_batches.is_empty() {
+        debug!(
+            "MCP reconstruction produced no executable batches for slot {} (reconstructed_any_proposer={})",
+            slot, reconstructed_any_proposer
+        );
         if reconstructed_any_proposer {
             let _ = blockstore.put_mcp_empty_execution_output_if_absent(slot);
         }
