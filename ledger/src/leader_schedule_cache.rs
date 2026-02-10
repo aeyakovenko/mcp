@@ -272,7 +272,13 @@ impl LeaderScheduleCache {
                 debug!("Requested MCP schedule in slot: {slot} of unconfirmed epoch: {epoch}");
                 return None;
             }
-            self.get_epoch_mcp_schedule_else_compute(epoch, bank, kind)?
+            // Recompute from the provided bank to avoid stale pre-activation
+            // epoch caches after feature transitions.
+            self.compute_epoch_mcp_schedules(epoch, bank)
+                .map(|(proposer, relay)| match kind {
+                    McpScheduleKind::Proposer => proposer,
+                    McpScheduleKind::Relay => relay,
+                })?
         } else {
             self.get_epoch_mcp_schedule_no_compute(epoch, kind)?
         };
@@ -305,19 +311,6 @@ impl LeaderScheduleCache {
             McpScheduleKind::Relay => &self.cached_mcp_relay_schedules,
         };
         cache.read().unwrap().0.get(&epoch).cloned()
-    }
-
-    fn get_epoch_mcp_schedule_else_compute(
-        &self,
-        epoch: Epoch,
-        bank: &Bank,
-        kind: McpScheduleKind,
-    ) -> Option<Arc<LeaderSchedule>> {
-        self.get_epoch_mcp_schedule_no_compute(epoch, kind)
-            .or_else(|| self.compute_epoch_mcp_schedules(epoch, bank).map(|(p, r)| match kind {
-                McpScheduleKind::Proposer => p,
-                McpScheduleKind::Relay => r,
-            }))
     }
 
     fn get_epoch_schedule_else_compute(
@@ -798,7 +791,10 @@ mod tests {
         let mut genesis_config =
             create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
                 .genesis_config;
-        deactivate_features(&mut genesis_config, &vec![feature_set::mcp_protocol_v1::id()]);
+        deactivate_features(
+            &mut genesis_config,
+            &vec![feature_set::mcp_protocol_v1::id()],
+        );
 
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
         let cache = LeaderScheduleCache::new_from_bank(&bank);
@@ -868,13 +864,17 @@ mod tests {
         assert!(cache
             .proposers_at_slot(epoch0_last_slot, Some(&bank))
             .is_some());
-        assert!(cache.relays_at_slot(epoch0_last_slot, Some(&bank)).is_some());
+        assert!(cache
+            .relays_at_slot(epoch0_last_slot, Some(&bank))
+            .is_some());
 
         // Epoch 1 is unconfirmed until root advances through the end of epoch 0.
         assert!(cache
             .proposers_at_slot(epoch1_first_slot, Some(&bank))
             .is_none());
-        assert!(cache.relays_at_slot(epoch1_first_slot, Some(&bank)).is_none());
+        assert!(cache
+            .relays_at_slot(epoch1_first_slot, Some(&bank))
+            .is_none());
 
         let bank2 = Arc::new(Bank::new_from_parent(
             bank,

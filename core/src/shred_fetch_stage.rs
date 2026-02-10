@@ -13,7 +13,9 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::shred::{self, should_discard_shred, ShredFetchStats},
+    solana_ledger::shred::{
+        self, mcp_shred::is_mcp_shred_bytes, should_discard_shred, ShredFetchStats,
+    },
     solana_packet::{Meta, PACKET_DATA_SIZE},
     solana_perf::packet::{
         BytesPacket, BytesPacketBatch, PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef,
@@ -86,8 +88,8 @@ impl ShredFetchStage {
         let (
             mut last_root,
             mut slots_per_epoch,
-            mut _feature_set,
-            mut _epoch_schedule,
+            mut feature_set,
+            mut epoch_schedule,
             mut last_slot,
         ) = {
             let bank_forks_r = bank_forks.read().unwrap();
@@ -110,8 +112,8 @@ impl ShredFetchStage {
                     last_slot = bank_forks_r.highest_slot();
                     bank_forks_r.root_bank()
                 };
-                _feature_set = root_bank.feature_set.clone();
-                _epoch_schedule = root_bank.epoch_schedule().clone();
+                feature_set = root_bank.feature_set.clone();
+                epoch_schedule = root_bank.epoch_schedule().clone();
                 last_root = root_bank.slot();
                 slots_per_epoch = root_bank.get_slots_in_epoch(root_bank.epoch());
                 keypair = repair_context.as_ref().copied().map(RepairContext::keypair);
@@ -155,14 +157,17 @@ impl ShredFetchStage {
             let max_slot = last_slot + MAX_SHRED_DISTANCE_MINIMUM.max(2 * slots_per_epoch);
             let turbine_disabled = turbine_disabled.load(Ordering::Relaxed);
             for mut packet in packet_batch.iter_mut().filter(|p| !p.meta().discard()) {
+                let preserve_mcp_packet =
+                    is_active_mcp_shred_packet(packet.as_ref(), &feature_set, &epoch_schedule);
                 if turbine_disabled
-                    || should_discard_shred(
-                        packet.as_ref(),
-                        last_root,
-                        max_slot,
-                        shred_version,
-                        &mut stats,
-                    )
+                    || (!preserve_mcp_packet
+                        && should_discard_shred(
+                            packet.as_ref(),
+                            last_root,
+                            max_slot,
+                            shred_version,
+                            &mut stats,
+                        ))
                 {
                     packet.meta_mut().set_discard(true);
                 } else {
@@ -404,6 +409,30 @@ fn verify_repair_nonce(
         .is_some()
 }
 
+fn is_active_mcp_shred_packet(
+    packet: PacketRef,
+    feature_set: &FeatureSet,
+    epoch_schedule: &EpochSchedule,
+) -> bool {
+    let Some(data) = packet.data(..) else {
+        return false;
+    };
+    if !is_mcp_shred_bytes(data) {
+        return false;
+    }
+    let Ok(slot_bytes) =
+        <[u8; std::mem::size_of::<Slot>()]>::try_from(&data[..std::mem::size_of::<Slot>()])
+    else {
+        return false;
+    };
+    check_feature_activation(
+        &agave_feature_set::mcp_protocol_v1::id(),
+        Slot::from_le_bytes(slot_bytes),
+        feature_set,
+        epoch_schedule,
+    )
+}
+
 pub(crate) fn receive_quic_datagrams(
     quic_datagrams_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
     flags: PacketFlags,
@@ -481,6 +510,9 @@ mod tests {
     use {
         super::*,
         crossbeam_channel::unbounded,
+        solana_ledger::shred::mcp_shred::{
+            MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+        },
         solana_packet::PacketFlags,
         std::thread,
     };
@@ -510,13 +542,21 @@ mod tests {
         let mut oversized_control = vec![0u8; PACKET_DATA_SIZE + 128];
         oversized_control[0] = MCP_CONTROL_MSG_CONSENSUS_BLOCK;
         quic_sender
-            .send((sender_pubkey, remote_addr, Bytes::from(oversized_control.clone())))
+            .send((
+                sender_pubkey,
+                remote_addr,
+                Bytes::from(oversized_control.clone()),
+            ))
             .unwrap();
 
         // Oversized non-control payload should be dropped.
         let oversized_non_control = vec![9u8; PACKET_DATA_SIZE + 128];
         quic_sender
-            .send((sender_pubkey, remote_addr, Bytes::from(oversized_non_control)))
+            .send((
+                sender_pubkey,
+                remote_addr,
+                Bytes::from(oversized_non_control),
+            ))
             .unwrap();
 
         // Small non-control payload should still flow into packet batches.
@@ -542,5 +582,38 @@ mod tests {
         exit.store(true, Ordering::Relaxed);
         drop(quic_sender);
         receiver_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_is_active_mcp_shred_packet_obeys_feature_epoch_gate() {
+        let slot = 500_000u64;
+        let witness_len_offset = std::mem::size_of::<Slot>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<u32>()
+            + 32
+            + MCP_SHRED_DATA_BYTES;
+        let mut mcp_bytes = vec![0u8; MCP_SHRED_WIRE_SIZE];
+        mcp_bytes[..std::mem::size_of::<Slot>()].copy_from_slice(&slot.to_le_bytes());
+        mcp_bytes[witness_len_offset] = MCP_WITNESS_LEN as u8;
+
+        let mut packet = solana_perf::packet::Packet::default();
+        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet.meta_mut().size = mcp_bytes.len();
+
+        let feature_set = FeatureSet::default();
+        let epoch_schedule = EpochSchedule::default();
+        assert!(!is_active_mcp_shred_packet(
+            PacketRef::Packet(&packet),
+            &feature_set,
+            &epoch_schedule,
+        ));
+
+        let mut feature_set = feature_set;
+        feature_set.activate(&agave_feature_set::mcp_protocol_v1::id(), 0);
+        assert!(is_active_mcp_shred_packet(
+            PacketRef::Packet(&packet),
+            &feature_set,
+            &epoch_schedule,
+        ));
     }
 }

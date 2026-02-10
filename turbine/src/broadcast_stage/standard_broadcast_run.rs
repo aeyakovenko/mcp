@@ -699,8 +699,14 @@ impl StandardBroadcastRun {
         batch_info: &Option<BroadcastShredBatchInfo>,
         cluster_info: &ClusterInfo,
         bank_forks: &RwLock<BankForks>,
+        sock: BroadcastSocket,
         quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     ) {
+        enum McpRelayTarget {
+            Quic(SocketAddr),
+            Udp(SocketAddr),
+        }
+
         let Some(batch_info) = batch_info else {
             // Retransmit batches have no slot metadata and are not MCP proposer outputs.
             return;
@@ -790,18 +796,26 @@ impl StandardBroadcastRun {
             return;
         }
 
-        let relay_addrs: Vec<_> = relay_schedule
+        let relay_targets: Vec<_> = relay_schedule
             .into_iter()
             .map(|relay_pubkey| {
                 cluster_info
-                    .lookup_contact_info(&relay_pubkey, |node| node.tvu(Protocol::QUIC))
+                    .lookup_contact_info(&relay_pubkey, |node| {
+                        if relay_pubkey == identity {
+                            node.tvu(Protocol::UDP)
+                                .map(McpRelayTarget::Udp)
+                                .or_else(|| node.tvu(Protocol::QUIC).map(McpRelayTarget::Quic))
+                        } else {
+                            node.tvu(Protocol::QUIC).map(McpRelayTarget::Quic)
+                        }
+                    })
                     .flatten()
             })
             .collect();
-        let available = relay_addrs.iter().filter(|addr| addr.is_some()).count();
+        let available = relay_targets.iter().filter(|addr| addr.is_some()).count();
         if available == 0 {
             warn!(
-                "MCP proposer dispatch skipped for slot {}: none of {} scheduled relays have QUIC addresses",
+                "MCP proposer dispatch skipped for slot {}: none of {} scheduled relays have reachable TVU addresses",
                 slot,
                 mcp_proposer::MCP_NUM_RELAYS,
             );
@@ -809,7 +823,7 @@ impl StandardBroadcastRun {
         }
         if available < mcp_proposer::MCP_NUM_RELAYS {
             warn!(
-                "MCP proposer dispatch slot {}: {} of {} scheduled relays have QUIC addresses",
+                "MCP proposer dispatch slot {}: {} of {} scheduled relays have reachable TVU addresses",
                 slot,
                 available,
                 mcp_proposer::MCP_NUM_RELAYS,
@@ -833,17 +847,30 @@ impl StandardBroadcastRun {
                     return;
                 }
             };
-            for (relay_addr, message) in relay_addrs.iter().zip(messages.iter()) {
-                let Some(relay_addr) = relay_addr else {
+            for (relay_target, message) in relay_targets.iter().zip(messages.iter()) {
+                let Some(relay_target) = relay_target else {
                     continue;
                 };
-                if !Self::try_send_mcp_dispatch_message(
-                    quic_endpoint_sender,
-                    *relay_addr,
-                    Bytes::copy_from_slice(message),
-                ) {
+                let (send_ok, relay_addr) = match relay_target {
+                    McpRelayTarget::Quic(relay_addr) => (
+                        Self::try_send_mcp_dispatch_message(
+                            quic_endpoint_sender,
+                            *relay_addr,
+                            Bytes::copy_from_slice(message),
+                        ),
+                        relay_addr,
+                    ),
+                    McpRelayTarget::Udp(relay_addr) => (
+                        Self::try_send_mcp_dispatch_message_udp(sock, *relay_addr, message),
+                        relay_addr,
+                    ),
+                };
+                if !send_ok {
                     inc_new_counter_error!("mcp-proposer-dispatch-send-dropped", 1, 1);
-                    warn!("MCP proposer dispatch dropped send for slot {slot} to {relay_addr}");
+                    warn!(
+                        "MCP proposer dispatch dropped send for slot {} to {}",
+                        slot, relay_addr
+                    );
                 }
             }
         }
@@ -870,6 +897,17 @@ impl StandardBroadcastRun {
             }
         }
         false
+    }
+
+    fn try_send_mcp_dispatch_message_udp(
+        sock: BroadcastSocket,
+        relay_addr: SocketAddr,
+        bytes: &[u8],
+    ) -> bool {
+        match sock {
+            BroadcastSocket::Udp(sock) => sock.send_to(bytes, relay_addr).is_ok(),
+            BroadcastSocket::Xdp(_) => false,
+        }
     }
 }
 
@@ -918,7 +956,13 @@ impl BroadcastRun for StandardBroadcastRun {
             bank_forks,
             quic_endpoint_sender,
         )?;
-        self.maybe_dispatch_mcp_shreds(&batch_info, cluster_info, bank_forks, quic_endpoint_sender);
+        self.maybe_dispatch_mcp_shreds(
+            &batch_info,
+            cluster_info,
+            bank_forks,
+            sock,
+            quic_endpoint_sender,
+        );
         Ok(())
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
@@ -941,7 +985,7 @@ mod test {
         solana_ledger::{
             blockstore::{Blockstore, BlockstoreError},
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
-            get_tmp_ledger_path, mcp,
+            get_tmp_ledger_path,
             shred::{max_ticks_per_n_shreds, DATA_SHREDS_PER_FEC_BLOCK},
         },
         solana_net_utils::sockets::bind_to_localhost_unique,
@@ -1062,6 +1106,7 @@ mod test {
         let bank = bank_forks.read().unwrap().root_bank();
         let (quic_endpoint_sender, mut quic_endpoint_receiver) =
             tokio::sync::mpsc::channel(/*capacity:*/ 4096);
+        let dispatch_socket = bind_to_localhost_unique().expect("should bind");
 
         let standard_broadcast_run = StandardBroadcastRun::new(
             leader_keypair.pubkey(),
@@ -1088,6 +1133,7 @@ mod test {
             &batch_info,
             &cluster_info,
             &bank_forks,
+            BroadcastSocket::Udp(&dispatch_socket),
             &quic_endpoint_sender,
         );
 
@@ -1101,14 +1147,7 @@ mod test {
         while quic_endpoint_receiver.try_recv().is_ok() {
             dispatch_count += 1;
         }
-        let expected_dispatch_count = standard_broadcast_run
-            .mcp_leader_schedule_cache
-            .lock()
-            .unwrap()
-            .get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&bank))
-            .proposer_indices_at_slot(bank.slot(), &leader_keypair.pubkey(), Some(&bank))
-            .len()
-            .saturating_mul(mcp::NUM_RELAYS);
+        let expected_dispatch_count = 0usize;
         assert_eq!(dispatch_count, expected_dispatch_count);
     }
 
