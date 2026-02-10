@@ -10,7 +10,8 @@ use {
             decode_relay_attestation_frame, dispatch_relay_attestation_to_slot_leader,
             RelayAttestationEntry, RelayAttestationV1, MCP_CONTROL_MSG_RELAY_ATTESTATION,
         },
-        mcp_replay::McpConsensusBlockStore,
+        mcp_replay::{self, McpConsensusBlockStore},
+        mcp_vote_gate::{self, VoteGateDecision},
         repair::repair_service::{
             OutstandingShredRepairs, RepairInfo, RepairService, RepairServiceChannels,
         },
@@ -50,7 +51,7 @@ use {
     solana_votor_messages::migration::MigrationStatus,
     std::{
         borrow::Cow,
-        collections::{BTreeMap, BTreeSet, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         net::{SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -115,19 +116,35 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     leader_schedule_cache: &LeaderScheduleCache,
     mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
     turbine_quic_endpoint_sender: Option<&AsyncSender<(SocketAddr, Bytes)>>,
-) {
-    let Some(consensus_blocks) = mcp_consensus_blocks else {
-        return;
+) -> bool {
+    let log_skip = |reason: &str| {
+        trace!(
+            "MCP consensus finalize skipped for slot {}: {}",
+            slot, reason
+        );
     };
-    if consensus_blocks
-        .read()
-        .ok()
-        .is_some_and(|blocks| blocks.contains_key(&slot))
-    {
-        return;
+    let Some(consensus_blocks) = mcp_consensus_blocks else {
+        log_skip("consensus block cache unavailable");
+        return false;
+    };
+    match consensus_blocks.read() {
+        Ok(blocks) => {
+            if blocks.contains_key(&slot) {
+                log_skip("consensus block already cached");
+                return false;
+            }
+        }
+        Err(err) => {
+            warn!(
+                "failed to read MCP consensus block cache at slot {} due to poisoned lock: {}",
+                slot, err
+            );
+            return false;
+        }
     }
 
-    let (root_bank, root_slot, working_bank, delayed_bankhash) = {
+    let delayed_slot = slot.saturating_sub(1);
+    let (root_bank, root_slot, working_bank, mut delayed_bankhash) = {
         let bank_forks = bank_forks.read().unwrap();
         let root_bank = bank_forks.root_bank();
         if !cluster_nodes::check_feature_activation(
@@ -135,18 +152,21 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             slot,
             &root_bank,
         ) {
-            return;
+            log_skip("feature not active at slot");
+            return false;
         }
 
-        let delayed_bankhash = bank_forks.get(slot.saturating_sub(1)).map(|bank| bank.hash());
-        let working_bank = bank_forks
-            .get(slot)
-            .unwrap_or_else(|| root_bank.clone());
+        let delayed_bankhash = bank_forks.get(delayed_slot).map(|bank| bank.hash());
+        let working_bank = bank_forks.get(slot).unwrap_or_else(|| root_bank.clone());
         (root_bank, bank_forks.root(), working_bank, delayed_bankhash)
     };
+    if delayed_bankhash.is_none() {
+        delayed_bankhash = blockstore.get_bank_hash(delayed_slot);
+    }
     let Some(delayed_bankhash) = delayed_bankhash else {
         // Vote-gate requires delayed bankhash; do not publish partial consensus state.
-        return;
+        log_skip("missing delayed bankhash");
+        return true;
     };
 
     let proposer_schedule = leader_schedule_cache
@@ -155,7 +175,8 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         .or_else(|| leader_schedule_cache.proposers_at_slot(slot, None))
         .unwrap_or_default();
     if proposer_schedule.is_empty() {
-        return;
+        log_skip("proposer schedule unavailable");
+        return true;
     }
     let relay_schedule = leader_schedule_cache
         .relays_at_slot(slot, Some(&working_bank))
@@ -163,7 +184,8 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
         .unwrap_or_default();
     if relay_schedule.len() < mcp::NUM_RELAYS {
-        return;
+        log_skip("relay schedule unavailable");
+        return true;
     }
 
     let leader_indices: Vec<u32> = proposer_schedule
@@ -178,7 +200,8 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         })
         .collect();
     if leader_indices.is_empty() {
-        return;
+        log_skip("local node is not a leader for slot");
+        return false;
     }
 
     let mut relay_entries = Vec::new();
@@ -221,7 +244,8 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     }
 
     if relay_entries.len() < mcp::REQUIRED_ATTESTATIONS {
-        return;
+        log_skip("insufficient relay attestations");
+        return true;
     }
 
     let identity_keypair = cluster_info.keypair();
@@ -229,9 +253,17 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         let Ok(aggregate) =
             AggregateAttestation::new_canonical(slot, leader_index, relay_entries.clone())
         else {
+            trace!(
+                "MCP consensus finalize skipped for slot {} leader_index {}: aggregate canonicalization failed",
+                slot, leader_index
+            );
             continue;
         };
         let Ok(aggregate_bytes) = aggregate.to_wire_bytes() else {
+            trace!(
+                "MCP consensus finalize skipped for slot {} leader_index {}: aggregate serialization failed",
+                slot, leader_index
+            );
             continue;
         };
         let Ok(mut consensus_block) = ConsensusBlock::new_unsigned(
@@ -241,15 +273,27 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             Vec::new(),
             delayed_bankhash,
         ) else {
+            trace!(
+                "MCP consensus finalize skipped for slot {} leader_index {}: consensus block build failed",
+                slot, leader_index
+            );
             continue;
         };
         if consensus_block
             .sign_leader(identity_keypair.as_ref())
             .is_err()
         {
+            trace!(
+                "MCP consensus finalize skipped for slot {} leader_index {}: leader signature failed",
+                slot, leader_index
+            );
             continue;
         }
         let Ok(consensus_bytes) = consensus_block.to_wire_bytes() else {
+            trace!(
+                "MCP consensus finalize skipped for slot {} leader_index {}: consensus serialization failed",
+                slot, leader_index
+            );
             continue;
         };
 
@@ -279,8 +323,21 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             }
         };
         if !inserted {
-            return;
+            return false;
         }
+        debug!(
+            "cached local MCP consensus block for slot {} with {} relay attestations",
+            slot,
+            relay_entries.len()
+        );
+        maybe_persist_execution_output_from_consensus(
+            slot,
+            &working_bank,
+            bank_forks,
+            blockstore,
+            leader_schedule_cache,
+            consensus_blocks,
+        );
 
         if let Some(sender) = turbine_quic_endpoint_sender {
             let mut frame = Vec::with_capacity(1 + consensus_bytes.len());
@@ -297,8 +354,52 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
                 }
             }
         }
-        return;
+        return false;
     }
+    false
+}
+
+fn maybe_persist_execution_output_from_consensus(
+    slot: Slot,
+    bank: &solana_runtime::bank::Bank,
+    bank_forks: &RwLock<BankForks>,
+    blockstore: &Blockstore,
+    leader_schedule_cache: &LeaderScheduleCache,
+    consensus_blocks: &McpConsensusBlockStore,
+) {
+    let vote_gate_inputs = RwLock::new(HashMap::new());
+    mcp_replay::refresh_vote_gate_input(
+        slot,
+        bank,
+        bank_forks,
+        blockstore,
+        leader_schedule_cache,
+        consensus_blocks,
+        &vote_gate_inputs,
+    );
+    let decision = match vote_gate_inputs.read() {
+        Ok(inputs) => inputs.get(&slot).map(mcp_vote_gate::evaluate_vote_gate),
+        Err(err) => {
+            warn!(
+                "failed to evaluate MCP vote gate input at slot {} due to poisoned lock: {}",
+                slot, err
+            );
+            None
+        }
+    };
+    let Some(VoteGateDecision::Vote { included_proposers }) = decision else {
+        return;
+    };
+
+    let included_proposers = RwLock::new(HashMap::from([(slot, included_proposers)]));
+    mcp_replay::maybe_persist_reconstructed_execution_output(
+        slot,
+        bank,
+        bank_forks,
+        blockstore,
+        leader_schedule_cache,
+        &included_proposers,
+    );
 }
 
 #[derive(Default)]
@@ -462,25 +563,34 @@ fn run_insert<F>(
     relay_signer: &Keypair,
     mcp_relay_processor: &mut McpRelayProcessor,
     mcp_relay_attestation_sender: Option<&Sender<RelayAttestationV1>>,
+    pending_mcp_attestation_entries: &mut HashMap<Slot, BTreeMap<u32, RelayAttestationEntry>>,
+    emitted_mcp_attestation_slots: &mut HashSet<Slot>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
 {
     const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+    const MCP_ATTESTATION_STATE_RETENTION_SLOTS: Slot = 1024;
     let mut shred_receiver_elapsed = Measure::start("shred_receiver_elapsed");
     let mut shreds = verified_receiver.recv_timeout(RECV_TIMEOUT)?;
     shreds.extend(verified_receiver.try_iter().flatten());
     shred_receiver_elapsed.stop();
     ws_metrics.shred_receiver_elapsed_us += shred_receiver_elapsed.as_us();
     ws_metrics.run_insert_count += 1;
-    let mut root_bank = bank_forks.read().unwrap().root_bank();
+    let (mut root_bank, mut working_bank) = {
+        let bank_forks = bank_forks.read().unwrap();
+        (bank_forks.root_bank(), bank_forks.working_bank())
+    };
     let mut last_bank_refresh = Instant::now();
     let mut mcp_retransmit_batch = Vec::new();
     let mut mcp_shred_count = 0usize;
     let mut legacy_shreds = Vec::with_capacity(shreds.len());
     let mut proposer_pubkeys_cache: HashMap<Slot, Vec<Pubkey>> = HashMap::new();
-    let mut attestation_entries_by_slot: HashMap<Slot, BTreeMap<u32, RelayAttestationEntry>> =
-        HashMap::new();
+    let min_retained_slot = root_bank
+        .slot()
+        .saturating_sub(MCP_ATTESTATION_STATE_RETENTION_SLOTS);
+    pending_mcp_attestation_entries.retain(|slot, _| *slot >= min_retained_slot);
+    emitted_mcp_attestation_slots.retain(|slot| *slot >= min_retained_slot);
 
     for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
@@ -506,7 +616,9 @@ where
 
         if last_bank_refresh.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
             last_bank_refresh = Instant::now();
-            root_bank = bank_forks.read().unwrap().root_bank();
+            let bank_forks = bank_forks.read().unwrap();
+            root_bank = bank_forks.root_bank();
+            working_bank = bank_forks.working_bank();
             mcp_relay_processor.prune_below_slot(root_bank.slot());
             proposer_pubkeys_cache.clear();
         }
@@ -515,7 +627,11 @@ where
             .entry(mcp_shred.slot)
             .or_insert_with(|| {
                 leader_schedule_cache
-                    .proposers_at_slot(mcp_shred.slot, Some(&root_bank))
+                    .proposers_at_slot(mcp_shred.slot, Some(&working_bank))
+                    .or_else(|| {
+                        leader_schedule_cache.proposers_at_slot(mcp_shred.slot, Some(&root_bank))
+                    })
+                    .or_else(|| leader_schedule_cache.proposers_at_slot(mcp_shred.slot, None))
                     .unwrap_or_default()
             });
         let Some(proposer_pubkey) = proposer_pubkeys
@@ -556,11 +672,13 @@ where
                         );
                     }
                 }
-                attestation_entries_by_slot
-                    .entry(slot)
-                    .or_default()
-                    .entry(proposer_index)
-                    .or_insert(attestation_entry);
+                if !emitted_mcp_attestation_slots.contains(&slot) {
+                    pending_mcp_attestation_entries
+                        .entry(slot)
+                        .or_default()
+                        .entry(proposer_index)
+                        .or_insert(attestation_entry);
+                }
             }
             McpRelayOutcome::Duplicate => {
                 mcp_shred_count += 1;
@@ -579,9 +697,24 @@ where
     }
 
     if let Some(attestation_sender) = mcp_relay_attestation_sender {
-        for (slot, entries_by_proposer) in attestation_entries_by_slot {
+        let mut finalized_slots = Vec::new();
+        for (slot, entries_by_proposer) in pending_mcp_attestation_entries.iter() {
+            let slot = *slot;
+            if emitted_mcp_attestation_slots.contains(&slot) {
+                finalized_slots.push(slot);
+                continue;
+            }
+            // Emit once per slot after we have full proposer coverage, or after
+            // the slot has aged by one working-bank step so late shreds can coalesce.
+            let should_emit = entries_by_proposer.len() >= mcp::NUM_PROPOSERS
+                || slot.saturating_add(1) < working_bank.slot();
+            if !should_emit {
+                continue;
+            }
+
             let relay_indices = leader_schedule_cache
-                .relays_at_slot(slot, Some(&root_bank))
+                .relays_at_slot(slot, Some(&working_bank))
+                .or_else(|| leader_schedule_cache.relays_at_slot(slot, Some(&root_bank)))
                 .or_else(|| leader_schedule_cache.relays_at_slot(slot, None))
                 .map(|relays| relay_indices_for_pubkey(&relays, local_pubkey))
                 .unwrap_or_default();
@@ -589,7 +722,8 @@ where
                 continue;
             }
 
-            let entries: Vec<RelayAttestationEntry> = entries_by_proposer.into_values().collect();
+            let entries: Vec<RelayAttestationEntry> =
+                entries_by_proposer.values().cloned().collect();
             if entries.is_empty() {
                 continue;
             }
@@ -637,6 +771,11 @@ where
                     );
                 }
             }
+            emitted_mcp_attestation_slots.insert(slot);
+            finalized_slots.push(slot);
+        }
+        for slot in finalized_slots {
+            pending_mcp_attestation_entries.remove(&slot);
         }
     }
 
@@ -1044,6 +1183,13 @@ impl WindowService {
                 let mut metrics = BlockstoreInsertionMetrics::default();
                 let mut ws_metrics = WindowServiceMetrics::default();
                 let mut mcp_relay_processor = McpRelayProcessor::default();
+                let mut pending_mcp_attestation_entries: HashMap<
+                    Slot,
+                    BTreeMap<u32, RelayAttestationEntry>,
+                > = HashMap::new();
+                let mut emitted_mcp_attestation_slots: HashSet<Slot> = HashSet::new();
+                let mut pending_mcp_consensus_slots: HashSet<Slot> = HashSet::new();
+                const MCP_PENDING_CONSENSUS_RETENTION_SLOTS: Slot = 1024;
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     let relay_signer = cluster_info.keypair();
@@ -1064,14 +1210,16 @@ impl WindowService {
                         relay_signer.as_ref(),
                         &mut mcp_relay_processor,
                         mcp_relay_attestation_sender.as_ref(),
+                        &mut pending_mcp_attestation_entries,
+                        &mut emitted_mcp_attestation_slots,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
                             break;
                         }
                     }
+                    let mut candidate_slots = BTreeSet::new();
                     if let Some(receiver) = mcp_control_message_receiver.as_ref() {
-                        let mut candidate_slots = BTreeSet::new();
                         for (sender_pubkey, remote_address, frame) in receiver.try_iter() {
                             if let Some(slot) = ingest_mcp_control_message(
                                 sender_pubkey,
@@ -1085,19 +1233,6 @@ impl WindowService {
                                 candidate_slots.insert(slot);
                             }
                         }
-
-                        for slot in candidate_slots {
-                            maybe_finalize_and_broadcast_mcp_consensus_block(
-                                slot,
-                                &local_pubkey,
-                                &cluster_info,
-                                &blockstore,
-                                &bank_forks,
-                                &leader_schedule_cache,
-                                mcp_consensus_blocks.as_ref(),
-                                turbine_quic_endpoint_sender.as_ref(),
-                            );
-                        }
                     }
                     if let (Some(receiver), Some(quic_sender)) = (
                         mcp_relay_attestation_receiver.as_ref(),
@@ -1105,6 +1240,7 @@ impl WindowService {
                     ) {
                         let root_bank = bank_forks.read().unwrap().root_bank();
                         for attestation in receiver.try_iter() {
+                            candidate_slots.insert(attestation.slot);
                             if let Err(err) = dispatch_relay_attestation_to_slot_leader(
                                 &attestation,
                                 &leader_schedule_cache,
@@ -1117,6 +1253,28 @@ impl WindowService {
                                     attestation.slot, err
                                 );
                             }
+                        }
+                    }
+                    let root_slot = bank_forks.read().unwrap().root();
+                    let min_retained_slot =
+                        root_slot.saturating_sub(MCP_PENDING_CONSENSUS_RETENTION_SLOTS);
+                    pending_mcp_consensus_slots.retain(|slot| *slot >= min_retained_slot);
+                    candidate_slots.extend(pending_mcp_consensus_slots.iter().copied());
+                    pending_mcp_consensus_slots.clear();
+
+                    for slot in candidate_slots {
+                        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
+                            slot,
+                            &local_pubkey,
+                            &cluster_info,
+                            &blockstore,
+                            &bank_forks,
+                            &leader_schedule_cache,
+                            mcp_consensus_blocks.as_ref(),
+                            turbine_quic_endpoint_sender.as_ref(),
+                        );
+                        if should_retry && slot >= min_retained_slot {
+                            pending_mcp_consensus_slots.insert(slot);
                         }
                     }
 
@@ -1245,15 +1403,14 @@ mod test {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = Hash::new_unique();
-        let mut block =
-            ConsensusBlock::new_unsigned(
-                slot,
-                leader_index,
-                aggregate_bytes,
-                vec![],
-                delayed_bankhash,
-            )
-                .unwrap();
+        let mut block = ConsensusBlock::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            vec![],
+            delayed_bankhash,
+        )
+        .unwrap();
         block.sign_leader(&leader).unwrap();
         let payload = block.to_wire_bytes().unwrap();
         let mut frame = Vec::with_capacity(1 + payload.len());
@@ -1308,15 +1465,14 @@ mod test {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = Hash::new_unique();
-        let mut block =
-            ConsensusBlock::new_unsigned(
-                slot,
-                leader_index,
-                aggregate_bytes,
-                vec![],
-                delayed_bankhash,
-            )
-                .unwrap();
+        let mut block = ConsensusBlock::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            vec![],
+            delayed_bankhash,
+        )
+        .unwrap();
         block.sign_leader(&leader).unwrap();
         let payload = block.to_wire_bytes().unwrap();
         let mut frame = Vec::with_capacity(1 + payload.len());
@@ -1342,8 +1498,7 @@ mod test {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Arc::new(Keypair::new());
-        let mut genesis =
-            create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
         genesis
             .genesis_config
             .accounts
@@ -1441,8 +1596,7 @@ mod test {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Arc::new(Keypair::new());
-        let mut genesis =
-            create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
         genesis
             .genesis_config
             .accounts
@@ -1523,8 +1677,7 @@ mod test {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Arc::new(Keypair::new());
-        let mut genesis =
-            create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
         genesis
             .genesis_config
             .accounts
@@ -1615,7 +1768,10 @@ mod test {
 
         let (remote_addr, frame) = receiver.try_recv().unwrap();
         assert_eq!(remote_addr, expected_peer_tvu_quic);
-        assert_eq!(frame.first().copied(), Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK));
+        assert_eq!(
+            frame.first().copied(),
+            Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK)
+        );
         let broadcast_block = ConsensusBlock::from_wire_bytes(&frame[1..]).unwrap();
         assert_eq!(broadcast_block.slot, slot);
     }

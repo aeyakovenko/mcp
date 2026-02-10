@@ -1142,6 +1142,16 @@ impl ReplayStage {
                     );
                     select_vote_and_reset_forks_time.stop();
 
+                    Self::maybe_process_pending_mcp_slots(
+                        &heaviest_bank,
+                        &mcp_consensus_blocks,
+                        &mcp_vote_gate_inputs,
+                        &mcp_vote_gate_included_proposers,
+                        &bank_forks,
+                        &blockstore,
+                        &leader_schedule_cache,
+                    );
+
                     if vote_bank.is_none() {
                         Self::maybe_refresh_last_vote(
                             &mut tower,
@@ -2973,6 +2983,105 @@ impl ReplayStage {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_process_pending_mcp_slots(
+        heaviest_bank: &Arc<Bank>,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+        mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
+        mcp_vote_gate_included_proposers: &RwLock<
+            HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>,
+        >,
+        bank_forks: &Arc<RwLock<BankForks>>,
+        blockstore: &Blockstore,
+        leader_schedule_cache: &Arc<LeaderScheduleCache>,
+    ) {
+        if !heaviest_bank
+            .feature_set
+            .is_active(&agave_feature_set::mcp_protocol_v1::id())
+        {
+            return;
+        }
+
+        const MCP_PENDING_PROCESS_PER_LOOP: usize = 16;
+
+        let mut pending_slots = match mcp_consensus_blocks.read() {
+            Ok(consensus_blocks) => consensus_blocks.keys().copied().collect::<Vec<_>>(),
+            Err(err) => {
+                warn!(
+                    "failed to read MCP consensus block cache while processing pending slots: {}",
+                    err
+                );
+                return;
+            }
+        };
+        if pending_slots.is_empty() {
+            return;
+        }
+        pending_slots.sort_unstable();
+
+        let heaviest_slot = heaviest_bank.slot();
+        let pending_slot_banks = {
+            let bank_forks = bank_forks.read().unwrap();
+            let root_slot = bank_forks.root();
+            pending_slots
+                .into_iter()
+                .filter(|slot| *slot >= root_slot && *slot <= heaviest_slot)
+                .map(|slot| (slot, bank_forks.get(slot)))
+                .collect::<Vec<_>>()
+        };
+        let start = pending_slot_banks
+            .len()
+            .saturating_sub(MCP_PENDING_PROCESS_PER_LOOP);
+        if start < pending_slot_banks.len() {
+            debug!(
+                "processing {} pending MCP consensus slots (heaviest={}, window={})",
+                pending_slot_banks.len(),
+                heaviest_slot,
+                MCP_PENDING_PROCESS_PER_LOOP
+            );
+        }
+        for (slot, slot_bank) in pending_slot_banks.into_iter().skip(start) {
+            if blockstore
+                .get_mcp_execution_output(slot)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                continue;
+            }
+
+            let slot_bank = slot_bank.unwrap_or_else(|| heaviest_bank.clone());
+            mcp_replay::refresh_vote_gate_input(
+                slot,
+                slot_bank.as_ref(),
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_consensus_blocks,
+                mcp_vote_gate_inputs,
+            );
+            if !Self::should_vote_mcp_slot(
+                slot,
+                mcp_vote_gate_inputs,
+                mcp_vote_gate_included_proposers,
+            ) {
+                continue;
+            }
+            debug!(
+                "MCP vote gate passed while processing pending slot {} in replay loop",
+                slot
+            );
+            mcp_replay::maybe_persist_reconstructed_execution_output(
+                slot,
+                slot_bank.as_ref(),
+                bank_forks,
+                blockstore,
+                leader_schedule_cache,
+                mcp_vote_gate_included_proposers,
+            );
+        }
+    }
+
     fn should_vote_mcp_slot(
         slot: Slot,
         mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
@@ -2986,13 +3095,15 @@ impl ReplayStage {
         let decision = match mcp_vote_gate_inputs.read() {
             Ok(inputs) => {
                 let Some(input) = inputs.get(&slot) else {
-                    info!(
+                    debug!(
                         "MCP vote gate missing input for slot {}; rejecting vote",
                         slot
                     );
                     return false;
                 };
-                mcp_vote_gate::evaluate_vote_gate(input)
+                let decision = mcp_vote_gate::evaluate_vote_gate(input);
+                trace!("MCP vote gate decision at slot {}: {:?}", slot, decision);
+                decision
             }
             Err(err) => {
                 warn!(
@@ -3889,6 +4000,8 @@ impl ReplayStage {
                     ("slot", bank_slot, i64),
                     ("hash", bank.hash().to_string(), String),
                 );
+                // Persist frozen bank hashes for MCP delayed-bankhash verification.
+                blockstore.insert_bank_hash(bank_slot, bank.hash(), false);
 
                 if let Some(transaction_status_sender) = transaction_status_sender {
                     transaction_status_sender.send_transaction_status_freeze_message(bank);
