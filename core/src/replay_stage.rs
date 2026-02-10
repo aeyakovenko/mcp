@@ -3004,13 +3004,28 @@ impl ReplayStage {
         };
 
         if slot % MCP_VOTE_GATE_PRUNE_PERIOD_SLOTS == 0 {
-            if let Ok(mut inputs) = mcp_vote_gate_inputs.try_write() {
-                let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
-                inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
+            match mcp_vote_gate_inputs.write() {
+                Ok(mut inputs) => {
+                    inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "MCP vote gate input lock poisoned while pruning at slot {}: {}",
+                        slot, err
+                    );
+                }
             }
-            if let Ok(mut included_proposers) = mcp_vote_gate_included_proposers.try_write() {
-                let min_slot = slot.saturating_sub(MCP_VOTE_GATE_INPUT_RETENTION_SLOTS);
-                included_proposers.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            match mcp_vote_gate_included_proposers.write() {
+                Ok(mut included_proposers) => {
+                    included_proposers.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "MCP vote gate proposer-output lock poisoned while pruning at slot {}: {}",
+                        slot, err
+                    );
+                }
             }
         }
 
