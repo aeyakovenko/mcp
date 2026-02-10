@@ -363,6 +363,7 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
     }
 
     let mut reconstructed_batches: Vec<(u32, Vec<ReconstructedTransaction>)> = Vec::new();
+    let mut reconstructed_any_proposer = false;
     for (proposer_index, commitment) in included_proposers {
         let Some(proposer_pubkey) = proposers.get(proposer_index as usize) else {
             continue;
@@ -405,6 +406,7 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
         let Ok(decoded_payload) = decode_reconstructed_payload(&payload) else {
             continue;
         };
+        reconstructed_any_proposer = true;
 
         let transactions = decoded_payload
             .transactions
@@ -424,6 +426,9 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
     }
 
     if reconstructed_batches.is_empty() {
+        if reconstructed_any_proposer {
+            let _ = blockstore.put_mcp_empty_execution_output_if_absent(slot);
+        }
         return;
     }
 
@@ -452,10 +457,9 @@ mod tests {
         agave_feature_set as feature_set,
         solana_keypair::Keypair,
         solana_ledger::{
-            blockstore::Blockstore,
-            genesis_utils::create_genesis_config_with_leader,
-            get_tmp_ledger_path_auto_delete,
-            mcp_aggregate_attestation::AggregateAttestation,
+            blockstore::Blockstore, genesis_utils::create_genesis_config_with_leader,
+            get_tmp_ledger_path_auto_delete, mcp_aggregate_attestation::AggregateAttestation,
+            mcp_erasure::encode_fec_set, shred::mcp_shred::McpShred,
         },
         solana_runtime::bank_forks::BankForks,
         solana_signer::Signer,
@@ -587,5 +591,83 @@ mod tests {
         assert!(input.leader_index_matches);
         assert!(input.delayed_bankhash_available);
         assert!(input.delayed_bankhash_matches);
+    }
+
+    #[test]
+    fn test_maybe_persist_reconstructed_execution_output_marks_empty_output() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+
+        let slot = 1;
+        let bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(
+                root_bank.clone(),
+                &leader.pubkey(),
+                slot,
+            ))
+            .clone_without_scheduler();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let proposer_index = leader_schedule_cache
+            .proposer_indices_at_slot(slot, &leader.pubkey(), Some(&bank))
+            .into_iter()
+            .next()
+            .expect("leader should be a proposer");
+
+        let payload = Vec::new();
+        let shreds = encode_fec_set(&payload).unwrap();
+        let (commitment, witnesses) = solana_ledger::mcp_merkle::commitment_and_witnesses::<
+            { mcp::SHRED_DATA_BYTES },
+            { mcp::MCP_WITNESS_LEN },
+        >(slot, proposer_index, &shreds)
+        .unwrap();
+        let proposer_signature = leader.sign_message(&commitment);
+        for shred_index in 0..mcp::REQUIRED_RECONSTRUCTION {
+            let message = McpShred {
+                slot,
+                proposer_index,
+                shred_index: shred_index as u32,
+                commitment,
+                shred_data: shreds[shred_index],
+                witness: witnesses[shred_index],
+                proposer_signature,
+            }
+            .to_bytes();
+            blockstore
+                .put_mcp_shred_data(slot, proposer_index, shred_index as u32, &message)
+                .unwrap();
+        }
+
+        let mcp_vote_gate_included_proposers =
+            RwLock::<HashMap<Slot, BTreeMap<u32, Commitment>>>::new(HashMap::new());
+        mcp_vote_gate_included_proposers
+            .write()
+            .unwrap()
+            .insert(slot, BTreeMap::from([(proposer_index, commitment)]));
+
+        maybe_persist_reconstructed_execution_output(
+            slot,
+            &bank,
+            &bank_forks,
+            &blockstore,
+            &leader_schedule_cache,
+            &mcp_vote_gate_included_proposers,
+        );
+
+        assert_eq!(
+            blockstore.get_mcp_execution_output(slot).unwrap(),
+            Some(vec![])
+        );
     }
 }

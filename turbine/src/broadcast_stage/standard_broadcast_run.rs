@@ -714,7 +714,12 @@ impl StandardBroadcastRun {
             let feature_active = bank
                 .feature_set
                 .is_active(&feature_set::mcp_protocol_v1::id());
-            (feature_active, bank, bank_forks.root_bank(), bank_forks.root())
+            (
+                feature_active,
+                bank,
+                bank_forks.root_bank(),
+                bank_forks.root(),
+            )
         };
         if !feature_active {
             return;
@@ -723,8 +728,7 @@ impl StandardBroadcastRun {
         let identity = cluster_info.id();
         let (proposer_indices, relay_schedule) = {
             let mut cache = self.mcp_leader_schedule_cache.lock().unwrap();
-            let cache =
-                cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&root_bank));
+            let cache = cache.get_or_insert_with(|| LeaderScheduleCache::new_from_bank(&root_bank));
             cache.set_root(&root_bank);
             (
                 cache.proposer_indices_at_slot(slot, &identity, Some(&working_bank)),
@@ -757,10 +761,6 @@ impl StandardBroadcastRun {
         let Some(payload_transactions) = maybe_payload_transactions else {
             return;
         };
-        if payload_transactions.is_empty() {
-            warn!("MCP proposer dispatch skipped for slot {slot}: empty payload");
-            return;
-        }
         let Some(payload_bytes) = encode_mcp_payload(payload_transactions) else {
             warn!("MCP proposer dispatch skipped for slot {slot}: invalid payload framing");
             return;
@@ -918,12 +918,7 @@ impl BroadcastRun for StandardBroadcastRun {
             bank_forks,
             quic_endpoint_sender,
         )?;
-        self.maybe_dispatch_mcp_shreds(
-            &batch_info,
-            cluster_info,
-            bank_forks,
-            quic_endpoint_sender,
-        );
+        self.maybe_dispatch_mcp_shreds(&batch_info, cluster_info, bank_forks, quic_endpoint_sender);
         Ok(())
     }
     fn record(&mut self, receiver: &RecordReceiver, blockstore: &Blockstore) -> Result<()> {
@@ -1059,7 +1054,8 @@ mod test {
         let mut genesis_config =
             create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1_000)
                 .genesis_config;
-        genesis_config.ticks_per_slot = max_ticks_per_n_shreds(DATA_SHREDS_PER_FEC_BLOCK as u64, None) + 1;
+        genesis_config.ticks_per_slot =
+            max_ticks_per_n_shreds(DATA_SHREDS_PER_FEC_BLOCK as u64, None) + 1;
         let mut bank = Bank::new_for_tests(&genesis_config);
         bank.activate_feature(&feature_set::mcp_protocol_v1::id());
         let bank_forks = BankForks::new_rw_arc(bank);
