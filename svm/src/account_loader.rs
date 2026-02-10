@@ -402,7 +402,7 @@ pub fn validate_fee_payer_for_mcp(
         error_metrics,
         rent,
         fee,
-        MCP_NUM_PROPOSERS,
+        MCP_NUM_PROPOSERS as u64,
     )
 }
 
@@ -1543,7 +1543,7 @@ mod tests {
             ..Rent::default()
         };
         let fee = 5_000;
-        let scaled_fee = fee * MCP_NUM_PROPOSERS;
+        let scaled_fee = fee * MCP_NUM_PROPOSERS as u64;
         let min_balance = rent.minimum_balance(NonceState::size());
         let payer = Keypair::new();
 

@@ -573,7 +573,7 @@ impl Consumer {
                 .minimum_balance(solana_nonce::state::State::size()),
         };
         let scaled_fee = base_fee
-            .checked_mul(MCP_NUM_PROPOSERS)
+            .checked_mul(MCP_NUM_PROPOSERS as u64)
             .ok_or(TransactionError::InsufficientFundsForFee)?;
         fee_tracker.try_reserve(
             bank.slot(),
