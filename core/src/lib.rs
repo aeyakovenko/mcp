@@ -27,6 +27,8 @@ pub mod ed25519_sigverifier;
 pub mod fetch_stage;
 pub mod forwarding_stage;
 pub mod gen_keys;
+#[cfg(test)]
+mod mcp_constant_consistency;
 pub mod mcp_relay;
 pub mod mcp_relay_submit;
 mod mcp_replay;
@@ -54,8 +56,6 @@ pub mod vote_simulator;
 pub mod voting_service;
 pub mod warm_quic_cache_service;
 pub mod window_service;
-#[cfg(test)]
-mod mcp_constant_consistency;
 
 #[macro_use]
 extern crate log;

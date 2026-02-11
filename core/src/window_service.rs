@@ -697,6 +697,15 @@ where
                          existing={}, incoming={}",
                             marker.existing_hash, marker.incoming_hash,
                         );
+                        // Persisted conflict means we observed equivocation for this proposer/slot.
+                        // Suppress attestation generation even if relay in-memory state was reset.
+                        suppressed_mcp_attestation_proposers
+                            .entry(slot)
+                            .or_default()
+                            .insert(proposer_index);
+                        if let Some(entries) = pending_mcp_attestation_entries.get_mut(&slot) {
+                            entries.remove(&proposer_index);
+                        }
                     }
                 }
                 if !emitted_mcp_attestation_slots.contains(&slot) {

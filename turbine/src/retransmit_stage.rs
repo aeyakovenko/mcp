@@ -464,8 +464,8 @@ fn retransmit_shred(
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     stats: &RetransmitStats,
 ) -> Option<RetransmitShredOutput> {
-    let key = shred::layout::get_shred_id(shred.as_ref())
-        .or_else(|| get_mcp_shred_id(shred.as_ref()))?;
+    let key =
+        shred::layout::get_shred_id(shred.as_ref()).or_else(|| get_mcp_shred_id(shred.as_ref()))?;
     if key.slot() < root_bank.slot()
         || shred_deduper.dedup(key, shred.as_ref(), MAX_DUPLICATE_COUNT)
     {
@@ -557,11 +557,7 @@ fn get_mcp_shred_id(shred: &[u8]) -> Option<ShredId> {
         .proposer_index
         .checked_mul(u32::try_from(MCP_NUM_RELAYS).ok()?)?
         .checked_add(mcp_shred.shred_index)?;
-    Some(ShredId::new(
-        mcp_shred.slot,
-        packed_index,
-        ShredType::Data,
-    ))
+    Some(ShredId::new(mcp_shred.slot, packed_index, ShredType::Data))
 }
 
 fn get_retransmit_addrs<'a>(

@@ -86,7 +86,12 @@ pub fn evaluate_vote_gate(input: &VoteGateInput) -> VoteGateDecision {
         .aggregate
         .iter()
         .filter(|relay| relay.relay_signature_valid)
-        .filter(|relay| relay.entries.iter().any(|entry| entry.proposer_signature_valid))
+        .filter(|relay| {
+            relay
+                .entries
+                .iter()
+                .any(|entry| entry.proposer_signature_valid)
+        })
         .collect();
     let valid_relay_count = valid_relays
         .iter()

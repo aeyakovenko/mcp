@@ -102,7 +102,9 @@ mod tests {
     use {
         super::*,
         solana_keypair::Keypair,
-        solana_ledger::shred::mcp_shred::{McpShredError, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN},
+        solana_ledger::shred::mcp_shred::{
+            McpShredError, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+        },
         solana_sha256_hasher::hashv,
         solana_signer::Signer,
     };

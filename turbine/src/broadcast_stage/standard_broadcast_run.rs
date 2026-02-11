@@ -1308,8 +1308,18 @@ mod test {
     #[test]
     fn test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state() {
         let leader_keypair = Arc::new(Keypair::new());
+        let mut leader_info = ContactInfo::new_localhost(&leader_keypair.pubkey(), 0);
+        // Force QUIC-only relay targets so dispatch fanout is observable via
+        // the QUIC endpoint channel in this unit test.
+        leader_info.remove_tvu();
+        let relay_tvu_quic = bind_to_localhost_unique().expect("should bind");
+        let relay_tvu_quic_addr = relay_tvu_quic.local_addr().expect("should have local addr");
+        drop(relay_tvu_quic);
+        leader_info
+            .set_tvu(Protocol::QUIC, relay_tvu_quic_addr)
+            .expect("should set QUIC TVU address");
         let cluster_info = Arc::new(ClusterInfo::new(
-            ContactInfo::new_localhost(&leader_keypair.pubkey(), 0),
+            leader_info,
             leader_keypair.clone(),
             SocketAddrSpace::Unspecified,
         ));
@@ -1364,11 +1374,26 @@ mod test {
             .unwrap()
             .get(&bank.slot())
             .is_none());
+
+        let expected_dispatch_count = {
+            let cache = LeaderScheduleCache::new_from_bank(bank.as_ref());
+            let proposer_indices =
+                cache.proposer_indices_at_slot(bank.slot(), &leader_keypair.pubkey(), Some(&bank));
+            let relay_schedule = cache
+                .relays_at_slot(bank.slot(), Some(&bank))
+                .expect("relay schedule should be available when MCP feature is active");
+            let quic_targets = relay_schedule
+                .iter()
+                .filter(|relay_pubkey| **relay_pubkey == leader_keypair.pubkey())
+                .count();
+            proposer_indices.len() * quic_targets
+        };
+        assert!(expected_dispatch_count > 0);
+
         let mut dispatch_count = 0usize;
         while quic_endpoint_receiver.try_recv().is_ok() {
             dispatch_count += 1;
         }
-        let expected_dispatch_count = 0usize;
         assert_eq!(dispatch_count, expected_dispatch_count);
     }
 

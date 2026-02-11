@@ -110,19 +110,18 @@ impl Bank {
                                 fee_budget.prioritization_fee,
                                 fee_features,
                             );
-                            let fee_details = if self
-                                .feature_set
-                                .is_active(&mcp_protocol_v1::id())
+                            let fee_details = if self.feature_set.is_active(&mcp_protocol_v1::id())
                             {
-                                tx.borrow()
-                                    .mcp_fee_components()
-                                    .map_or(fee_details, |(inclusion_fee, ordering_fee)| {
+                                tx.borrow().mcp_fee_components().map_or(
+                                    fee_details,
+                                    |(inclusion_fee, ordering_fee)| {
                                         apply_mcp_fee_component_values(
                                             fee_details,
                                             inclusion_fee,
                                             ordering_fee,
                                         )
-                                    })
+                                    },
+                                )
                             } else {
                                 fee_details
                             };

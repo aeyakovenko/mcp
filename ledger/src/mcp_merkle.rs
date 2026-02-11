@@ -44,8 +44,8 @@ pub fn commitment_root<const SHRED_DATA_BYTES: usize>(
         .iter()
         .enumerate()
         .map(|(shred_index, shred_data)| {
-            let shred_index =
-                u32::try_from(shred_index).map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
+            let shred_index = u32::try_from(shred_index)
+                .map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
             Ok(hashv(&[
                 &LEAF_DOMAIN,
                 &slot.to_le_bytes(),
@@ -93,8 +93,8 @@ pub fn witness_for_leaf<const SHRED_DATA_BYTES: usize>(
         .iter()
         .enumerate()
         .map(|(shred_index, shred_data)| {
-            let shred_index =
-                u32::try_from(shred_index).map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
+            let shred_index = u32::try_from(shred_index)
+                .map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
             Ok(hashv(&[
                 &LEAF_DOMAIN,
                 &slot.to_le_bytes(),
@@ -175,8 +175,8 @@ fn build_levels<const SHRED_DATA_BYTES: usize>(
         .iter()
         .enumerate()
         .map(|(shred_index, shred_data)| {
-            let shred_index =
-                u32::try_from(shred_index).map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
+            let shred_index = u32::try_from(shred_index)
+                .map_err(|_| McpMerkleError::TooManyShreds(shreds.len()))?;
             Ok(hashv(&[
                 &LEAF_DOMAIN,
                 &slot.to_le_bytes(),
@@ -285,18 +285,16 @@ mod tests {
         let shreds = vec![[9u8; 4], [8u8; 4], [7u8; 4], [6u8; 4]];
         let leaf_index = 2usize;
         let (root, witness) = witness_for_leaf(5, 1, &shreds, leaf_index).unwrap();
-        assert!(
-            verify_witness(
-                5,
-                1,
-                leaf_index as u32,
-                &shreds[leaf_index],
-                &witness,
-                &root,
-                shreds.len(),
-            )
-            .unwrap()
-        );
+        assert!(verify_witness(
+            5,
+            1,
+            leaf_index as u32,
+            &shreds[leaf_index],
+            &witness,
+            &root,
+            shreds.len(),
+        )
+        .unwrap());
     }
 
     #[test]

@@ -5768,6 +5768,74 @@ pub mod tests {
     }
 
     #[test]
+    fn test_execute_batch_mcp_two_pass_charges_fee_per_occurrence() {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(100_000, &dummy_leader_pubkey, 100);
+        genesis_config.fee_rate_governor.lamports_per_signature = 5_000;
+        genesis_config
+            .fee_rate_governor
+            .target_lamports_per_signature = 5_000;
+        let run_case = |tx_count: usize| -> u64 {
+            let mut bank = Bank::new_for_tests(&genesis_config);
+            bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+            let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+            let bank = Arc::new(bank);
+
+            let payer = mint_keypair.pubkey();
+            let before_balance = bank.get_balance(&payer);
+            let txs: Vec<_> = (0..tx_count)
+                .map(|_| {
+                    RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                        &mint_keypair,
+                        &Pubkey::new_unique(),
+                        0,
+                        bank.last_blockhash(),
+                    ))
+                })
+                .collect();
+
+            let mut batch = TransactionBatch::new(
+                vec![Ok(()); txs.len()],
+                &bank,
+                OwnedOrBorrowed::Borrowed(&txs),
+            );
+            batch.set_needs_unlock(false);
+            let batch = TransactionBatchWithIndexes {
+                batch,
+                transaction_indexes: vec![],
+            };
+
+            let prioritization_fee_cache = PrioritizationFeeCache::default();
+            let mut timing = ExecuteTimings::default();
+            let result = execute_batch(
+                &batch,
+                &bank,
+                None,
+                None,
+                &mut timing,
+                None,
+                &prioritization_fee_cache,
+                None::<fn(&Result<ProcessedTransaction>) -> Result<Option<usize>>>,
+            );
+            assert_eq!(result, Ok(()));
+            before_balance.saturating_sub(bank.get_balance(&payer))
+        };
+
+        let one_occurrence_fee = run_case(1);
+        assert!(one_occurrence_fee > 0);
+        let two_occurrence_fee = run_case(2);
+        assert_eq!(
+            two_occurrence_fee,
+            one_occurrence_fee.saturating_mul(2),
+            "MCP two-pass fee path must charge once per transaction occurrence",
+        );
+    }
+
+    #[test]
     fn test_should_use_mcp_two_pass_fees_requires_block_verification_and_feature() {
         let dummy_leader_pubkey = solana_pubkey::new_rand();
         let GenesisConfigInfo { genesis_config, .. } =

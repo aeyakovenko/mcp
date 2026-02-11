@@ -18,6 +18,7 @@ use {
         consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
+        mcp_replay,
         mcp_relay_submit::RelayAttestationV1,
         repair::repair_service::{OutstandingShredRepairs, RepairInfo, RepairServiceChannels},
         replay_stage::{ReplayReceivers, ReplaySenders, ReplayStage, ReplayStageConfig},
@@ -104,6 +105,7 @@ pub struct Tvu {
     alpenglow_sigverify_service: BLSSigverifyService,
     alpenglow_quic_t: thread::JoinHandle<()>,
     _mcp_relay_attestation_sender: Sender<RelayAttestationV1>,
+    mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
 }
 
 // The maximum number of alpenglow packets that can be processed in a single batch
@@ -555,7 +557,15 @@ impl Tvu {
             alpenglow_sigverify_service,
             alpenglow_quic_t,
             _mcp_relay_attestation_sender: mcp_relay_attestation_sender,
+            mcp_consensus_blocks,
         })
+    }
+
+    pub fn mcp_consensus_block_bytes(&self, slot: Slot) -> Option<Vec<u8>> {
+        self.mcp_consensus_blocks
+            .read()
+            .ok()
+            .and_then(|blocks| blocks.get(&slot).cloned())
     }
 
     pub fn join(self) -> thread::Result<()> {

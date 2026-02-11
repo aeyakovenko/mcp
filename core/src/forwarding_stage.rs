@@ -10,9 +10,9 @@ use {
     crossbeam_channel::{Receiver, RecvTimeoutError},
     packet_container::PacketContainer,
     solana_client::connection_cache::ConnectionCache,
+    solana_clock::{FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_connection_cache::client_connection::ClientConnection,
     solana_cost_model::cost_model::CostModel,
-    solana_clock::{FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, node::NodeMultihoming},
     solana_keypair::Keypair,
@@ -30,7 +30,6 @@ use {
         runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
     },
     solana_streamer::sendmmsg::{batch_send, SendPktsError},
-    solana_turbine::cluster_nodes,
     solana_tpu_client_next::{
         connection_workers_scheduler::{
             BindTarget, ConnectionWorkersSchedulerConfig, Fanout, StakeIdentity,
@@ -41,6 +40,7 @@ use {
     },
     solana_transaction::sanitized::MessageHash,
     solana_transaction_error::TransportError,
+    solana_turbine::cluster_nodes,
     std::{
         collections::HashSet,
         net::{SocketAddr, UdpSocket},
@@ -606,8 +606,7 @@ impl ConnectionCacheClient {
         }
     }
     fn get_next_valid_leaders(&self) -> Vec<SocketAddr> {
-        self
-            .forward_address_getter
+        self.forward_address_getter
             .get_non_vote_forwarding_addresses(
                 NUM_LOOKAHEAD_LEADERS,
                 self.connection_cache.protocol(),
@@ -926,15 +925,12 @@ mod tests {
         solana_perf::packet::{Packet, PacketBatch, PinnedPacketBatch},
         solana_poh_config::PohConfig,
         solana_pubkey::Pubkey,
-        solana_runtime::genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         solana_runtime::bank_forks::BankForks,
+        solana_runtime::genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         solana_system_transaction as system_transaction,
-        std::sync::{
-            atomic::AtomicBool,
-            Arc, Mutex,
-        },
+        std::sync::{atomic::AtomicBool, Arc, Mutex},
     };
 
     #[derive(Clone)]
@@ -1092,8 +1088,11 @@ mod tests {
 
         let local_keypair = Arc::new(Keypair::new());
         let local_contact_info = ContactInfo::new_localhost(&local_keypair.pubkey(), 0);
-        let cluster_info =
-            Arc::new(ClusterInfo::new(local_contact_info, local_keypair, SocketAddrSpace::Unspecified));
+        let cluster_info = Arc::new(ClusterInfo::new(
+            local_contact_info,
+            local_keypair,
+            SocketAddrSpace::Unspecified,
+        ));
         let leader_contact_info = ContactInfo::new_localhost(&leader.pubkey(), 0);
         let expected_address = leader_contact_info.tpu_forwards(Protocol::UDP).unwrap();
         cluster_info.insert_info(leader_contact_info);

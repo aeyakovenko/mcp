@@ -3191,11 +3191,7 @@ impl Blockstore {
         Ok(McpPutStatus::Inserted)
     }
 
-    fn validate_mcp_len(
-        kind: &'static str,
-        value: &[u8],
-        max: usize,
-    ) -> Result<()> {
+    fn validate_mcp_len(kind: &'static str, value: &[u8], max: usize) -> Result<()> {
         if value.len() > max {
             return Err(BlockstoreError::InvalidMcpLength {
                 kind,
@@ -6791,7 +6787,10 @@ pub mod tests {
         assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), None);
 
         blockstore.put_mcp_empty_execution_output(99).unwrap();
-        assert_eq!(blockstore.get_mcp_execution_output(99).unwrap(), Some(vec![]));
+        assert_eq!(
+            blockstore.get_mcp_execution_output(99).unwrap(),
+            Some(vec![])
+        );
 
         blockstore
             .put_mcp_execution_output(99, b"ordered-output")
@@ -6863,8 +6862,12 @@ pub mod tests {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
-        blockstore.put_mcp_execution_output(120, b"slot-120").unwrap();
-        blockstore.put_mcp_execution_output(121, b"slot-121").unwrap();
+        blockstore
+            .put_mcp_execution_output(120, b"slot-120")
+            .unwrap();
+        blockstore
+            .put_mcp_execution_output(121, b"slot-121")
+            .unwrap();
         assert_eq!(
             blockstore.get_mcp_execution_output(120).unwrap(),
             Some(b"slot-120".to_vec())

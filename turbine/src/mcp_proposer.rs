@@ -1,12 +1,12 @@
 use {
+    solana_clock::Slot,
+    solana_keypair::Keypair,
     solana_ledger::{
         mcp,
         mcp_erasure::{encode_fec_set, McpErasureError, MCP_MAX_PAYLOAD_BYTES},
         mcp_merkle,
         shred::mcp_shred::{McpShred, MCP_SHRED_WIRE_SIZE},
     },
-    solana_clock::Slot,
-    solana_keypair::Keypair,
     solana_signer::Signer,
     thiserror::Error,
 };
@@ -46,13 +46,11 @@ pub(crate) fn build_shred_messages(
         });
     }
 
-    let (commitment, witnesses) =
-        mcp_merkle::commitment_and_witnesses::<MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN>(
-            slot,
-            proposer_index,
-            shreds,
-        )
-        .map_err(McpProposerError::Merkle)?;
+    let (commitment, witnesses) = mcp_merkle::commitment_and_witnesses::<
+        MCP_SHRED_DATA_BYTES,
+        MCP_WITNESS_LEN,
+    >(slot, proposer_index, shreds)
+    .map_err(McpProposerError::Merkle)?;
     let proposer_signature = proposer_keypair.sign_message(&commitment);
     let mut messages = Vec::with_capacity(MCP_NUM_RELAYS);
 
@@ -120,6 +118,8 @@ mod tests {
         let payload = vec![9u8; MCP_MAX_PAYLOAD_SIZE];
         let shreds = encode_payload_to_mcp_shreds(&payload).unwrap();
         assert_eq!(shreds.len(), MCP_NUM_RELAYS);
-        assert!(shreds.iter().all(|shred| shred.len() == MCP_SHRED_DATA_BYTES));
+        assert!(shreds
+            .iter()
+            .all(|shred| shred.len() == MCP_SHRED_DATA_BYTES));
     }
 }

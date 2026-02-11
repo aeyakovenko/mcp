@@ -1,6 +1,6 @@
 use {
-    agave_transaction_view::mcp_payload::{McpPayload, McpPayloadParseError},
     crate::{mcp, mcp_merkle},
+    agave_transaction_view::mcp_payload::{McpPayload, McpPayloadParseError},
     reed_solomon_erasure::galois_8::ReedSolomon,
 };
 
@@ -507,8 +507,14 @@ mod tests {
 
         let parsed = decode_reconstructed_payload(&payload).unwrap();
         assert_eq!(parsed.transactions.len(), 2);
-        assert_eq!(parsed.transactions[0].format, McpPayloadTransactionFormat::Latest);
-        assert_eq!(parsed.transactions[1].format, McpPayloadTransactionFormat::Legacy);
+        assert_eq!(
+            parsed.transactions[0].format,
+            McpPayloadTransactionFormat::Latest
+        );
+        assert_eq!(
+            parsed.transactions[1].format,
+            McpPayloadTransactionFormat::Legacy
+        );
     }
 
     #[test]

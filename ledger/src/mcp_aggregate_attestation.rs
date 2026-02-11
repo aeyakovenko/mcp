@@ -15,13 +15,12 @@ const PROPOSER_ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
 const MAX_AGGREGATE_PROTOCOL_BYTES: usize = HEADER_LEN
     + mcp::NUM_RELAYS
         * (RELAY_ENTRY_HEADER_LEN + mcp::NUM_PROPOSERS * PROPOSER_ENTRY_LEN + SIGNATURE_BYTES);
-const MAX_AGGREGATE_WIRE_BYTES: usize = if MAX_AGGREGATE_PROTOCOL_BYTES
-    < mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
-{
-    MAX_AGGREGATE_PROTOCOL_BYTES
-} else {
-    mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
-};
+const MAX_AGGREGATE_WIRE_BYTES: usize =
+    if MAX_AGGREGATE_PROTOCOL_BYTES < mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES {
+        MAX_AGGREGATE_PROTOCOL_BYTES
+    } else {
+        mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
+    };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateProposerEntry {
@@ -349,8 +348,7 @@ impl AggregateRelayEntry {
         slot: Slot,
         signer: &T,
     ) -> Result<(), AggregateAttestationError> {
-        let signing_bytes =
-            relay_signing_bytes(version, slot, self.relay_index, &self.entries)?;
+        let signing_bytes = relay_signing_bytes(version, slot, self.relay_index, &self.entries)?;
         self.relay_signature = signer.sign_message(&signing_bytes);
         Ok(())
     }
@@ -635,10 +633,8 @@ mod tests {
         relay_entry.relay_signature = Signature::new_unique();
 
         let aggregate = AggregateAttestation::new_canonical(77, 0, vec![relay_entry]).unwrap();
-        let filtered = aggregate.filtered_valid_entries(
-            |_| Some(relay.pubkey()),
-            |_| Some(proposer.pubkey()),
-        );
+        let filtered =
+            aggregate.filtered_valid_entries(|_| Some(relay.pubkey()), |_| Some(proposer.pubkey()));
         assert!(filtered.is_empty());
     }
 
@@ -822,11 +818,17 @@ mod tests {
         assert_eq!(filtered.relay_entries[0].relay_index, 2);
         assert_eq!(filtered.relay_entries[0].entries.len(), 1);
         assert_eq!(filtered.relay_entries[0].entries[0].proposer_index, 1);
-        assert_eq!(filtered.relay_entries[0].entries[0].commitment, proposer1_commitment);
+        assert_eq!(
+            filtered.relay_entries[0].entries[0].commitment,
+            proposer1_commitment
+        );
         assert_eq!(filtered.relay_entries[1].relay_index, 9);
         assert_eq!(filtered.relay_entries[1].entries.len(), 1);
         assert_eq!(filtered.relay_entries[1].entries[0].proposer_index, 1);
-        assert_eq!(filtered.relay_entries[1].entries[0].commitment, proposer1_commitment);
+        assert_eq!(
+            filtered.relay_entries[1].entries[0].commitment,
+            proposer1_commitment
+        );
     }
 
     #[test]

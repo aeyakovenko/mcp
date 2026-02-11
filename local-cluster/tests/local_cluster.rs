@@ -26,6 +26,7 @@ use {
         consensus::{
             tower_storage::FileTowerStorage, Tower, SWITCH_FORK_THRESHOLD, VOTE_THRESHOLD_DEPTH,
         },
+        mcp_relay_submit::RelayAttestationV1,
         optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
         replay_stage::DUPLICATE_THRESHOLD,
         validator::{BlockVerificationMethod, ValidatorConfig},
@@ -35,7 +36,7 @@ use {
     solana_epoch_schedule::{MAX_LEADER_SCHEDULE_EPOCH_OFFSET, MINIMUM_SLOTS_PER_EPOCH},
     solana_gossip::{crds_data::MAX_VOTES, gossip_service::discover_validators},
     solana_hard_forks::HardForks,
-    solana_hash::Hash,
+    solana_hash::{Hash, HASH_BYTES},
     solana_keypair::{keypair_from_seed, Keypair},
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
@@ -44,7 +45,8 @@ use {
         blockstore_processor::ProcessOptions,
         leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule},
         leader_schedule_utils::first_of_consecutive_leader_slots,
-        shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        mcp_consensus_block::ConsensusBlock,
+        shred::{mcp_shred::McpShred, ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     solana_local_cluster::{
@@ -7131,17 +7133,91 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         blockstore.get_mcp_execution_output(slot).unwrap().is_some()
     }
 
+    fn decode_execution_output_wire_transactions(encoded_output: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if encoded_output.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut offset = 0usize;
+        let tx_count = usize::try_from(u32::from_le_bytes(
+            encoded_output
+                .get(offset..offset + std::mem::size_of::<u32>())?
+                .try_into()
+                .ok()?,
+        ))
+        .ok()?;
+        offset += std::mem::size_of::<u32>();
+
+        let mut transactions = Vec::with_capacity(tx_count);
+        for _ in 0..tx_count {
+            let tx_len = usize::try_from(u32::from_le_bytes(
+                encoded_output
+                    .get(offset..offset + std::mem::size_of::<u32>())?
+                    .try_into()
+                    .ok()?,
+            ))
+            .ok()?;
+            offset += std::mem::size_of::<u32>();
+            let tx = encoded_output.get(offset..offset + tx_len)?.to_vec();
+            offset += tx_len;
+            transactions.push(tx);
+        }
+        if encoded_output[offset..].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        Some(transactions)
+    }
+
+    fn first_relay_attestation(
+        blockstore: &Blockstore,
+        slot: Slot,
+    ) -> Option<(u32, RelayAttestationV1)> {
+        for relay_index in 0..solana_ledger::mcp::NUM_RELAYS {
+            let relay_index = u32::try_from(relay_index).ok()?;
+            let Some(bytes) = blockstore
+                .get_mcp_relay_attestation(slot, relay_index)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            if let Ok(attestation) = RelayAttestationV1::from_bytes(&bytes) {
+                return Some((relay_index, attestation));
+            }
+        }
+        None
+    }
+
+    fn first_mcp_shred(blockstore: &Blockstore, slot: Slot) -> Option<(u32, McpShred)> {
+        for proposer_index in 0..solana_ledger::mcp::NUM_PROPOSERS {
+            let proposer_index = u32::try_from(proposer_index).ok()?;
+            for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
+                let shred_index = u32::try_from(shred_index).ok()?;
+                let Some(bytes) = blockstore
+                    .get_mcp_shred_data(slot, proposer_index, shred_index)
+                    .ok()
+                    .flatten()
+                else {
+                    continue;
+                };
+                if let Ok(shred) = McpShred::from_bytes(&bytes) {
+                    return Some((proposer_index, shred));
+                }
+            }
+        }
+        None
+    }
+
     fn send_best_effort_transfers(
         entry_client: &RpcClient,
         funding_keypair: &Keypair,
         count: usize,
-    ) -> usize {
+    ) -> Vec<String> {
         let Ok((recent_blockhash, _)) =
             entry_client.get_latest_blockhash_with_commitment(CommitmentConfig::processed())
         else {
-            return 0;
+            return Vec::new();
         };
-        let mut sent = 0usize;
+        let mut sent = Vec::new();
         for _ in 0..count {
             let recipient = Keypair::new();
             let transaction = system_transaction::transfer(
@@ -7150,18 +7226,16 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 1,
                 recent_blockhash,
             );
-            if entry_client
-                .send_transaction_with_config(
-                    &transaction,
-                    RpcSendTransactionConfig {
-                        skip_preflight: true,
-                        max_retries: Some(0),
-                        ..RpcSendTransactionConfig::default()
-                    },
-                )
-                .is_ok()
-            {
-                sent = sent.saturating_add(1);
+            match entry_client.send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(0),
+                    ..RpcSendTransactionConfig::default()
+                },
+            ) {
+                Ok(signature) => sent.push(signature.to_string()),
+                Err(_) => {}
             }
         }
         sent
@@ -7188,7 +7262,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             },
             mcp_feature_lamports,
         ));
-
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
     let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
@@ -7366,6 +7439,38 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .or_else(|| cache.slot_leader_at(slot, None))
         })
     };
+    let proposer_pubkey_for = |slot: Slot, proposer_index: u32| -> Option<Pubkey> {
+        cluster.validators.values().find_map(|validator_info| {
+            let validator = validator_info.validator.as_ref()?;
+            let bank = validator.bank_forks.read().unwrap().working_bank();
+            let cache =
+                solana_ledger::leader_schedule_cache::LeaderScheduleCache::new_from_bank(&bank);
+            cache
+                .proposers_at_slot(slot, Some(&bank))
+                .or_else(|| cache.proposers_at_slot(slot, None))
+                .and_then(|proposers| proposers.get(proposer_index as usize).copied())
+        })
+    };
+    let relay_pubkey_for = |slot: Slot, relay_index: u32| -> Option<Pubkey> {
+        cluster.validators.values().find_map(|validator_info| {
+            let validator = validator_info.validator.as_ref()?;
+            let bank = validator.bank_forks.read().unwrap().working_bank();
+            let cache =
+                solana_ledger::leader_schedule_cache::LeaderScheduleCache::new_from_bank(&bank);
+            cache
+                .relays_at_slot(slot, Some(&bank))
+                .or_else(|| cache.relays_at_slot(slot, None))
+                .and_then(|relays| relays.get(relay_index as usize).copied())
+        })
+    };
+    let consensus_block_for_slot = |slot: Slot| -> Option<(Pubkey, ConsensusBlock)> {
+        cluster.validators.iter().find_map(|(pubkey, validator_info)| {
+            let validator = validator_info.validator.as_ref()?;
+            let bytes = validator.mcp_consensus_block_bytes(slot)?;
+            let consensus_block = ConsensusBlock::from_wire_bytes(&bytes).ok()?;
+            Some((*pubkey, consensus_block))
+        })
+    };
 
     let post_activation_deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < post_activation_deadline {
@@ -7380,8 +7485,14 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         sleep(Duration::from_millis(200));
     }
 
-    let mut submitted_tx_count =
-        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 32);
+    let mut submitted_signatures: HashSet<String> =
+        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 32)
+            .into_iter()
+            .collect();
+    assert!(
+        !submitted_signatures.is_empty(),
+        "failed to submit any transfer transactions into local-cluster MCP test"
+    );
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut observed_artifacts = None;
@@ -7391,7 +7502,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             log_cluster_runtime_state("artifact-scan");
             next_progress_log = Instant::now() + Duration::from_secs(10);
         }
-        submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
+        submitted_signatures.extend(send_best_effort_transfers(
             &entry_client,
             &cluster.funding_keypair,
             4,
@@ -7532,7 +7643,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     };
     let Some((validator_pubkey, observed_slot)) = observed_artifacts else {
         let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
-            diagnostics_payload(submitted_tx_count);
+            diagnostics_payload(submitted_signatures.len());
         panic!(
             "timed out waiting for MCP artifacts in blockstore; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
@@ -7546,7 +7657,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             log_cluster_runtime_state("non-leader-scan");
             next_non_leader_progress_log = Instant::now() + Duration::from_secs(10);
         }
-        submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
+        submitted_signatures.extend(send_best_effort_transfers(
             &entry_client,
             &cluster.funding_keypair,
             8,
@@ -7577,15 +7688,157 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         observed_non_leader_execution
     else {
         let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
-            diagnostics_payload(submitted_tx_count);
+            diagnostics_payload(submitted_signatures.len());
         panic!(
             "timed out waiting for non-leader MCP execution output; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
+    let mut observed_consensus_block = None;
+    let consensus_block_deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < consensus_block_deadline {
+        let max_scan_slot = blockstores
+            .iter()
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default();
+        let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+        for slot in (scan_lower_slot..=max_scan_slot).rev().take(256) {
+            if let Some((validator_pubkey, consensus_block)) = consensus_block_for_slot(slot) {
+                observed_consensus_block = Some((validator_pubkey, slot, consensus_block));
+                break;
+            }
+        }
+        if observed_consensus_block.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+    let Some((consensus_validator_pubkey, consensus_slot, consensus_block)) =
+        observed_consensus_block
+    else {
+        let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
+            diagnostics_payload(submitted_signatures.len());
+        panic!(
+            "timed out waiting for MCP consensus block observation; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
+        );
+    };
+    let consensus_leader_pubkey = proposer_pubkey_for(consensus_slot, consensus_block.leader_index)
+        .expect("consensus block leader index must resolve to proposer pubkey");
+    assert!(
+        consensus_block.verify_leader_signature(&consensus_leader_pubkey),
+        "observed consensus block failed leader signature verification at slot {}",
+        consensus_slot
+    );
+    assert_eq!(
+        consensus_block.consensus_meta.len(),
+        HASH_BYTES,
+        "consensus_meta must be {} bytes at slot {}",
+        HASH_BYTES,
+        consensus_slot
+    );
+    let delayed_slot = consensus_slot.saturating_sub(1);
+    let delayed_bankhash = blockstores
+        .iter()
+        .find_map(|(_, blockstore)| blockstore.get_bank_hash(delayed_slot))
+        .expect("delayed-slot bankhash must exist when consensus block is ingested");
+    assert_eq!(
+        consensus_block.delayed_bankhash, delayed_bankhash,
+        "consensus block delayed bankhash mismatch at slot {} (delayed slot {})",
+        consensus_slot, delayed_slot
+    );
+    let artifact_blockstore = blockstores
+        .iter()
+        .find_map(|(pubkey, blockstore)| {
+            if *pubkey == validator_pubkey {
+                Some(blockstore.as_ref())
+            } else {
+                None
+            }
+        })
+        .expect("artifact validator should have a blockstore handle");
+    let (proposer_index, shred) = first_mcp_shred(artifact_blockstore, observed_slot)
+        .expect("artifact slot should contain at least one parseable MCP shred");
+    let proposer_pubkey = proposer_pubkey_for(observed_slot, proposer_index)
+        .expect("proposer schedule should contain observed shred proposer index");
+    assert!(
+        shred.verify_signature(&proposer_pubkey) && shred.verify_witness(),
+        "observed MCP shred failed signature/witness validation at slot {} proposer {}",
+        observed_slot,
+        proposer_index
+    );
+
+    let (relay_index, relay_attestation) =
+        first_relay_attestation(artifact_blockstore, observed_slot)
+            .expect("artifact slot should contain at least one parseable relay attestation");
+    let relay_pubkey = relay_pubkey_for(observed_slot, relay_index)
+        .expect("relay schedule should contain observed attestation relay index");
+    assert!(
+        relay_attestation.verify_relay_signature(&relay_pubkey)
+            && !relay_attestation.entries.is_empty(),
+        "observed relay attestation failed validation at slot {} relay {}",
+        observed_slot,
+        relay_index
+    );
+
+    let max_scan_slot = blockstores
+        .iter()
+        .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+        .max()
+        .unwrap_or_default();
+    let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+    let decodable_execution_output =
+        (scan_lower_slot..=max_scan_slot)
+            .rev()
+            .take(256)
+            .find_map(|slot| {
+                blockstores.iter().find_map(|(pubkey, blockstore)| {
+                    let Some(encoded_output) = blockstore.get_mcp_execution_output(slot).unwrap()
+                    else {
+                        return None;
+                    };
+                    decode_execution_output_wire_transactions(&encoded_output)
+                        .map(|transactions| (*pubkey, slot, transactions.len()))
+                })
+            });
+    let Some((decoded_pubkey, decoded_slot, decoded_tx_count)) = decodable_execution_output else {
+        let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
+            diagnostics_payload(submitted_signatures.len());
+        panic!(
+            "no decodable MCP execution output found; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
+        );
+    };
+
+    let shared_execution_slot = (scan_lower_slot..=max_scan_slot)
+        .rev()
+        .take(256)
+        .find(|slot| {
+            blockstores
+                .iter()
+                .filter(|(_, blockstore)| slot_has_execution_output(blockstore, *slot))
+                .count()
+                >= 2
+        });
+    assert!(
+        shared_execution_slot.is_some(),
+        "expected at least one slot with execution output observed by >=2 validators"
+    );
+
     info!(
-        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={})",
-        observed_slot, validator_pubkey, non_leader_pubkey, non_leader_slot, non_leader_leader
+        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={}); consensus block observed on validator {} at slot {} with matching delayed bankhash slot {}; decoded {} transactions from validator {} output at slot {}",
+        observed_slot,
+        validator_pubkey,
+        non_leader_pubkey,
+        non_leader_slot,
+        non_leader_leader,
+        consensus_validator_pubkey,
+        consensus_slot,
+        delayed_slot,
+        decoded_tx_count,
+        decoded_pubkey,
+        decoded_slot,
     );
 }
 

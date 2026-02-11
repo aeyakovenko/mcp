@@ -63,8 +63,7 @@ impl McpTransaction {
             return true;
         }
 
-        read_config_mask_at(bytes, 3)
-            .is_some_and(|mask| mask & !MCP_TX_CONFIG_MASK_ALLOWED == 0)
+        read_config_mask_at(bytes, 3).is_some_and(|mask| mask & !MCP_TX_CONFIG_MASK_ALLOWED == 0)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, McpTransactionParseError> {

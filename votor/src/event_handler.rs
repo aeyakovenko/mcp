@@ -525,10 +525,7 @@ impl EventHandler {
         Some((parent_slot, parent_block_id))
     }
 
-    fn maybe_record_empty_execution_output(
-        finalized_block: Block,
-        ctx: &SharedContext,
-    ) {
+    fn maybe_record_empty_execution_output(finalized_block: Block, ctx: &SharedContext) {
         let (slot, block_id) = finalized_block;
         let bank_forks = ctx.bank_forks.read().unwrap();
         if slot <= bank_forks.root() {
@@ -578,10 +575,10 @@ impl EventHandler {
                 );
             }
             Err(err) => {
-            warn!(
-                "Failed to store empty MCP execution output for slot {}: {:?}",
-                slot, err
-            );
+                warn!(
+                    "Failed to store empty MCP execution output for slot {}: {:?}",
+                    slot, err
+                );
             }
         }
     }
@@ -1607,7 +1604,10 @@ mod tests {
     fn test_records_empty_execution_output_for_missing_finalized_block() {
         let test_context = setup();
         let slot = 9;
-        EventHandler::maybe_record_empty_execution_output((slot, Hash::new_unique()), &test_context.shared_context);
+        EventHandler::maybe_record_empty_execution_output(
+            (slot, Hash::new_unique()),
+            &test_context.shared_context,
+        );
         assert_eq!(
             test_context
                 .shared_context
@@ -1670,7 +1670,10 @@ mod tests {
     fn test_skips_empty_execution_output_when_feature_inactive() {
         let test_context = setup_with_mcp_feature(false);
         let slot = 9;
-        EventHandler::maybe_record_empty_execution_output((slot, Hash::new_unique()), &test_context.shared_context);
+        EventHandler::maybe_record_empty_execution_output(
+            (slot, Hash::new_unique()),
+            &test_context.shared_context,
+        );
         assert_eq!(
             test_context
                 .shared_context
