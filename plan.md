@@ -66,18 +66,31 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
     - legacy format: derive ordering key from `compute_unit_price` (default `0` if absent)
   - Conservative proposer admission fee check:
     - an MCP proposer only admits a transaction if the fee payer can cover conservative slot-level exposure:
-      - standard tx: `NUM_PROPOSERS * base_fee`
-      - nonce tx: `NUM_PROPOSERS * base_fee + nonce_min_rent`
+      - legacy standard tx: `NUM_PROPOSERS * base_fee`
+      - MCP standard tx: `NUM_PROPOSERS * (base_fee + inclusion_fee)`
+      - legacy nonce tx: `NUM_PROPOSERS * base_fee + nonce_min_rent`
+      - MCP nonce tx: `NUM_PROPOSERS * (base_fee + inclusion_fee) + nonce_min_rent`
     - this is an admission precheck, not a replay-time charge multiplier
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
   - Execute highest-paying transactions first.
-  - Ordering rule is `ordering_fee` descending.
-  - Stable tie-break remains concatenated position (after proposer-index concatenation).
+  - Partition ordering:
+    - first: MCP-format transactions
+    - second: legacy/standard-Solana transactions
+  - MCP partition ordering:
+    - primary key: MCP `ordering_fee` descending
+    - tie-break: first signature bytes lexicographic ascending
+    - within each proposer batch, keep at most one transaction per signature in execution output
+  - Legacy partition ordering:
+    - primary key: legacy priority (`compute_unit_price`) descending
+    - tie-break: first signature bytes lexicographic ascending
+  - no signature dedup across proposers or across partitions
+  - fee charging remains per occurrence (pre-dedup), even when proposer-local duplicate signatures collapse to one executed transaction
 - `B3` `block_id` authority:
   - `block_id` is defined by Alpenglow consensus.
   - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
   - `consensus_meta` carries the consensus-defined data needed to recover/verify that `block_id`.
+  - MCP integration state is `ACTIVE` (not deferred): leader construction, validator verification, and vote submission paths must use the authoritative `block_id`.
 - `B4` delayed bankhash availability:
   - There must always be a delayed-slot bankhash before MCP progression.
   - v1 delayed slot is `slot.saturating_sub(1)`.
@@ -469,10 +482,20 @@ Staged rollout guard:
 ### 7.3 Ordering and execution
 
 - Deterministic order:
-  - concat by proposer index
-  - apply `ordering_fee` descending (highest fee first)
-  - stable tie-break by concatenated position
-  - duplicate transactions are not deduplicated in v1; each occurrence executes independently in deterministic order
+  - build two partitions:
+    - MCP-format transactions (latest/legacy MCP wire format)
+    - legacy/standard-Solana transactions
+  - MCP partition:
+    - for each proposer batch, dedup by signature (retain first occurrence)
+    - merge proposer batches by proposer index
+    - sort by MCP `ordering_fee` descending
+    - tie-break by first signature bytes lexicographic ascending
+  - legacy partition:
+    - no MCP proposer-batch dedup semantics
+    - sort by `compute_unit_price` descending
+    - tie-break by first signature bytes lexicographic ascending
+  - final order is MCP partition first, then legacy partition.
+  - no signature dedup across proposers or across partitions.
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -484,11 +507,15 @@ Staged rollout guard:
 Two-phase fee handling (spec §8):
 - Phase A (fee commitment):
   - per-transaction checks for signature/basic validity
+  - fee charging is evaluated on pre-dedup occurrences
   - per-slot cumulative payer map in memory
   - required debit:
-    - standard tx: `base_fee` per transaction occurrence
-    - nonce tx: `base_fee + nonce_min_rent` per transaction occurrence
-    - no additional replay-time `NUM_PROPOSERS` multiplier
+    - legacy standard tx: `base_fee` per occurrence
+    - MCP standard tx: `base_fee + inclusion_fee` per occurrence
+    - legacy nonce tx: `base_fee + nonce_min_rent` per occurrence
+    - MCP nonce tx: `base_fee + inclusion_fee + nonce_min_rent` per occurrence
+    - `ordering_fee` is not charged in replay
+    - no replay-time `NUM_PROPOSERS` multiplier
   - debit implementation:
     - standard tx: `Bank::withdraw()`
     - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
@@ -521,19 +548,14 @@ Reconstruction-to-execution bridge:
 
 ### 7.4 Bank/block ID and vote
 
-**DEFERRED — requires Alpenglow consensus integration.**
-
-- Per policy B3, `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
-- `ConsensusBlock` currently carries `delayed_bankhash` and `consensus_meta` but does NOT carry an explicit `block_id` field, because `block_id` derivation depends on Alpenglow consensus logic that is not yet integrated.
-- Prerequisites before this section can be implemented:
-  1. Alpenglow consensus provides a `block_id` value (or the derivation rule) in `ConsensusBlock.consensus_meta`
-  2. `Bank` exposes a setter for `block_id` that can be called after vote-gate validation
-  3. Vote submission path uses `block_id` instead of (or in addition to) legacy bank hash
-- Until prerequisites are met:
-  - validators vote on the legacy bank hash (derived from Pipeline A entry execution)
-  - `ConsensusBlock.consensus_meta` is consensus-layer data: MCP validates structural bounds and signatures, while Alpenglow consensus owns semantic interpretation
-  - MCP acts as a consensus overlay that gates voting, not as the authority for block identity
-- underlying vote wire format remains unchanged.
+- `block_id` handling is active in MCP flow.
+- Leader finalization:
+  - construct `ConsensusBlock` so authoritative `block_id` is recoverable/verifiable from consensus-defined fields.
+  - sign and broadcast only after delayed-bankhash and threshold checks pass.
+- Validator replay/vote path:
+  - verify `block_id` semantics from `ConsensusBlock` using Alpenglow-defined rules.
+  - vote submission uses authoritative `block_id` (not legacy fallback hash for MCP-effective slots).
+- underlying vote wire format remains unchanged unless Alpenglow requires an explicit new field.
 
 ### 7.5 Empty result
 
@@ -546,6 +568,10 @@ Reconstruction-to-execution bridge:
 - delayed bankhash availability gate: leader does not finalize and validator does not vote until delayed-slot bankhash is available locally
 - reconstruction mismatch rejection
 - deterministic ordering behavior
+- partition ordering behavior: MCP-first then legacy
+- signature tie-break behavior for both partitions
+- MCP proposer-local signature dedup behavior (retain first per proposer)
+- pre-dedup fee charging behavior (duplicates still charged per occurrence)
 - transaction-level parse-failure handling: unparsable transactions are dropped individually (batch continues)
 - execution-output reader behavior: strict decode for malformed payloads; MCP-wire (latest/legacy) and standard-wire transactions decode into replay input
 - dual-format payload acceptance: mixed latest + legacy tx bytes decode correctly
@@ -553,6 +579,8 @@ Reconstruction-to-execution bridge:
 - two-phase fees:
   - per-transaction granularity
   - cross-proposer cumulative payer accounting
+  - MCP `inclusion_fee` charged once per pre-dedup occurrence
+  - MCP `ordering_fee` not charged in replay
   - nonce minimum-rent edge case
   - phase-B no re-deduction
 - issue-20 integration:
