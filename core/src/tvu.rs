@@ -17,6 +17,7 @@ use {
         consensus::{tower_storage::TowerStorage, Tower},
         cost_update_service::CostUpdateService,
         drop_bank_service::DropBankService,
+        mcp_replay,
         mcp_relay_submit::RelayAttestationV1,
         repair::{
             block_id_repair_service::BlockIdRepairChannels,
@@ -113,6 +114,7 @@ pub struct Tvu {
     votor: Votor,
     commitment_service: AggregateCommitmentService,
     _mcp_relay_attestation_sender: Sender<RelayAttestationV1>,
+    mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
 }
 
 pub struct TvuSockets {
@@ -662,7 +664,15 @@ impl Tvu {
             votor,
             commitment_service,
             _mcp_relay_attestation_sender: mcp_relay_attestation_sender,
+            mcp_consensus_blocks,
         })
+    }
+
+    pub fn mcp_consensus_block_bytes(&self, slot: Slot) -> Option<Vec<u8>> {
+        self.mcp_consensus_blocks
+            .read()
+            .ok()
+            .and_then(|blocks| blocks.get(&slot).cloned())
     }
 
     pub fn join(self) -> thread::Result<()> {

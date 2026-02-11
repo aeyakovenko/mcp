@@ -1,3 +1,5 @@
+#[cfg(test)]
+use solana_sha256_hasher::hashv;
 use {
     crate::{mcp, mcp_merkle},
     solana_clock::Slot,
@@ -6,8 +8,6 @@ use {
     solana_signature::{Signature, SIGNATURE_BYTES},
     thiserror::Error,
 };
-#[cfg(test)]
-use solana_sha256_hasher::hashv;
 
 pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
 pub const MCP_NUM_PROPOSERS: usize = mcp::NUM_PROPOSERS;
@@ -119,8 +119,11 @@ impl McpShred {
         }
 
         let mut offset = 0usize;
-        let slot =
-            Slot::from_le_bytes(data[offset..offset + std::mem::size_of::<Slot>()].try_into().unwrap());
+        let slot = Slot::from_le_bytes(
+            data[offset..offset + std::mem::size_of::<Slot>()]
+                .try_into()
+                .unwrap(),
+        );
         offset += std::mem::size_of::<Slot>();
 
         let proposer_index = u32::from_le_bytes(
@@ -179,7 +182,8 @@ impl McpShred {
         let mut data = [0u8; MCP_SHRED_WIRE_SIZE];
         let mut offset = 0usize;
 
-        data[offset..offset + std::mem::size_of::<Slot>()].copy_from_slice(&self.slot.to_le_bytes());
+        data[offset..offset + std::mem::size_of::<Slot>()]
+            .copy_from_slice(&self.slot.to_le_bytes());
         offset += std::mem::size_of::<Slot>();
 
         data[offset..offset + std::mem::size_of::<u32>()]
@@ -302,7 +306,8 @@ mod tests {
         let shred_index = 55usize;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
 
@@ -354,7 +359,8 @@ mod tests {
         let shred_index = 0usize;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
         let shred = McpShred {
@@ -377,7 +383,8 @@ mod tests {
         let shred_index = 0usize;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
         let shred = McpShred {
@@ -402,9 +409,11 @@ mod tests {
         let slot = 88;
         let proposer_index = 1;
         let shred_index = 3usize;
-        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
-            (0..MCP_NUM_RELAYS).map(|i| make_leaf((i * 3) as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> = (0..MCP_NUM_RELAYS)
+            .map(|i| make_leaf((i * 3) as u8))
+            .collect();
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
 
@@ -437,7 +446,8 @@ mod tests {
         let shred_index = 0usize;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
         let shred = McpShred {
@@ -459,7 +469,8 @@ mod tests {
         let shred_index = MCP_NUM_RELAYS - 1;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
         let shred = McpShred {
@@ -482,7 +493,8 @@ mod tests {
         let shred_index = 0usize;
         let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
             (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
-        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let (commitment, witness) =
+            build_merkle_witness(slot, proposer_index, &leaves, shred_index);
         let keypair = Keypair::new();
         let proposer_signature = keypair.sign_message(&commitment);
         let shred = McpShred {
@@ -518,6 +530,35 @@ mod tests {
         );
         for shred in data_shreds.into_iter().chain(coding_shreds) {
             assert!(!is_mcp_shred_bytes(shred.payload()));
+        }
+    }
+
+    #[test]
+    fn test_parser_and_classifier_accept_edge_slot_values() {
+        let proposer_index = 0u32;
+        let shred_index = 0usize;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let keypair = Keypair::new();
+
+        for slot in [0u64, u64::MAX] {
+            let (commitment, witness) =
+                build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+            let proposer_signature = keypair.sign_message(&commitment);
+            let shred = McpShred {
+                slot,
+                proposer_index,
+                shred_index: shred_index as u32,
+                commitment,
+                shred_data: leaves[shred_index],
+                witness,
+                proposer_signature,
+            };
+            let bytes = shred.to_bytes();
+            assert!(is_mcp_shred_bytes(&bytes));
+            let parsed = McpShred::from_bytes(&bytes).unwrap();
+            assert_eq!(parsed.slot, slot);
+            assert!(parsed.verify(&keypair.pubkey()));
         }
     }
 }

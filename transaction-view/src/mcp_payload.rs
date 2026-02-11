@@ -57,9 +57,8 @@ impl McpPayload {
                     (format, Some(transaction))
                 }
                 Err(error) => {
-                    SanitizedTransactionView::try_new_sanitized(tx_bytes).map_err(|_| {
-                        McpPayloadParseError::TransactionParse { tx_index, error }
-                    })?;
+                    SanitizedTransactionView::try_new_sanitized(tx_bytes)
+                        .map_err(|_| McpPayloadParseError::TransactionParse { tx_index, error })?;
                     (McpPayloadTransactionFormat::StandardSolana, None)
                 }
             };
@@ -110,11 +109,11 @@ mod tests {
         },
         solana_hash::Hash,
         solana_keypair::Keypair,
+        solana_pubkey::Pubkey,
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::Transaction,
-        solana_pubkey::Pubkey,
-        solana_signature::Signature,
     };
 
     fn sample_tx() -> McpTransaction {
@@ -162,10 +161,16 @@ mod tests {
 
         let parsed = McpPayload::from_bytes(&payload).unwrap();
         assert_eq!(parsed.transactions.len(), 2);
-        assert_eq!(parsed.transactions[0].format, McpPayloadTransactionFormat::Latest);
+        assert_eq!(
+            parsed.transactions[0].format,
+            McpPayloadTransactionFormat::Latest
+        );
         assert_eq!(parsed.transactions[0].wire_bytes, latest);
         assert_eq!(parsed.transactions[0].mcp_transaction, Some(tx.clone()));
-        assert_eq!(parsed.transactions[1].format, McpPayloadTransactionFormat::Legacy);
+        assert_eq!(
+            parsed.transactions[1].format,
+            McpPayloadTransactionFormat::Legacy
+        );
         assert_eq!(parsed.transactions[1].wire_bytes, legacy);
         assert_eq!(parsed.transactions[1].mcp_transaction, Some(tx));
     }

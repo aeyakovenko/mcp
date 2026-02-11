@@ -10,8 +10,7 @@ use {
         mcp_relay_attestation::{
             RelayAttestation as LedgerRelayAttestation,
             RelayAttestationEntry as LedgerRelayAttestationEntry,
-            RelayAttestationError as LedgerRelayAttestationError,
-            RELAY_ATTESTATION_V1,
+            RelayAttestationError as LedgerRelayAttestationError, RELAY_ATTESTATION_V1,
         },
     },
     solana_metrics::inc_new_counter_error,
@@ -19,23 +18,15 @@ use {
     solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
     solana_turbine::cluster_nodes,
-    std::{
-        net::SocketAddr,
-        thread::sleep,
-        time::Duration,
-    },
+    std::{net::SocketAddr, thread::sleep, time::Duration},
     thiserror::Error,
     tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
 pub const MCP_CONTROL_MSG_RELAY_ATTESTATION: u8 = 0x01;
 pub const RELAY_ATTESTATION_VERSION_V1: u8 = RELAY_ATTESTATION_V1;
-pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
-    + 8
-    + 4
-    + 1
-    + (mcp::NUM_PROPOSERS * (4 + 32 + SIGNATURE_BYTES))
-    + SIGNATURE_BYTES;
+pub const MAX_RELAY_ATTESTATION_BYTES: usize =
+    1 + 8 + 4 + 1 + (mcp::NUM_PROPOSERS * (4 + 32 + SIGNATURE_BYTES)) + SIGNATURE_BYTES;
 pub const MAX_RELAY_ATTESTATION_FRAME_BYTES: usize = 1 + MAX_RELAY_ATTESTATION_BYTES;
 const MCP_RELAY_DISPATCH_SEND_RETRY_LIMIT: usize = 3;
 
@@ -556,7 +547,10 @@ mod tests {
     fn test_try_send_dispatch_frame_with_retry_rejects_full_channel_immediately() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender
-            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"x")))
+            .try_send((
+                SocketAddr::from(([127, 0, 0, 1], 12345)),
+                Bytes::from_static(b"x"),
+            ))
             .unwrap();
 
         let err = try_send_dispatch_frame_with_retry(
@@ -684,11 +678,17 @@ mod tests {
         );
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender
-            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"x")))
+            .try_send((
+                SocketAddr::from(([127, 0, 0, 1], 12345)),
+                Bytes::from_static(b"x"),
+            ))
             .unwrap();
         assert!(receiver.try_recv().is_ok());
         sender
-            .try_send((SocketAddr::from(([127, 0, 0, 1], 12345)), Bytes::from_static(b"y")))
+            .try_send((
+                SocketAddr::from(([127, 0, 0, 1], 12345)),
+                Bytes::from_static(b"y"),
+            ))
             .unwrap();
 
         let err = dispatch_relay_attestation_to_slot_leader(

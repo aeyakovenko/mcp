@@ -1,7 +1,7 @@
 use {
-    agave_feature_set::mcp_protocol_v1,
     super::Bank,
     crate::bank::CollectorFeeDetails,
+    agave_feature_set::mcp_protocol_v1,
     log::debug,
     solana_account::{ReadableAccount, WritableAccount},
     solana_fee::{apply_mcp_fee_component_values, FeeFeatures},

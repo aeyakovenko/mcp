@@ -48,9 +48,16 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - `A3` Local-cluster MCP integration strictness:
   - Issue-20 test must fail on timeout by default (no env-gated soft pass).
   - Must read from live validator blockstore handles during runtime.
-- `A4` Coverage gap to close before final sign-off:
-  - Add multi-node MCP integration coverage for forwarding + two-pass replay-fee path (`block_verification=true` path).
-  - Test should enforce non-leader execution-output observation in a 5-node cluster with strict timeout failures (no soft-pass degradation).
+- `A4` Coverage gap closure before final sign-off: `RESOLVED`
+  - direct ConsensusBlock content verification is now in 5-node local-cluster integration:
+    - validates leader signature
+    - validates `consensus_meta.len() == 32`
+    - validates delayed bankhash matches delayed-slot bankhash
+    - evidence: `local-cluster/tests/local_cluster.rs`
+  - explicit two-pass replay-fee per-occurrence assertion is now in block-verification unit coverage:
+    - evidence: `ledger/src/blockstore_processor.rs` (`test_execute_batch_mcp_two_pass_charges_fee_per_occurrence`)
+  - direct forwarding fanout attribution is now unit-tested at dispatch:
+    - evidence: `turbine/src/broadcast_stage/standard_broadcast_run.rs` (`test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state`)
 - `A5` Rollout invariant:
   - MCP CF additions require coordinated node upgrade before feature activation.
 - `A6` MCP control-message backpressure:

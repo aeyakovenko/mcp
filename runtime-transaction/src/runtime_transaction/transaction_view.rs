@@ -6,9 +6,9 @@ use {
         transaction_with_meta::TransactionWithMeta,
     },
     agave_transaction_view::{
-        mcp_transaction::McpTransaction,
-        resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
-        transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
+        mcp_transaction::McpTransaction, resolved_transaction_view::ResolvedTransactionView,
+        transaction_data::TransactionData, transaction_version::TransactionVersion,
+        transaction_view::SanitizedTransactionView,
     },
     solana_message::{
         compiled_instruction::CompiledInstruction,
@@ -73,16 +73,17 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
                         // Latest MCP format may omit fee fields; missing values default to v0
                         // behavior so sanitization remains backward-compatible.
                         let inclusion_fee = u64::from(mcp_tx.inclusion_fee().unwrap_or_default());
-                        let ordering_fee = mcp_tx
-                            .ordering_fee()
-                            .map(u64::from)
-                            .unwrap_or_else(|| {
+                        let ordering_fee =
+                            mcp_tx.ordering_fee().map(u64::from).unwrap_or_else(|| {
                                 compute_budget_instruction_details.requested_compute_unit_price()
                             });
                         Some((inclusion_fee, ordering_fee))
                     } else {
                         // Legacy MCP layout has no ordering_fee field; use CU price.
-                        Some((0, compute_budget_instruction_details.requested_compute_unit_price()))
+                        Some((
+                            0,
+                            compute_budget_instruction_details.requested_compute_unit_price(),
+                        ))
                     }
                 }
                 Err(_) => None,
