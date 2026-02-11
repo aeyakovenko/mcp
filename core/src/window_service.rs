@@ -19,7 +19,7 @@ use {
     },
     agave_feature_set as feature_set,
     bytes::Bytes,
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
+    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TrySendError},
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
@@ -785,11 +785,30 @@ where
                     }
                 }
 
-                if let Err(err) = attestation_sender.send(attestation) {
-                    debug!(
-                        "failed to enqueue MCP relay attestation for slot {}: {}",
-                        slot, err
-                    );
+                match attestation_sender.try_send(attestation) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        inc_new_counter_error!(
+                            "mcp-relay-attestation-send-dropped-full",
+                            1,
+                            1
+                        );
+                        debug!(
+                            "dropping MCP relay attestation for slot {} relay {}: channel full",
+                            slot, relay_index
+                        );
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        inc_new_counter_error!(
+                            "mcp-relay-attestation-send-dropped-disconnected",
+                            1,
+                            1
+                        );
+                        debug!(
+                            "dropping MCP relay attestation for slot {} relay {}: channel disconnected",
+                            slot, relay_index
+                        );
+                    }
                 }
             }
             emitted_mcp_attestation_slots.insert(slot);
