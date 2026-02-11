@@ -1807,7 +1807,7 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
     };
 
     let transaction_wires = decode_mcp_execution_output_wire_transactions(slot, &encoded_output)?;
-    let mut transactions = transaction_wires
+    let transactions = transaction_wires
         .iter()
         .enumerate()
         .map(|(tx_index, tx_wire_bytes)| {
@@ -1831,50 +1831,14 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         ));
     }
 
-    let mut replaced_replay_entries = Vec::with_capacity(replay_entries.len() + 1);
-    let mut inserted_transactions = false;
-    let mut saw_original_transaction_entry = false;
-    for ReplayEntry {
-        entry,
-        starting_index,
-    } in replay_entries
-    {
-        match entry {
-            EntryType::Tick(hash) => replaced_replay_entries.push(ReplayEntry {
-                entry: EntryType::Tick(hash),
-                starting_index,
-            }),
-            EntryType::Transactions(_) => {
-                saw_original_transaction_entry = true;
-                if !inserted_transactions {
-                    inserted_transactions = true;
-                    if !transactions.is_empty() {
-                        replaced_replay_entries.push(ReplayEntry {
-                            entry: EntryType::Transactions(std::mem::take(&mut transactions)),
-                            starting_index,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if !saw_original_transaction_entry && !transaction_wires.is_empty() {
-        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
-            slot,
-            reason: "MCP execution output has transactions but replay entries have no transaction entry to replace".to_string(),
-        });
-    }
-    if !transactions.is_empty() {
-        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
-            slot,
-            reason:
-                "failed to consume all MCP execution transactions while replacing replay entries"
-                    .to_string(),
-        });
-    }
-
-    Ok((replaced_replay_entries, transaction_wires.len()))
+    // Keep replay execution source aligned across leader and non-leader nodes
+    // until MCP-ordered execution is wired into both paths.
+    debug!(
+        "slot {} validated MCP execution output with {} transaction(s); execution override deferred",
+        slot,
+        transaction_wires.len()
+    );
+    Ok((replay_entries, default_num_txs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5843,7 +5807,8 @@ pub mod tests {
     }
 
     #[test]
-    fn test_maybe_override_replay_entries_with_mcp_execution_output_replaces_transactions() {
+    fn test_maybe_override_replay_entries_with_mcp_execution_output_validates_but_preserves_replay_entries()
+    {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let dummy_leader_pubkey = solana_pubkey::new_rand();
@@ -5894,10 +5859,10 @@ pub mod tests {
             )
             .unwrap();
 
-        assert_eq!(overridden_num_txs, 2);
+        assert_eq!(overridden_num_txs, 1);
         assert_eq!(overridden_entries.len(), 1);
         match &overridden_entries[0].entry {
-            EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 2),
+            EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 1),
             EntryType::Tick(_) => panic!("expected transaction entry"),
         }
     }

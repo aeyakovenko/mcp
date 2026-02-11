@@ -7169,20 +7169,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     agave_logger::setup_with_default(RUST_LOG_FILTER);
 
-    // Some constrained environments (for example, sandboxed CI runners) deny
-    // binding validator UDP ports entirely. Skip instead of producing a
-    // misleading MCP regression signal in those environments.
-    if solana_net_utils::sockets::bind_in_range_with_config(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        solana_net_utils::VALIDATOR_PORT_RANGE,
-        solana_net_utils::sockets::SocketConfiguration::default(),
-    )
-    .is_err()
-    {
-        info!("skipping MCP local-cluster integration test: unable to bind validator UDP ports");
-        return;
-    }
-
     let mut validator_config = ValidatorConfig::default_for_test();
     validator_config.wait_for_supermajority = None;
 
@@ -7205,12 +7191,19 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
+    let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
+        .map(|_| (Arc::new(Keypair::new()), true))
+        .collect();
+    let node_vote_keys: Vec<Arc<Keypair>> =
+        (0..num_nodes).map(|_| Arc::new(Keypair::new())).collect();
     let cluster = {
         let mut cluster = None;
         for attempt in 0..CLUSTER_CREATE_MAX_ATTEMPTS {
             let mut config = ClusterConfig {
                 validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+                validator_keys: Some(validator_keys.clone()),
                 node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
+                node_vote_keys: Some(node_vote_keys.clone()),
                 ticks_per_slot: 8,
                 slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
                 stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
@@ -7243,11 +7236,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                         continue;
                     }
                     if retriable_port_error {
-                        info!(
-                            "skipping MCP local-cluster integration test: unable to bind ports for {}-node cluster",
-                            num_nodes
+                        panic!(
+                            "failed to start {}-node MCP local cluster after {} attempts due to transient port bind failures: {}",
+                            num_nodes,
+                            CLUSTER_CREATE_MAX_ATTEMPTS,
+                            panic_message,
                         );
-                        return;
                     }
                     std::panic::resume_unwind(panic_payload);
                 }
@@ -7256,8 +7250,9 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         cluster.expect("cluster startup retry loop must produce cluster or return")
     };
 
-    let entry_client = RpcClient::new_socket_with_commitment(
-        cluster.entry_point_info.rpc().unwrap(),
+    let entry_client = RpcClient::new_with_timeout_and_commitment(
+        format!("http://{}", cluster.entry_point_info.rpc().unwrap()),
+        Duration::from_secs(2),
         CommitmentConfig::processed(),
     );
     let mcp_feature_account = entry_client
@@ -7312,6 +7307,54 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         num_nodes,
         blockstores.len()
     );
+    let log_cluster_runtime_state = |phase: &str| {
+        let cluster_node_count = entry_client
+            .get_cluster_nodes()
+            .map(|nodes| nodes.len())
+            .unwrap_or_default();
+        let (current_vote_accounts, delinquent_vote_accounts) = entry_client
+            .get_vote_accounts()
+            .map(|status| (status.current.len(), status.delinquent.len()))
+            .unwrap_or_default();
+        let local_validator_snapshot = cluster
+            .validators
+            .iter()
+            .map(|(pubkey, validator_info)| {
+                let (root_slot, working_slot, rpc_slot) = if let Some(validator) =
+                    validator_info.validator.as_ref()
+                {
+                    let bank_forks = validator.bank_forks.read().unwrap();
+                    let root_slot = bank_forks.root();
+                    let working_slot = bank_forks.working_bank().slot();
+                    drop(bank_forks);
+                    let rpc_slot = validator_info.info.contact_info.rpc().and_then(|rpc_addr| {
+                        RpcClient::new_with_timeout_and_commitment(
+                            format!("http://{}", rpc_addr),
+                            Duration::from_millis(500),
+                            CommitmentConfig::processed(),
+                        )
+                        .get_slot_with_commitment(CommitmentConfig::processed())
+                        .ok()
+                    });
+                    (root_slot, working_slot, rpc_slot)
+                } else {
+                    (0, 0, None)
+                };
+                (*pubkey, root_slot, working_slot, rpc_slot)
+            })
+            .collect::<Vec<_>>();
+        info!(
+            "MCP local-cluster [{}]: configured_nodes={}, local_validator_handles={}, gossip_visible_nodes={}, vote_accounts(current={}, delinquent={}), local_snapshot={:?}",
+            phase,
+            num_nodes,
+            cluster.validators.len(),
+            cluster_node_count,
+            current_vote_accounts,
+            delinquent_vote_accounts,
+            local_validator_snapshot,
+        );
+    };
+    log_cluster_runtime_state("post-start");
     let slot_leader_for = |slot: Slot| -> Option<Pubkey> {
         cluster.validators.values().find_map(|validator_info| {
             let validator = validator_info.validator.as_ref()?;
@@ -7342,7 +7385,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut observed_artifacts = None;
+    let mut next_progress_log = Instant::now();
     while Instant::now() < deadline {
+        if Instant::now() >= next_progress_log {
+            log_cluster_runtime_state("artifact-scan");
+            next_progress_log = Instant::now() + Duration::from_secs(10);
+        }
         submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
             &entry_client,
             &cluster.funding_keypair,
@@ -7357,7 +7405,9 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .map(|validator| validator.bank_forks.read().unwrap().working_bank().slot())
                 .unwrap_or(highest_slot);
             let scan_upper_slot = highest_slot.max(working_bank_slot);
-            let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+            let scan_lower_slot = mcp_activation_slot
+                .saturating_sub(1)
+                .max(scan_upper_slot.saturating_sub(256));
             let candidate_slots: Vec<_> = (scan_lower_slot..=scan_upper_slot)
                 .rev()
                 .filter(|slot| slot_has_execution_output(blockstore, *slot))
@@ -7407,12 +7457,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                     .map(|validator| validator.bank_forks.read().unwrap().working_bank().slot())
                     .unwrap_or(highest_slot);
                 let scan_upper_slot = highest_slot.max(working_bank_slot);
-                let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+                let scan_lower_slot = mcp_activation_slot
+                    .saturating_sub(1)
+                    .max(scan_upper_slot.saturating_sub(512));
                 let mut slots_with_exec = 0usize;
                 let mut slots_with_attestation = 0usize;
                 let mut slots_with_shreds = 0usize;
-                let mut slots_with_reconstructable_proposer = 0usize;
-                let mut best_shard_density = (0u64, 0u32, 0usize);
                 for slot in scan_lower_slot..=scan_upper_slot {
                     if slot_has_execution_output(blockstore, slot) {
                         slots_with_exec += 1;
@@ -7423,70 +7473,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                     if slot_has_shred_data(blockstore, slot) {
                         slots_with_shreds += 1;
                     }
-                    let mut slot_best_count = 0usize;
-                    let mut slot_best_proposer = 0u32;
-                    for proposer_index in 0..solana_ledger::mcp::NUM_PROPOSERS {
-                        let Some(proposer_index_u32) = u32::try_from(proposer_index).ok() else {
-                            continue;
-                        };
-                        let mut shard_count = 0usize;
-                        for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
-                            let Some(shred_index_u32) = u32::try_from(shred_index).ok() else {
-                                continue;
-                            };
-                            if blockstore
-                                .get_mcp_shred_data(slot, proposer_index_u32, shred_index_u32)
-                                .unwrap()
-                                .is_some()
-                            {
-                                shard_count += 1;
-                            }
-                        }
-                        if shard_count > slot_best_count {
-                            slot_best_count = shard_count;
-                            slot_best_proposer = proposer_index_u32;
-                        }
-                    }
-                    if slot_best_count >= solana_ledger::mcp::REQUIRED_RECONSTRUCTION {
-                        slots_with_reconstructable_proposer += 1;
-                    }
-                    if slot_best_count > best_shard_density.2 {
-                        best_shard_density = (slot, slot_best_proposer, slot_best_count);
-                    }
                 }
-                let mut best_shard_indices_preview = Vec::new();
-                if best_shard_density.2 > 0 {
-                    let (best_slot, best_proposer, _) = best_shard_density;
-                    for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
-                        let Some(shred_index_u32) = u32::try_from(shred_index).ok() else {
-                            continue;
-                        };
-                        if blockstore
-                            .get_mcp_shred_data(best_slot, best_proposer, shred_index_u32)
-                            .unwrap()
-                            .is_some()
-                        {
-                            best_shard_indices_preview.push(shred_index_u32);
-                            if best_shard_indices_preview.len() >= 64 {
-                                break;
-                            }
-                        }
-                    }
-                }
-                let (best_slot_proposer_indices, best_slot_relay_indices) = cluster
+                let role_counts = cluster
                     .validators
                     .get(pubkey)
                     .and_then(|validator_info| validator_info.validator.as_ref())
                     .map(|validator| {
                         let bank = validator.bank_forks.read().unwrap().working_bank();
                         let cache = solana_ledger::leader_schedule_cache::LeaderScheduleCache::new_from_bank(&bank);
+                        let probe_slot = scan_upper_slot;
                         (
-                            cache
-                                .proposer_indices_at_slot(best_shard_density.0, pubkey, Some(&bank))
-                                .len(),
-                            cache
-                                .relay_indices_at_slot(best_shard_density.0, pubkey, Some(&bank))
-                                .len(),
+                            cache.proposer_indices_at_slot(probe_slot, pubkey, Some(&bank)).len(),
+                            cache.relay_indices_at_slot(probe_slot, pubkey, Some(&bank)).len(),
                         )
                     })
                     .unwrap_or((0usize, 0usize));
@@ -7497,11 +7495,8 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                     slots_with_exec,
                     slots_with_attestation,
                     slots_with_shreds,
-                    slots_with_reconstructable_proposer,
-                    best_shard_density,
-                    best_shard_indices_preview,
-                    best_slot_proposer_indices,
-                    best_slot_relay_indices,
+                    role_counts.0,
+                    role_counts.1,
                 )
             })
             .collect::<Vec<_>>();
@@ -7545,7 +7540,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     };
     let mut observed_non_leader_execution = None;
     let non_leader_deadline = Instant::now() + Duration::from_secs(180);
+    let mut next_non_leader_progress_log = Instant::now();
     while Instant::now() < non_leader_deadline {
+        if Instant::now() >= next_non_leader_progress_log {
+            log_cluster_runtime_state("non-leader-scan");
+            next_non_leader_progress_log = Instant::now() + Duration::from_secs(10);
+        }
         submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
             &entry_client,
             &cluster.funding_keypair,
