@@ -170,6 +170,24 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         return true;
     };
 
+    // Carry an authoritative block_id sidecar when available. Keep empty
+    // consensus_meta for compatibility if block_id is not yet derivable.
+    let consensus_meta = working_bank
+        .block_id()
+        .or_else(|| {
+            blockstore
+                .check_last_fec_set_and_get_block_id(
+                    slot,
+                    working_bank.hash(),
+                    true,
+                    &working_bank.feature_set,
+                )
+                .ok()
+                .flatten()
+        })
+        .map(|block_id| block_id.to_bytes().to_vec())
+        .unwrap_or_default();
+
     let proposer_schedule = leader_schedule_cache
         .proposers_at_slot(slot, Some(&working_bank))
         .or_else(|| leader_schedule_cache.proposers_at_slot(slot, Some(&root_bank)))
@@ -271,7 +289,7 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             slot,
             leader_index,
             aggregate_bytes,
-            Vec::new(),
+            consensus_meta.clone(),
             delayed_bankhash,
         ) else {
             trace!(
@@ -1517,7 +1535,13 @@ mod test {
             slot.saturating_sub(1),
         );
         let delayed_bankhash = delayed_bank.hash();
-        bank_forks.write().unwrap().insert(delayed_bank);
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        slot_bank.set_block_id(Some(Hash::new_unique()));
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            bank_forks.insert(delayed_bank);
+            bank_forks.insert(slot_bank);
+        }
 
         let proposer_schedule = leader_schedule_cache
             .proposers_at_slot(slot, Some(&root_bank))
@@ -1694,6 +1718,9 @@ mod test {
         let delayed_slot = slot.saturating_sub(1);
         let delayed_bankhash = Hash::new_unique();
         blockstore.insert_bank_hash(delayed_slot, delayed_bankhash, false);
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        slot_bank.set_block_id(Some(Hash::new_unique()));
+        bank_forks.write().unwrap().insert(slot_bank);
 
         let proposer_schedule = leader_schedule_cache
             .proposers_at_slot(slot, Some(&root_bank))
@@ -1789,7 +1816,13 @@ mod test {
             &Pubkey::new_unique(),
             slot.saturating_sub(1),
         );
-        bank_forks.write().unwrap().insert(delayed_bank);
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        slot_bank.set_block_id(Some(Hash::new_unique()));
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            bank_forks.insert(delayed_bank);
+            bank_forks.insert(slot_bank);
+        }
 
         let proposer_schedule = leader_schedule_cache
             .proposers_at_slot(slot, Some(&root_bank))

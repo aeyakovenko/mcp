@@ -12,24 +12,23 @@ const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
 const RELAY_ENTRY_HEADER_LEN: usize = 4 + 1;
 const PROPOSER_ENTRY_LEN: usize = 4 + HASH_BYTES + SIGNATURE_BYTES;
-const MAX_AGGREGATE_ATTESTATION_BYTES: usize =
-    1 + 8 + 4 + 2
-        + (mcp::NUM_RELAYS
-            * (RELAY_ENTRY_HEADER_LEN
-                + (mcp::NUM_PROPOSERS * PROPOSER_ENTRY_LEN)
-                + SIGNATURE_BYTES));
+const MAX_AGGREGATE_ATTESTATION_BYTES: usize = 1
+    + 8
+    + 4
+    + 2
+    + (mcp::NUM_RELAYS
+        * (RELAY_ENTRY_HEADER_LEN + (mcp::NUM_PROPOSERS * PROPOSER_ENTRY_LEN) + SIGNATURE_BYTES));
 // Keep consensus metadata bounded to a small sidecar payload while preserving
 // room for attestation bytes and the leader signature under the QUIC cap.
 const MAX_CONSENSUS_META_BYTES: usize = 64 * 1024;
 const MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES: usize =
     HEADER_LEN + MAX_AGGREGATE_ATTESTATION_BYTES + MAX_CONSENSUS_META_BYTES + TRAILER_LEN;
-const MAX_CONSENSUS_BLOCK_WIRE_BYTES: usize = if MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES
-    < mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
-{
-    MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES
-} else {
-    mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
-};
+const MAX_CONSENSUS_BLOCK_WIRE_BYTES: usize =
+    if MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES < mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES {
+        MAX_CONSENSUS_BLOCK_PROTOCOL_BYTES
+    } else {
+        mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES
+    };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConsensusBlock {
@@ -38,9 +37,8 @@ pub struct ConsensusBlock {
     pub leader_index: u32,
     pub aggregate_bytes: Vec<u8>,
     pub consensus_meta: Vec<u8>,
-    // MCP does not define block_id derivation at this layer; block_id remains
-    // Alpenglow-consensus authoritative. This field only carries the delayed
-    // bankhash used by the vote-gate checks.
+    // Opaque Alpenglow sidecar bytes. When present in v1, a 32-byte payload is
+    // interpreted by replay as an authoritative block_id.
     pub delayed_bankhash: Hash,
     pub leader_signature: Signature,
 }
@@ -316,8 +314,8 @@ mod tests {
     #[test]
     fn test_roundtrip_with_empty_aggregate_and_meta() {
         let leader = Keypair::new();
-        let mut block = ConsensusBlock::new_unsigned(21, 3, vec![], vec![], Hash::new_unique())
-            .unwrap();
+        let mut block =
+            ConsensusBlock::new_unsigned(21, 3, vec![], vec![], Hash::new_unique()).unwrap();
         block.sign_leader(&leader).unwrap();
 
         let bytes = block.to_wire_bytes().unwrap();

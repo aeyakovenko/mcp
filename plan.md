@@ -23,10 +23,15 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Leader finalization keeps retrying pending slots when prerequisites are temporarily unavailable (especially delayed bankhash).
   - Replay keeps retrying pending consensus slots independently of fork-choice one-shot behavior.
   - Delayed-slot bankhash source order is: `BankForks` delayed slot, then blockstore frozen bank hash.
+- Alpenglow `block_id` authority wiring: `PARTIAL`
+  - `window_service` now carries a `block_id` sidecar in `ConsensusBlock.consensus_meta` when locally available.
+  - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and sets it on the bank before vote processing.
+  - Current limitation: if sidecar bytes are absent/invalid, replay keeps compatibility fallback to legacy local `block_id` derivation.
 - Reconstruction-to-execution bridge reader: `PARTIAL`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
-  - Current limitation: missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
+  - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots; if vote gate passes but output is still missing, replay is deferred.
+  - Current limitation: when vote gate is not yet satisfied, v1 keeps compatibility fallback to legacy entry-derived replay input.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -583,19 +588,16 @@ Reconstruction-to-execution bridge:
 
 ### 7.4 Bank/block ID and vote
 
-**DEFERRED — requires Alpenglow consensus integration.**
-
-- Target invariant (policy B3): `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
-- `ConsensusBlock` currently carries `delayed_bankhash` and `consensus_meta` but does NOT carry an explicit `block_id` field, because `block_id` derivation depends on Alpenglow consensus logic that is not yet integrated.
-- Prerequisites before this section can be implemented:
-  1. Alpenglow consensus provides a `block_id` value (or the derivation rule) in `ConsensusBlock.consensus_meta`
-  2. `Bank` exposes a setter for `block_id` that can be called after vote-gate validation
-  3. Vote submission path uses `block_id` instead of (or in addition to) legacy bank hash
-- Until prerequisites are met:
-  - validators vote on the legacy bank hash (derived from Pipeline A entry execution)
-  - `ConsensusBlock.consensus_meta` is opaque bytes, verified for presence but not interpreted
-  - MCP acts as a consensus overlay that gates voting, not as the authority for block identity
-- underlying vote wire format remains unchanged.
+- Policy target (B3): `block_id` is defined by Alpenglow consensus and MCP treats it as authoritative.
+- Implemented wiring:
+  - `ConsensusBlock.consensus_meta` is opaque sidecar bytes; replay interprets a 32-byte payload as authoritative `block_id`.
+  - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)` when available.
+  - replay reads consensus-sidecar `block_id` and sets `bank.block_id` before completion/vote processing.
+- Compatibility behavior in v1:
+  - if sidecar bytes are absent/invalid, replay uses existing local `block_id` derivation fallback.
+  - vote wire format remains unchanged; tower vote path consumes `bank.block_id()` when present.
+- Strict-authority follow-up:
+  - remove fallback only after consensus-sidecar availability is guaranteed for all MCP-finalized slots.
 
 ### 7.5 Empty result
 

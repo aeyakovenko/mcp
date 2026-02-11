@@ -6,8 +6,8 @@ Authoritative constraint: `carllin/solana@81bc2690987f7424bc54a60c663e92db42abdd
 
 ## Verdict
 
-- `plan.md` consistency: `PASS` (with 2 explicit deferred external dependencies)
-- code vs plan consistency: `PASS-PARTIAL` (core MCP path is aligned; deferred items remain)
+- `plan.md` consistency: `PASS` (with 2 explicit compatibility fallbacks)
+- code vs plan consistency: `PASS-PARTIAL` (core MCP path is aligned; strict-mode follow-ups remain)
 - succinctness: `PASS` (contradictory/duplicate proposer sections removed)
 
 ## Resolved Findings
@@ -37,32 +37,31 @@ Authoritative constraint: `carllin/solana@81bc2690987f7424bc54a60c663e92db42abdd
 
 ## Remaining Valid Blockers
 
-1. `R1 CRITICAL` Alpenglow `block_id` authority is policy-complete but implementation-deferred.
-- Reason: `block_id` derivation/setter/vote-path integration is still external to this branch.
-- Evidence: `plan.md:586`, `plan.md:590`
+1. `R1 HIGH` strict authoritative `block_id` mode is not fully enforced.
+- Current behavior: replay uses authoritative `block_id` from `ConsensusBlock.consensus_meta` when hash-sized sidecar bytes are present, but keeps compatibility fallback to local derivation when sidecar bytes are absent/invalid.
+- Evidence: `core/src/replay_stage.rs:3929`, `core/src/replay_stage.rs:3952`, `core/src/window_service.rs:174`, `plan.md:31`
 
 2. `R2 HIGH` strict no-fallback replay mode for missing `McpExecutionOutput` remains deferred.
-- Current behavior: malformed output is hard error, missing output still falls back in v1.
-- Evidence: `plan.md:576`, `plan.md:582`
+- Current behavior: replay now attempts pre-replay reconstruction and defers non-leader replay when vote gate passes but output is still unavailable; when vote gate is not satisfied, v1 still allows legacy replay-input fallback.
+- Evidence: `core/src/replay_stage.rs:3572`, `core/src/replay_stage.rs:3736`, `ledger/src/blockstore_processor.rs:1781`, `plan.md:35`
 
-3. `R3 MEDIUM` full 5-node MCP local-cluster E2E was not rerun in this pass.
-- Status: `UNVERIFIED` in this audit pass (targeted unit/integration tests passed; full cluster pass not re-executed here).
+3. `R3 RESOLVED` full 5-node MCP local-cluster E2E rerun succeeded in this pass.
+- Evidence: `local-cluster/tests/local_cluster.rs` (`test_local_cluster_mcp_produces_blockstore_artifacts`) executed and passed with non-leader MCP execution-output observation.
 
 ## Plan/Code Alignment Notes
 
 - Policy `B2` is now explicit and matches implementation (MCP-first classing, fee-desc, signature tie-break, per-proposer dedup, cross-proposer per-occurrence charging).
   - Evidence: `plan.md:63`, `plan.md:535`, `core/src/mcp_replay.rs:476`
-- Policy `B3` is now explicitly framed as target invariant with deferred implementation section to avoid contradiction.
-  - Evidence: `plan.md:588`
+- Policy `B3` now matches code as partial implementation: replay consumes authoritative 32-byte `consensus_meta` block IDs when present, with explicit compatibility fallback when absent.
+  - Evidence: `plan.md:30`, `plan.md:581`, `core/src/replay_stage.rs:3929`
 
 ## Tests Run In This Pass
 
-- `cargo test -p solana-ledger mcp_ordering::tests -- --nocapture`
-- `cargo test -p solana-runtime collect_fees_only_for -- --nocapture`
-- `cargo test -p solana-fee apply_mcp_fee_component -- --nocapture`
-- `cargo test -p solana-core maybe_persist_reconstructed_execution_output -- --nocapture`
-- `cargo test -p solana-ledger test_maybe_override_replay_entries_with_mcp_execution_output_validates_and_overrides_replay_entries -- --nocapture`
-- `cargo test -p solana-core test_is_active_mcp_shred_packet_obeys_feature_slot_gate -- --nocapture`
-- `cargo test -p solana-turbine test_partition_mcp_packets_uses_layout_prefilter_and_feature_gate -- --nocapture`
-- `cargo test -p solana-ledger test_domain_separated_schedule_seed -- --nocapture`
-- `cargo test -p solana-ledger test_mcp_schedule_accessors_require_feature_activation -- --nocapture`
+- `cargo check -p solana-core`
+- `cargo test -p solana-core test_maybe_finalize_consensus_block_from_relay_attestations -- --nocapture`
+- `cargo test -p solana-core test_maybe_finalize_consensus_block_requires_delayed_bankhash -- --nocapture`
+- `cargo test -p solana-core test_maybe_finalize_consensus_block_uses_blockstore_delayed_bankhash -- --nocapture`
+- `cargo test -p solana-core test_maybe_finalize_consensus_block_broadcasts_quic_control_frame -- --nocapture`
+- `cargo test -p solana-core test_mcp_authoritative_block_id_for_slot_reads_hash_sized_consensus_meta -- --nocapture`
+- `cargo test -p solana-core test_mcp_authoritative_block_id_for_slot_rejects_non_hash_sized_consensus_meta -- --nocapture`
+- `cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture`
