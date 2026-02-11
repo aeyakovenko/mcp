@@ -326,13 +326,12 @@ impl SanitizedTransactionReceiveAndBuffer {
                     }
                 }
 
-                if Consumer::check_fee_payer_unlocked(
+                let fee_check_result = Consumer::check_fee_payer_unlocked(
                     &working_bank,
                     &transaction,
                     &mut error_counts,
-                )
-                .is_err()
-                {
+                );
+                if fee_check_result.is_err() {
                     num_dropped_on_fee_payer += 1;
                     continue;
                 }
@@ -556,11 +555,12 @@ impl TransactionViewReceiveAndBuffer {
                     let transaction = container
                         .get_transaction(priority_id.id)
                         .expect("transaction must exist");
-                    if let Err(err) = Consumer::check_fee_payer_unlocked(
+                    let fee_check_result = Consumer::check_fee_payer_unlocked(
                         working_bank,
                         transaction,
                         &mut error_counters,
-                    ) {
+                    );
+                    if let Err(err) = fee_check_result {
                         *result = Err(err);
                         num_dropped_on_fee_payer += 1;
                         container.remove_by_id(priority_id.id);
