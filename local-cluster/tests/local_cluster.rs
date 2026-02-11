@@ -1,5 +1,8 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
+    agave_transaction_view::{
+        mcp_transaction::McpTransaction, transaction_view::SanitizedTransactionView,
+    },
     crate::cluster_tests::start_quic_streamer_to_listen_for_votes_and_certs,
     assert_matches::assert_matches,
     crossbeam_channel::{unbounded, Receiver},
@@ -7167,6 +7170,21 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         Some(transactions)
     }
 
+    fn first_signature_from_wire_transaction(tx_wire_bytes: &[u8]) -> Option<String> {
+        if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(tx_wire_bytes) {
+            return mcp_transaction
+                .signatures
+                .first()
+                .map(ToString::to_string);
+        }
+
+        SanitizedTransactionView::try_new_sanitized(tx_wire_bytes)
+            .ok()?
+            .signatures()
+            .first()
+            .map(|signature| signature.to_string())
+    }
+
     fn first_relay_attestation(
         blockstore: &Blockstore,
         slot: Slot,
@@ -7790,34 +7808,63 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         relay_index
     );
 
-    let max_scan_slot = blockstores
-        .iter()
-        .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
-        .max()
-        .unwrap_or_default();
-    let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
-    let decodable_execution_output =
-        (scan_lower_slot..=max_scan_slot)
+    let mut decodable_execution_output = None;
+    let inclusion_deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < inclusion_deadline {
+        submitted_signatures.extend(send_best_effort_transfers(
+            &entry_client,
+            &cluster.funding_keypair,
+            8,
+        ));
+        let max_scan_slot = blockstores
+            .iter()
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default();
+        let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+        decodable_execution_output = (scan_lower_slot..=max_scan_slot)
             .rev()
-            .take(256)
+            .take(512)
             .find_map(|slot| {
                 blockstores.iter().find_map(|(pubkey, blockstore)| {
                     let Some(encoded_output) = blockstore.get_mcp_execution_output(slot).unwrap()
                     else {
                         return None;
                     };
-                    decode_execution_output_wire_transactions(&encoded_output)
-                        .map(|transactions| (*pubkey, slot, transactions.len()))
+                    let transactions = decode_execution_output_wire_transactions(&encoded_output)?;
+                    if transactions.is_empty() {
+                        return None;
+                    }
+                    let matched_signature = transactions
+                        .iter()
+                        .filter_map(|tx_wire_bytes| {
+                            first_signature_from_wire_transaction(tx_wire_bytes)
+                        })
+                        .find(|signature| submitted_signatures.contains(signature))?;
+                    Some((*pubkey, slot, transactions.len(), matched_signature))
                 })
             });
-    let Some((decoded_pubkey, decoded_slot, decoded_tx_count)) = decodable_execution_output else {
+        if decodable_execution_output.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+    let Some((decoded_pubkey, decoded_slot, decoded_tx_count, included_signature)) =
+        decodable_execution_output
+    else {
         let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
             diagnostics_payload(submitted_signatures.len());
         panic!(
-            "no decodable MCP execution output found; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            "no non-empty decodable MCP execution output containing a submitted signature found; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
+    let max_scan_slot = blockstores
+        .iter()
+        .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+        .max()
+        .unwrap_or_default();
+    let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
     let shared_execution_slot = (scan_lower_slot..=max_scan_slot)
         .rev()
         .take(256)
@@ -7828,13 +7875,34 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .count()
                 >= 2
         });
+    let Some(shared_execution_slot) = shared_execution_slot else {
+        panic!("expected at least one slot with execution output observed by >=2 validators");
+    };
+    let shared_outputs: Vec<_> = blockstores
+        .iter()
+        .filter_map(|(pubkey, blockstore)| {
+            blockstore
+                .get_mcp_execution_output(shared_execution_slot)
+                .unwrap()
+                .map(|output| (*pubkey, output))
+        })
+        .collect();
     assert!(
-        shared_execution_slot.is_some(),
-        "expected at least one slot with execution output observed by >=2 validators"
+        shared_outputs.len() >= 2,
+        "expected >=2 execution outputs at shared slot {}",
+        shared_execution_slot
+    );
+    let reference_output = shared_outputs[0].1.clone();
+    assert!(
+        shared_outputs
+            .iter()
+            .all(|(_, output)| *output == reference_output),
+        "execution output mismatch across validators at shared slot {}",
+        shared_execution_slot
     );
 
     info!(
-        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={}); consensus block observed on validator {} at slot {} with matching delayed bankhash slot {}; decoded {} transactions from validator {} output at slot {}",
+        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={}); consensus block observed on validator {} at slot {} with matching delayed bankhash slot {}; decoded {} transactions from validator {} output at slot {} including submitted signature {}",
         observed_slot,
         validator_pubkey,
         non_leader_pubkey,
@@ -7846,6 +7914,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         decoded_tx_count,
         decoded_pubkey,
         decoded_slot,
+        included_signature,
     );
 }
 
