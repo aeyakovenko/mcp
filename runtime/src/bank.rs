@@ -3581,9 +3581,6 @@ impl Bank {
                     }
                 };
             }
-            if fee == 0 {
-                continue;
-            }
             let withdraw_result = if is_durable_nonce_tx {
                 self.withdraw_for_mcp_phase_a_nonce(tx.fee_payer(), fee)
             } else {

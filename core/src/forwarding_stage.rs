@@ -16,7 +16,7 @@ use {
     solana_fee_structure::{FeeBudgetLimits, FeeDetails},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol, node::NodeMultihoming},
     solana_keypair::Keypair,
-    solana_ledger::leader_schedule_cache::LeaderScheduleCache,
+    solana_ledger::{leader_schedule_cache::LeaderScheduleCache, mcp},
     solana_net_utils::multihomed_sockets::BindIpAddrs,
     solana_packet as packet,
     solana_perf::data_budget::DataBudget,
@@ -131,7 +131,8 @@ impl ForwardAddressGetter {
             current_slot.saturating_add(FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET);
         if root_bank
             .feature_set
-            .is_active(&feature_set::mcp_protocol_v1::id())
+            .activated_slot(&feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| first_lookahead_slot >= activated_slot)
             && cluster_nodes::check_feature_activation(
                 &feature_set::mcp_protocol_v1::id(),
                 first_lookahead_slot,
@@ -603,14 +604,13 @@ impl ConnectionCacheClient {
             forward_address_getter,
         }
     }
-    fn get_next_valid_leader(&self) -> Option<SocketAddr> {
-        let node_addresses = self
+    fn get_next_valid_leaders(&self) -> Vec<SocketAddr> {
+        self
             .forward_address_getter
             .get_non_vote_forwarding_addresses(
                 NUM_LOOKAHEAD_LEADERS,
                 self.connection_cache.protocol(),
-            );
-        node_addresses.first().copied()
+            )
     }
 }
 
@@ -619,11 +619,14 @@ impl ForwardingClient for ConnectionCacheClient {
         &self,
         wire_transactions: Vec<Vec<u8>>,
     ) -> Result<(), ForwardingClientError> {
-        let Some(current_address) = self.get_next_valid_leader() else {
+        let current_addresses = self.get_next_valid_leaders();
+        if current_addresses.is_empty() {
             return Err(ForwardingClientError::LeaderContactMissing);
-        };
-        let conn = self.connection_cache.get_connection(&current_address);
-        conn.send_data_batch_async(wire_transactions)?;
+        }
+        for current_address in current_addresses {
+            let conn = self.connection_cache.get_connection(&current_address);
+            conn.send_data_batch_async(wire_transactions.clone())?;
+        }
         Ok(())
     }
 }
@@ -691,11 +694,11 @@ impl TpuClientNextClient {
             skip_check_transaction_age: true,
             worker_channel_size: 2,
             max_reconnect_attempts: 4,
-            // Send to the next leader only, but verify that connections exist
-            // for the leaders of the next `4 * NUM_CONSECUTIVE_SLOTS`.
+            // Fanout to all MCP proposers once MCP is active.
+            // Outside MCP mode, the leader updater returns fewer targets.
             leaders_fanout: Fanout {
-                send: 1,
-                connect: 4,
+                send: mcp::NUM_PROPOSERS,
+                connect: mcp::NUM_PROPOSERS,
             },
         }
     }

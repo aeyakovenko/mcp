@@ -415,7 +415,9 @@ impl Tvu {
         // Create switch block event channel for ReplayStage
         let (switch_bank_sender, switch_bank_receiver) = bounded(100);
 
-        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) = unbounded();
+        const MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY: usize = 10_000;
+        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) =
+            bounded(MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY);
         let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
         let window_service = {
             let repair_service_channels = RepairServiceChannels::new(
