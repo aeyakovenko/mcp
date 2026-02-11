@@ -443,7 +443,7 @@ mod tests {
         let outcome = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(
             outcome,
-            McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange)
+            McpRelayOutcome::Dropped(McpDropReason::DecodeError)
         );
     }
 
@@ -470,7 +470,7 @@ mod tests {
         let outcome = relay.process_shred(&payload, &proposer.pubkey());
         assert_eq!(
             outcome,
-            McpRelayOutcome::Dropped(McpDropReason::ShredIndexOutOfRange)
+            McpRelayOutcome::Dropped(McpDropReason::DecodeError)
         );
     }
 

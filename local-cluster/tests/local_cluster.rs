@@ -7741,7 +7741,15 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     let delayed_slot = consensus_slot.saturating_sub(1);
     let delayed_bankhash = blockstores
         .iter()
-        .find_map(|(_, blockstore)| blockstore.get_bank_hash(delayed_slot))
+        .find_map(|(pubkey, blockstore)| {
+            (*pubkey == consensus_validator_pubkey).then(|| blockstore.get_bank_hash(delayed_slot))
+        })
+        .flatten()
+        .or_else(|| {
+            blockstores
+                .iter()
+                .find_map(|(_, blockstore)| blockstore.get_bank_hash(delayed_slot))
+        })
         .expect("delayed-slot bankhash must exist when consensus block is ingested");
     assert_eq!(
         consensus_block.delayed_bankhash, delayed_bankhash,
@@ -7810,7 +7818,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
-
     let shared_execution_slot = (scan_lower_slot..=max_scan_slot)
         .rev()
         .take(256)
