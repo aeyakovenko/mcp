@@ -51,8 +51,10 @@ Scope: integration branch + consistency against `plan.md`
 
 5. MCP control-path backpressure tightened.
 - Relay-attestation channel in TVU changed from unbounded to bounded.
+- Relay-attestation enqueue in `window_service` changed to non-blocking `try_send` with explicit drop counters for `Full` and `Disconnected` cases.
 - Evidence:
   - `core/src/tvu.rs`
+  - `core/src/window_service.rs`
 
 6. MCP shred strict parser bounds added.
 - `McpShred::from_bytes()` now rejects out-of-range proposer/shred indices.
