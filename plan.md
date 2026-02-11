@@ -7,9 +7,6 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reuse existing TPU/TVU pipelines, sigverify, `window_service`, blockstore, replay stage, and execution paths.
 - No new stage types. Only add small targeted modules where no equivalent exists.
 - All MCP behavior is gated by `feature_set::mcp_protocol_v1::id()`.
-- Activation semantics: define `mcp_cutover_slot` as the first slot whose bank has `mcp_protocol_v1` active.
-- Slots `< mcp_cutover_slot` are legacy-executed.
-- Slots `>= mcp_cutover_slot` are MCP-executed from canonical MCP-ordered source (no legacy execution-source fallback).
 - Do **not** modify `ShredVariant`, `ShredCommonHeader`, or existing Agave shred pipeline types.
 - MCP shreds use a separate wire format and dedicated column families.
 - Invalid MCP messages are dropped and MUST NOT advance protocol state.
@@ -29,8 +26,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reconstruction-to-execution bridge reader: `PARTIAL`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
-  - Required invariant (not fully implemented yet): once `slot >= mcp_cutover_slot`, replay must not execute from legacy entry-derived source for that slot.
-  - Remaining blocker: `McpExecutionOutput` production currently happens post-execution in replay, so pre-execution availability for `slot >= mcp_cutover_slot` is not yet guaranteed.
+  - Current limitation: missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -43,8 +39,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Must read from live validator blockstore handles during runtime.
 - `A4` Coverage gap to close before final sign-off:
   - Add multi-node MCP integration coverage for forwarding + two-pass replay-fee path (`block_verification=true` path).
-  - Issue-20 test must run with a real 5-node cluster and enforce non-leader execution-output observation.
-  - Startup failure to allocate required validator ports is a hard failure after bounded retries (no soft skip).
+  - Test should enforce non-leader execution-output observation when 2+ validators are live, and degrade to artifact-only checks in port-constrained environments.
 - `A5` Rollout invariant:
   - MCP CF additions require coordinated node upgrade before feature activation.
 - `A6` MCP control-message backpressure:
@@ -64,36 +59,17 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
       - `inclusion_fee`: read §7.1 config field when present, else default `0`
       - `ordering_fee`: read §7.1 config field when present, else derive from `compute_unit_price` (default `0` if absent)
     - legacy format: derive ordering key from `compute_unit_price` (default `0` if absent)
-  - Conservative proposer admission fee check:
-    - an MCP proposer only admits a transaction if the fee payer can cover conservative slot-level exposure:
-      - legacy standard tx: `NUM_PROPOSERS * base_fee`
-      - MCP standard tx: `NUM_PROPOSERS * (base_fee + inclusion_fee)`
-      - legacy nonce tx: `NUM_PROPOSERS * base_fee + nonce_min_rent`
-      - MCP nonce tx: `NUM_PROPOSERS * (base_fee + inclusion_fee) + nonce_min_rent`
-    - this is an admission precheck, not a replay-time charge multiplier
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
   - Execute highest-paying transactions first.
-  - Partition ordering:
-    - first: MCP-format transactions
-    - second: legacy/standard-Solana transactions
-  - MCP partition ordering:
-    - primary key: MCP `ordering_fee` descending
-    - tie-break: first signature bytes lexicographic ascending
-    - within each proposer batch, keep at most one transaction per signature in execution output
-  - Legacy partition ordering:
-    - primary key: legacy priority (`compute_unit_price`) descending
-    - tie-break: first signature bytes lexicographic ascending
-  - no signature dedup across proposers or across partitions
-  - fee charging remains per occurrence (pre-dedup), even when proposer-local duplicate signatures collapse to one executed transaction
+  - Ordering rule is `ordering_fee` descending.
+  - Stable tie-break remains concatenated position (after proposer-index concatenation).
 - `B3` `block_id` authority:
   - `block_id` is defined by Alpenglow consensus.
   - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
   - `consensus_meta` carries the consensus-defined data needed to recover/verify that `block_id`.
-  - MCP integration state is `ACTIVE` (not deferred): leader construction, validator verification, and vote submission paths must use the authoritative `block_id`.
 - `B4` delayed bankhash availability:
   - There must always be a delayed-slot bankhash before MCP progression.
-  - v1 delayed slot is `slot.saturating_sub(1)`.
   - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
   - No fallback hash value is permitted.
 
@@ -125,9 +101,14 @@ Non-reusable for MCP wire correctness:
 - `feature-set/src/lib.rs`:
   - Add `pub mod mcp_protocol_v1 { declare_id!("..."); }`.
   - Register in `FEATURE_NAMES`.
-- Slot feature gate rule:
-  - normative cutover for MCP-effective execution is `slot >= activated_slot(mcp_protocol_v1)`.
-  - ingress/control paths currently use `cluster_nodes::check_feature_activation(feature, slot, root_bank)`; this remains a tracked activation-semantics gap until all paths use the same slot cutover rule.
+- Slot-effective feature check pattern (referenced as "slot feature gate" throughout plan):
+  ```rust
+  if let Some(activated_slot) = bank.feature_set.activated_slot(&mcp_protocol_v1::id()) {
+      if slot >= activated_slot {
+          // MCP active for this slot
+      }
+  }
+  ```
 
 ### 1.2 MCP constants and wire types
 
@@ -137,15 +118,14 @@ Non-reusable for MCP wire correctness:
     - `NUM_RELAYS = 200`
     - `DATA_SHREDS_PER_FEC_BLOCK = 40`
     - `CODING_SHREDS_PER_FEC_BLOCK = 160`
-    - `MCP_WITNESS_LEN = ceil(log2(NUM_RELAYS)) = 8`
-    - `SHRED_DATA_BYTES = 863` (derived in Pass 1.4 from fixed wire overhead)
+    - `WITNESS_LEN = 8` (ceil(log2(NUM_RELAYS)))
     - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
     - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
     - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
     - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
     - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
-    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (tight bound equals RS data capacity; always `<= NUM_RELAYS * SHRED_DATA_BYTES`)
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (this is always `<= NUM_RELAYS * SHRED_DATA_BYTES` because `DATA_SHREDS_PER_FEC_BLOCK <= NUM_RELAYS`)
   - Types:
     - `RelayAttestation`
     - `AggregateAttestation`
@@ -173,25 +153,35 @@ Non-reusable for MCP wire correctness:
 ### 1.4 MCP shred wire format
 
 - Add `ledger/src/shred/mcp_shred.rs`:
-  - Wire-size constants:
-    - `MCP_SHRED_OVERHEAD = 369` bytes (`slot + proposer_index + shred_index + commitment + witness_len + witness + proposer_sig`)
-    - `MCP_SHRED_DATA_BYTES = PACKET_DATA_SIZE - MCP_SHRED_OVERHEAD = 1232 - 369 = 863`
-    - `MCP_SHRED_WIRE_SIZE = PACKET_DATA_SIZE = 1232`
+  - Wire size constants:
+    - `SIZE_OF_SLOT = 8` (u64)
+    - `SIZE_OF_PROPOSER_INDEX = 4` (u32)
+    - `SIZE_OF_SHRED_INDEX = 4` (u32)
+    - `SIZE_OF_COMMITMENT = 32`
+    - `SIZE_OF_WITNESS_LEN = 1` (u8)
+    - `SIZE_OF_WITNESS = 32 * WITNESS_LEN = 256`
+    - `SIZE_OF_PROPOSER_SIG = 64`
+    - `MCP_SHRED_OVERHEAD = 8 + 4 + 4 + 32 + 1 + 256 + 64 = 369`
+    - `SHRED_DATA_BYTES = solana_packet::PACKET_DATA_SIZE - MCP_SHRED_OVERHEAD = 1232 - 369 = 863`
+    - `MCP_SHRED_WIRE_SIZE = solana_packet::PACKET_DATA_SIZE = 1232`
   - Format: `slot:u64 + proposer_index:u32 + shred_index:u32 + commitment:[u8;32] + shred_data + witness_len:u8 + witness + proposer_sig:[u8;64]`
-  - Data/coding representation:
-    - all 200 MCP shreds use the same wire layout
-    - `shred_index in [0, 39]` carries data shards; `shred_index in [40, 199]` carries RS parity shards
-    - RS operates on payload bytes; MCP wire headers are added after shard generation
+  - Data and coding shreds use the same wire format. Unlike Agave where RS encodes entire data shreds (headers + payload) into coding shreds, MCP RS-encodes only the payload bytes. Headers are added after RS encoding, so all 200 shreds share the same structure.
+    - `shred_index` 0 to DATA_SHREDS_PER_FEC_BLOCK-1 (0-39) = data shreds (original payload bytes)
+    - `shred_index` DATA_SHREDS_PER_FEC_BLOCK to NUM_RELAYS-1 (40-199) = coding shreds (RS parity bytes)
+    - The `shred_data` field contains either original or parity depending on index
+    - Headers are added after RS encoding, not encoded by RS (see section on SHRED_DATA_BYTES derivation)
   - `is_mcp_shred_packet(packet)` classifier
   - strict parse + verify helpers
   - enforce `witness_len == ceil(log2(NUM_RELAYS))`
 
-### 1.5 Reed-Solomon helper visibility
+### 1.5 Reed-Solomon and shredding
 
-- Keep RS internals in `ledger` crate.
-- Reuse `ledger/src/mcp_erasure.rs` for payload-to-shard encode/reconstruct helpers.
-- Reuse `turbine/src/mcp_proposer.rs` for MCP shred message construction (`commitment + witnesses + per-relay shred_index`).
-- Avoid direct RS-library calls from replay/window/forwarding paths.
+- Add `ledger/src/mcp_shredder.rs` mirroring `ledger/src/shredder.rs` for MCP:
+  - RS encode: payload bytes → 40 data shards + 160 coding shards
+  - RS decode/reconstruct: recover payload from any 40 shards
+  - Merkle tree construction and witness generation (using `mcp_merkle.rs`)
+  - Build complete `McpShred` structs with signatures
+- Follow the same pattern as `shredder.rs`: wrap RS encoding/decoding so `core` uses the wrapper, not the RS library directly.
 
 ### 1.6 Tests
 
@@ -201,14 +191,32 @@ Non-reusable for MCP wire correctness:
 - Attestation sorting/duplicate rejection.
 - `witness_len` enforcement.
 - MCP shred packet size and classifier tests.
-- Wire-size invariant tests:
-  - `MCP_SHRED_WIRE_SIZE == PACKET_DATA_SIZE`
-  - `MCP_SHRED_DATA_BYTES + MCP_SHRED_OVERHEAD == MCP_SHRED_WIRE_SIZE`
-- RS robustness tests:
-  - recover payload from any `REQUIRED_RECONSTRUCTION` shards
-  - fail reconstruction with fewer than `REQUIRED_RECONSTRUCTION` shards
-- Mutation tests:
-  - modified commitment/signature/witness fails verification deterministically.
+- Constants verification:
+  - Size constants match actual serialized sizes.
+  - `MCP_SHRED_WIRE_SIZE == MCP_SHRED_OVERHEAD + SHRED_DATA_BYTES`.
+- Wire layout verification:
+  - Field offsets match expected positions.
+  - Getters extract correct bytes at correct offsets.
+- RS encode/decode round-trip:
+  - Encode payload into 40+160 shards, decode back.
+  - Recover from exactly `REQUIRED_RECONSTRUCTION` (40) shreds.
+  - Fail recovery from 39 shreds.
+  - Recovery with various erasure patterns (all data lost, all coding lost, mixed).
+- Invalid field rejection:
+  - Invalid proposer_index (>= NUM_PROPOSERS).
+  - Invalid shred_index (>= NUM_RELAYS).
+  - Truncated packet (< MCP_SHRED_WIRE_SIZE).
+  - Oversized packet (> MCP_SHRED_WIRE_SIZE).
+- Signature/witness mutation:
+  - Mutated commitment fails signature verification.
+  - Mutated shred_data fails witness verification.
+  - Wrong shred_index fails witness verification.
+- Commitment recomputation:
+  - Given all 200 shards, recompute Merkle root and verify it matches commitment.
+- Boundary values:
+  - Edge slot values (0, u64::MAX).
+  - Edge indices (0, NUM_PROPOSERS-1, 0, NUM_RELAYS-1).
+  - Max payload size (exactly MAX_PROPOSER_PAYLOAD bytes).
 
 ---
 
@@ -221,14 +229,24 @@ Non-reusable for MCP wire correctness:
 - `ledger/src/leader_schedule.rs`:
   - Add helper that reuses stake-weighted leader sampling with domain-separated seed.
   - `NUM_PROPOSERS`/`NUM_RELAYS` must be imported from `ledger::mcp` (single source of truth), not duplicated locally.
-  - seed construction:
+  - Seed construction (32 bytes):
     - `seed[0..8] = epoch.to_le_bytes()`
-    - `seed[8..] = hash(domain)[..24]`
-  - sampling semantics:
-    - use `repeat = 1` for MCP schedules (independent sample per slot position; no leader-style 4-slot repetition)
+    - `seed[8..8+domain.len()] = domain`
+    - remaining bytes = 0
   - Domains:
-    - proposer: `b"mcp:proposer"`
-    - relay: `b"mcp:relay"`
+    - proposer: `b"mcp:proposer"` (12 bytes)
+    - relay: `b"mcp:relay"` (9 bytes)
+  - Key differences from leader schedule:
+    - Multiple samples per slot: NUM_PROPOSERS (16) for proposers, NUM_RELAYS (200) for relays
+    - No repeat/consecutive slots: each position is an independent sample (leader schedule repeats same leader for 4 consecutive slots)
+    - Duplicates allowed: same validator can appear multiple times in a slot's list
+  - Sampling pattern (contrast with leader schedule's `if i % repeat == 0` logic):
+    ```rust
+    (0..slots_in_epoch * count)
+        .map(|_| keys[weighted_index.sample(rng)])
+        .collect()
+    ```
+  - This ensures proposer, relay, and leader schedules produce independent random sequences from the same stake set.
 
 ### 2.2 Stake source parity with leader schedule
 
@@ -246,9 +264,8 @@ Non-reusable for MCP wire correctness:
     - `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=200)
     - `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
     - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
-  - Accessor gating:
-    - when MCP feature is inactive in the provided bank, return `None`/empty and do not expose proposer/relay indices.
-  - Duplicate identities return all indices (spec §5).
+  - Feature gate check: all helpers must check if `mcp_protocol_v1` is active for the slot by checking inside the given bank; if not, return `None` or empty `Vec`. This ensures proposer/relay logic (e.g., section 5.1 proposer activation) does not activate when MCP is disabled.
+  - Duplicate identities: if a validator appears multiple times in a schedule (e.g., at proposer indices 3, 7, 15), the index lookup returns all positions (spec §5). This applies to both proposer and relay schedules.
 
 ### 2.4 Tests
 
@@ -291,8 +308,8 @@ Non-reusable for MCP wire correctness:
   - MCP partition classifier MUST be strict (`McpShred` wire-size/layout + witness-length/path checks), not a loose size-only check.
   - Agave packets: unchanged existing path.
   - MCP packets:
-    - apply slot feature gate
-    - gate is feature-only (not local proposer/relay role), because every validator needs MCP shreds for local reconstruction/vote gate checks
+    - apply slot feature gate (see §1.1) using the `working_bank` that `run_shred_sigverify()` already uses
+    - feature is the only filter (no proposer/relay role check) because all validators need MCP shreds for vote gate (spec §3.5: count locally stored shreds >= RECONSTRUCTION_THRESHOLD) and reconstruction
     - bypass Agave shred-id/leader-sigverify assumptions
     - forward through existing `verified_sender` channel for MCP-specific verification in `window_service`
 
@@ -302,7 +319,8 @@ Non-reusable for MCP wire correctness:
 - classifier rejects valid Agave Merkle shreds.
 - Valid MCP shred passes, bad signature/proof fails.
 - MCP CF put/get + purge behavior.
-- Feature toggle coverage at ingress: MCP packets are accepted/rejected based on slot feature gate and do not leak into Agave shred verify path.
+- Feature flag can toggle between MCP/non MCP pipelines starting from
+packet ingestion, into dedup and sigverify
 
 ---
 
@@ -337,9 +355,6 @@ Non-reusable for MCP wire correctness:
   - `RelayAttestation.entries` MUST be sorted by `proposer_index` and deduplicated.
   - Empty `RelayAttestation.entries` is invalid and MUST be rejected.
   - relay-signing domain is `version || slot || relay_index || entries_len || entries` and intentionally excludes `leader_index` (leader-agnostic within slot).
-- Relay attestation emission trigger:
-  - emit once per `(slot, relay_index)` when either proposer coverage is complete (`NUM_PROPOSERS`) or the slot is at least one working-bank slot old.
-  - this defines the relay deadline in implementation terms and avoids unbounded waiting.
 
 ### 4.3 MCP QUIC transport
 
@@ -375,9 +390,6 @@ Non-reusable for MCP wire correctness:
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`:
   - use existing broadcast entry-batch flow (no new TPU stage/worker).
   - collect per-slot transaction wire bytes and enforce `MAX_PROPOSER_PAYLOAD` with framing overhead.
-  - build MCP shreds through reusable helper path:
-    - `turbine/src/mcp_proposer.rs::encode_payload_to_mcp_shreds()`
-    - `turbine/src/mcp_proposer.rs::build_shred_messages()`
   - on slot completion, encode MCP shreds and dispatch to relay schedule over existing QUIC endpoint sender.
   - proposer activation: local pubkey must appear in `proposer_indices_at_slot`.
   - duplicate proposer indices are valid and dispatch once per owned index.
@@ -390,7 +402,53 @@ Non-reusable for MCP wire correctness:
   - reject slot-mismatch vs PoH recorder start slot
   - reject malformed inputs (`mixins.len() != transaction_batches.len()` or any empty transaction batch)
 
-### 5.3 Forwarding stage changes
+### 5.4 TPU proposer worker
+
+**Implementation: `core/src/mcp_proposer.rs` + `core/src/tpu.rs`**
+
+The MCP proposer is **bankless** (no execution, no PoH) but needs to validate transactions and extract ordering fees. This is achieved via `McpProposerContext`, a lightweight struct that extracts only what's needed from a frozen parent bank:
+
+```rust
+pub struct McpProposerContext {
+    feature_set: Arc<FeatureSet>,
+    fee_structure: FeeStructure,
+    rent: Rent,
+    lamports_per_signature: u64,
+    accounts: Arc<Accounts>,        // For loading fee payer balances
+    ancestors: Ancestors,
+    cost_tracker: RwLock<CostTracker>,  // 1/16th limits
+}
+```
+
+**Key methods (reuse patterns from consumer.rs:460-493):**
+- `validate_fee_payer()` — Extracts compute budget limits, calculates fee, loads fee payer account, validates balance
+- `try_add_cost()` — Enforces per-proposer 1/16th CU limits via CostTracker
+- `extract_ordering_fee()` — Returns `compute_unit_price` from transaction's compute budget instructions
+
+
+**Thread flow (If feature is active, `tpu.rs` spawns "solMcpProposer" thread):**
+1. Wait for slot where this validator is a proposer (via `leader_schedule_cache.proposer_indices_at_slot()`)
+2. Create `McpProposerContext::new(&parent_bank)` — cost tracker initialized with 1/16th limits
+3. Receive cloned packets from sigverify (via `mcp_proposer_receiver`)
+4. For each packet:
+   - Deserialize via `ImmutableDeserializedPacket::new()` pattern
+   - Build `RuntimeTransaction` via `build_sanitized_transaction()`
+   - Validate fee payer: `context.validate_fee_payer(&tx)` → returns `ordering_fee`
+   - Validate cost budget: `context.try_add_cost(&tx)` → rejects if exceeds 1/16th
+   - Collect valid transactions as `ValidatedTransaction { transaction, ordering_fee }`
+5. Sort by ordering_fee descending (stable sort preserves insertion order for ties)
+6. Serialize to `McpPayload` (max `MAX_PROPOSER_PAYLOAD` = `DATA_SHREDS * SHRED_DATA_BYTES`)
+7. RS encode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` directly
+8. Compute Merkle commitment per spec section 6 using `mcp_merkle_tree()` from `mcp_merkle.rs`
+9. Build `McpShred` for each relay index (0..199) with witness + proposer_signature
+   - Relay `i` receives shred with `shred_index = i`
+   - Relays 0-39 receive data shreds (original payload), relays 40-199 receive coding shreds (RS parity)
+10. Look up relay addresses via `relays_at_slot()` + `ClusterInfo::lookup_contact_info()`
+11. Send one shred per relay to their TVU address
+
+**MCP transaction format note (PENDING SPEC AMENDMENT):** See SPEC AMENDMENT REQUIREMENT in section 1.2. McpPayload carries standard Solana wire-format transactions. The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`.
+
+### 5.5 Forwarding stage changes
 
 - `core/src/forwarding_stage.rs` + `core/src/next_leader.rs`:
   - MCP mode resolves proposer forward addresses using schedule cache and same lookahead slot-offset policy used today.
@@ -399,18 +457,41 @@ Non-reusable for MCP wire correctness:
     - `TpuClientNext`: `get_forward_addresses_from_tpu_info` must also resolve MCP proposer addresses when `mcp_protocol_v1` is active, using the same schedule cache lookup
   - preserve non-MCP behavior unchanged.
 
-### 5.4 Explicit non-change
+### 5.6 Explicit non-change
 
 - Do not globally divide BankingStage QoS limits in `core/src/banking_stage/qos_service.rs` in v1.
 - Per-proposer limits are handled by proposer admission and replay validation paths.
 
-### 5.5 Tests
+### 5.7 Per-proposer CU budgets
+
+**Handled directly in `McpProposerContext::new()`:**
+
+The `CostTracker` is initialized with 1/16th of block limits:
+```rust
+cost_tracker.set_limits(
+    account_cost_limit / NUM_PROPOSERS,
+    block_cost_limit / NUM_PROPOSERS,
+    vote_cost_limit / NUM_PROPOSERS,
+);
+```
+
+This ensures each proposer's payload doesn't exceed its share. No changes needed to `qos_service.rs` — the per-proposer tracking is local to the MCP proposer thread.
+
+### 5.8 Tests
 
 - MCP dispatch removes completed slot state and emits one shred per relay index per owned proposer index.
+
+- Context created with 1/16th limits
+- Rejects tx when payer has no balance
+- Correctly extracts compute_unit_price (0 if no SetComputeUnitPrice)
+- Transactions sorted descending, ties preserve insertion order
+- Proposer produces 200 shreds (one per relay)
+- Payload size within `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes
+- RS encode -> decode round-trip
+- TransactionSigVerifier clones to MCP proposer channel
+- Proposer worker emits exactly one shred per relay index.
 - Payload bound enforcement.
 - Forwarding routes to proposer addresses in MCP mode for both forwarding clients.
-
----
 
 ## Pass 6 — Leader Aggregation + ConsensusBlock
 
@@ -457,16 +538,6 @@ Implementation point:
 - `core/src/replay_stage.rs` + `core/src/mcp_replay.rs`:
   - refresh per-slot `VoteGateInput` from validated consensus-block bytes before MCP vote-gate evaluation.
   - retain and retry pending MCP consensus slots in replay loop so evaluation does not depend on one-shot heaviest-fork selection timing.
-  - evaluate slot `X` only against slot-`X` bank context (parent of `X` must already be replayed/frozen before `X` is replayed).
-  - if slot-`X` bank is unavailable, keep slot pending and retry later; never substitute `heaviest_bank` as a fallback evaluation context.
-
-### 6.6 Fork semantics
-
-- ConsensusBlock cache is keyed by `slot`; first valid block for a slot wins in-memory for that process lifetime.
-- Conflicting later consensus blocks for the same slot are ignored and logged as conflicts.
-- Replay evaluates pending MCP slots only within `[root, heaviest]`; rooted-out slots are pruned.
-- `heaviest_bank` remains the parent selection source for creating new leader work, not a fallback bank for evaluating already-existing pending MCP slots.
-- On restart, in-memory MCP maps are rebuilt from incoming control traffic and blockstore artifacts; no snapshot persistence of in-memory MCP maps is assumed in v1.
 
 ### 6.5 Tests
 
@@ -497,7 +568,6 @@ Implementation point:
   6. local availability check:
      - count only locally stored shreds whose witness validates against included commitment
      - require `>= REQUIRED_RECONSTRUCTION` per included proposer
-     - strict gate behavior: if any included proposer is below threshold, do not vote the slot yet and retry on later passes; do not locally drop/exclude that proposer for voting
 
 Staged rollout guard:
 - replay-stage vote-gate lookups must be non-consuming; repeated evaluations for the same slot must see identical gate input.
@@ -511,25 +581,14 @@ Staged rollout guard:
   - discard proposer batch on commitment mismatch
   - commitment mismatch may poison current attempt, but next shard insert must reset state (no permanent poison for slot/proposer)
   - decode payload tx list with dual-format `B1` parser (latest + legacy)
-  - if an individual transaction cannot be parsed for ordering-key extraction, drop only that transaction and continue with the remaining transactions in the same proposer batch
 
 ### 7.3 Ordering and execution
 
 - Deterministic order:
-  - build two partitions:
-    - MCP-format transactions (latest/legacy MCP wire format)
-    - legacy/standard-Solana transactions
-  - MCP partition:
-    - for each proposer batch, dedup by signature (retain first occurrence)
-    - merge proposer batches by proposer index
-    - sort by MCP `ordering_fee` descending
-    - tie-break by first signature bytes lexicographic ascending
-  - legacy partition:
-    - no MCP proposer-batch dedup semantics
-    - sort by `compute_unit_price` descending
-    - tie-break by first signature bytes lexicographic ascending
-  - final order is MCP partition first, then legacy partition.
-  - no signature dedup across proposers or across partitions.
+  - concat by proposer index
+  - apply `ordering_fee` descending (highest fee first)
+  - stable tie-break by concatenated position
+  - duplicate transactions are not deduplicated in v1; each occurrence executes independently in deterministic order
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -541,15 +600,10 @@ Staged rollout guard:
 Two-phase fee handling (spec §8):
 - Phase A (fee commitment):
   - per-transaction checks for signature/basic validity
-  - fee charging is evaluated on pre-dedup occurrences
   - per-slot cumulative payer map in memory
   - required debit:
-    - legacy standard tx: `base_fee` per occurrence
-    - MCP standard tx: `base_fee + inclusion_fee` per occurrence
-    - legacy nonce tx: `base_fee + nonce_min_rent` per occurrence
-    - MCP nonce tx: `base_fee + inclusion_fee + nonce_min_rent` per occurrence
-    - `ordering_fee` is not charged in replay
-    - no replay-time `NUM_PROPOSERS` multiplier
+    - standard tx: `base_fee * NUM_PROPOSERS`
+    - nonce tx: `base_fee * NUM_PROPOSERS + nonce_min_rent`
   - debit implementation:
     - standard tx: `Bank::withdraw()`
     - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
@@ -566,30 +620,32 @@ Implementation wiring:
 
 Reconstruction-to-execution bridge:
 - `McpExecutionOutput` stored via `put_mcp_execution_output()` MUST have a production reader
-- cutover rule:
-  - for slots `< mcp_cutover_slot`, execution source is legacy entry-derived
-  - for slots `>= mcp_cutover_slot`, execution source is MCP canonical ordered transactions only
-- during block-verification replay (`block_verification=true`) for `slot >= mcp_cutover_slot`:
+- during block-verification replay (`block_verification=true`) when `mcp_protocol_v1` is active:
   - read `McpExecutionOutput` for the slot from blockstore
   - deserialize the MCP-ordered transaction list
-  - validate against bank transaction verification rules
+  - if present and valid, use it as canonical replay transaction input (replacing legacy entry-derived transaction entries)
   - malformed `McpExecutionOutput` is a hard replay error for the slot
-  - missing `McpExecutionOutput` is a retry/pending condition; no fallback to legacy source for that slot
+  - if missing, fall back to legacy entry-derived replay input in v1 (temporary compatibility mode)
 - during leader execution (`block_verification=false`):
   - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
   - the leader's MCP execution output is still persisted for verification by other nodes
-- implementation requirement: move `McpExecutionOutput` production to a pre-execution point (or equivalent deterministic MCP pre-exec construction) so first-run and restart share the same source for slots `>= mcp_cutover_slot`
+- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point; current replay pipeline produces it post-execution
 
 ### 7.4 Bank/block ID and vote
 
-- `block_id` handling is active in MCP flow.
-- Leader finalization:
-  - construct `ConsensusBlock` so authoritative `block_id` is recoverable/verifiable from consensus-defined fields.
-  - sign and broadcast only after delayed-bankhash and threshold checks pass.
-- Validator replay/vote path:
-  - verify `block_id` semantics from `ConsensusBlock` using Alpenglow-defined rules.
-  - vote submission uses authoritative `block_id` (not legacy fallback hash for MCP-effective slots).
-- underlying vote wire format remains unchanged unless Alpenglow requires an explicit new field.
+**DEFERRED — requires Alpenglow consensus integration.**
+
+- Per policy B3, `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
+- `ConsensusBlock` currently carries `delayed_bankhash` and `consensus_meta` but does NOT carry an explicit `block_id` field, because `block_id` derivation depends on Alpenglow consensus logic that is not yet integrated.
+- Prerequisites before this section can be implemented:
+  1. Alpenglow consensus provides a `block_id` value (or the derivation rule) in `ConsensusBlock.consensus_meta`
+  2. `Bank` exposes a setter for `block_id` that can be called after vote-gate validation
+  3. Vote submission path uses `block_id` instead of (or in addition to) legacy bank hash
+- Until prerequisites are met:
+  - validators vote on the legacy bank hash (derived from Pipeline A entry execution)
+  - `ConsensusBlock.consensus_meta` is opaque bytes, verified for presence but not interpreted
+  - MCP acts as a consensus overlay that gates voting, not as the authority for block identity
+- underlying vote wire format remains unchanged.
 
 ### 7.5 Empty result
 
@@ -602,30 +658,21 @@ Reconstruction-to-execution bridge:
 - delayed bankhash availability gate: leader does not finalize and validator does not vote until delayed-slot bankhash is available locally
 - reconstruction mismatch rejection
 - deterministic ordering behavior
-- partition ordering behavior: MCP-first then legacy
-- signature tie-break behavior for both partitions
-- MCP proposer-local signature dedup behavior (retain first per proposer)
-- pre-dedup fee charging behavior (duplicates still charged per occurrence)
-- transaction-level parse-failure handling: unparsable transactions are dropped individually (batch continues)
 - execution-output reader behavior: strict decode for malformed payloads; MCP-wire (latest/legacy) and standard-wire transactions decode into replay input
 - dual-format payload acceptance: mixed latest + legacy tx bytes decode correctly
 - producer serialization preference: latest format emitted when available, legacy retained otherwise
 - two-phase fees:
   - per-transaction granularity
   - cross-proposer cumulative payer accounting
-  - MCP `inclusion_fee` charged once per pre-dedup occurrence
-  - MCP `ordering_fee` not charged in replay
   - nonce minimum-rent edge case
   - phase-B no re-deduction
-- issue-20 integration:
+- issue-20 single-node integration:
   - strict timeout failure by default (no soft-pass env toggle)
-  - strict 5-node startup with equal stake (20% each) and no soft skip on port failures
   - use live validator blockstore handles during runtime
   - assert all three artifacts are observed: relay attestation, MCP shreds, MCP execution output
-  - assert non-leader MCP execution output is observed for at least one slot where leader differs
-  - emit periodic diagnostics for gossip-visible nodes, vote accounts, and per-validator slot progress
 - additional multi-node integration:
   - verify proposer forwarding fanout and non-leader replay path for MCP two-pass fees when 2+ validators are live
+  - in constrained environments that cannot allocate enough validator UDP ports, skip only the non-leader assertion and keep artifact checks strict
 
 ---
 
@@ -634,7 +681,6 @@ Reconstruction-to-execution bridge:
 New files:
 - `ledger/src/mcp.rs`
 - `ledger/src/mcp_merkle.rs`
-- `ledger/src/mcp_erasure.rs`
 - `transaction-view/src/mcp_payload.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
@@ -651,7 +697,6 @@ Modified files:
 - `turbine/src/sigverify_shreds.rs`
 - `turbine/src/retransmit_stage.rs`
 - `turbine/src/quic_endpoint.rs`
-- `turbine/src/mcp_proposer.rs`
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`
 - `core/src/shred_fetch_stage.rs`
 - `core/src/window_service.rs`
