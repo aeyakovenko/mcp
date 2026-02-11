@@ -7,7 +7,9 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reuse existing TPU/TVU pipelines, sigverify, `window_service`, blockstore, replay stage, and execution paths.
 - No new stage types. Only add small targeted modules where no equivalent exists.
 - All MCP behavior is gated by `feature_set::mcp_protocol_v1::id()`.
-- Activation semantics: a slot is MCP-effective iff that slot's bank has `mcp_protocol_v1` active; pre-activation slots remain legacy-only.
+- Activation semantics: define `mcp_cutover_slot` as the first slot whose bank has `mcp_protocol_v1` active.
+- Slots `< mcp_cutover_slot` are legacy-executed.
+- Slots `>= mcp_cutover_slot` are MCP-executed from canonical MCP-ordered source (no legacy execution-source fallback).
 - Do **not** modify `ShredVariant`, `ShredCommonHeader`, or existing Agave shred pipeline types.
 - MCP shreds use a separate wire format and dedicated column families.
 - Invalid MCP messages are dropped and MUST NOT advance protocol state.
@@ -27,8 +29,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reconstruction-to-execution bridge reader: `PARTIAL`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
-  - Current limitation: replay execution source remains entry-derived for now, even when `McpExecutionOutput` is present, to avoid leader/non-leader execution-source divergence until MCP-ordered execution is wired into both paths.
-  - Missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
+  - Required invariant (not fully implemented yet): once `slot >= mcp_cutover_slot`, replay must not execute from legacy entry-derived source for that slot.
+  - Remaining blocker: `McpExecutionOutput` production currently happens post-execution in replay, so pre-execution availability for `slot >= mcp_cutover_slot` is not yet guaranteed.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -62,6 +64,11 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
       - `inclusion_fee`: read §7.1 config field when present, else default `0`
       - `ordering_fee`: read §7.1 config field when present, else derive from `compute_unit_price` (default `0` if absent)
     - legacy format: derive ordering key from `compute_unit_price` (default `0` if absent)
+  - Conservative proposer admission fee check:
+    - an MCP proposer only admits a transaction if the fee payer can cover conservative slot-level exposure:
+      - standard tx: `NUM_PROPOSERS * base_fee`
+      - nonce tx: `NUM_PROPOSERS * base_fee + nonce_min_rent`
+    - this is an admission precheck, not a replay-time charge multiplier
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
   - Execute highest-paying transactions first.
@@ -403,12 +410,15 @@ Implementation point:
 - `core/src/replay_stage.rs` + `core/src/mcp_replay.rs`:
   - refresh per-slot `VoteGateInput` from validated consensus-block bytes before MCP vote-gate evaluation.
   - retain and retry pending MCP consensus slots in replay loop so evaluation does not depend on one-shot heaviest-fork selection timing.
+  - evaluate slot `X` only against slot-`X` bank context (parent of `X` must already be replayed/frozen before `X` is replayed).
+  - if slot-`X` bank is unavailable, keep slot pending and retry later; never substitute `heaviest_bank` as a fallback evaluation context.
 
 ### 6.6 Fork semantics
 
 - ConsensusBlock cache is keyed by `slot`; first valid block for a slot wins in-memory for that process lifetime.
 - Conflicting later consensus blocks for the same slot are ignored and logged as conflicts.
 - Replay evaluates pending MCP slots only within `[root, heaviest]`; rooted-out slots are pruned.
+- `heaviest_bank` remains the parent selection source for creating new leader work, not a fallback bank for evaluating already-existing pending MCP slots.
 - On restart, in-memory MCP maps are rebuilt from incoming control traffic and blockstore artifacts; no snapshot persistence of in-memory MCP maps is assumed in v1.
 
 ### 6.5 Tests
@@ -440,6 +450,7 @@ Implementation point:
   6. local availability check:
      - count only locally stored shreds whose witness validates against included commitment
      - require `>= REQUIRED_RECONSTRUCTION` per included proposer
+     - strict gate behavior: if any included proposer is below threshold, do not vote the slot yet and retry on later passes; do not locally drop/exclude that proposer for voting
 
 Staged rollout guard:
 - replay-stage vote-gate lookups must be non-consuming; repeated evaluations for the same slot must see identical gate input.
@@ -453,6 +464,7 @@ Staged rollout guard:
   - discard proposer batch on commitment mismatch
   - commitment mismatch may poison current attempt, but next shard insert must reset state (no permanent poison for slot/proposer)
   - decode payload tx list with dual-format `B1` parser (latest + legacy)
+  - if an individual transaction cannot be parsed for ordering-key extraction, drop only that transaction and continue with the remaining transactions in the same proposer batch
 
 ### 7.3 Ordering and execution
 
@@ -474,8 +486,9 @@ Two-phase fee handling (spec §8):
   - per-transaction checks for signature/basic validity
   - per-slot cumulative payer map in memory
   - required debit:
-    - standard tx: `base_fee * NUM_PROPOSERS`
-    - nonce tx: `base_fee * NUM_PROPOSERS + nonce_min_rent`
+    - standard tx: `base_fee` per transaction occurrence
+    - nonce tx: `base_fee + nonce_min_rent` per transaction occurrence
+    - no additional replay-time `NUM_PROPOSERS` multiplier
   - debit implementation:
     - standard tx: `Bank::withdraw()`
     - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
@@ -492,16 +505,19 @@ Implementation wiring:
 
 Reconstruction-to-execution bridge:
 - `McpExecutionOutput` stored via `put_mcp_execution_output()` MUST have a production reader
-- during block-verification replay (`block_verification=true`) when `mcp_protocol_v1` is active:
+- cutover rule:
+  - for slots `< mcp_cutover_slot`, execution source is legacy entry-derived
+  - for slots `>= mcp_cutover_slot`, execution source is MCP canonical ordered transactions only
+- during block-verification replay (`block_verification=true`) for `slot >= mcp_cutover_slot`:
   - read `McpExecutionOutput` for the slot from blockstore
   - deserialize the MCP-ordered transaction list
-  - if present and valid, validate it against bank transaction verification rules
+  - validate against bank transaction verification rules
   - malformed `McpExecutionOutput` is a hard replay error for the slot
-  - execution source remains legacy entry-derived replay input in v1 (temporary compatibility mode)
+  - missing `McpExecutionOutput` is a retry/pending condition; no fallback to legacy source for that slot
 - during leader execution (`block_verification=false`):
   - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
   - the leader's MCP execution output is still persisted for verification by other nodes
-- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point and switching both leader and non-leader execution paths to the same MCP-ordered source
+- implementation requirement: move `McpExecutionOutput` production to a pre-execution point (or equivalent deterministic MCP pre-exec construction) so first-run and restart share the same source for slots `>= mcp_cutover_slot`
 
 ### 7.4 Bank/block ID and vote
 
@@ -530,6 +546,7 @@ Reconstruction-to-execution bridge:
 - delayed bankhash availability gate: leader does not finalize and validator does not vote until delayed-slot bankhash is available locally
 - reconstruction mismatch rejection
 - deterministic ordering behavior
+- transaction-level parse-failure handling: unparsable transactions are dropped individually (batch continues)
 - execution-output reader behavior: strict decode for malformed payloads; MCP-wire (latest/legacy) and standard-wire transactions decode into replay input
 - dual-format payload acceptance: mixed latest + legacy tx bytes decode correctly
 - producer serialization preference: latest format emitted when available, legacy retained otherwise
