@@ -7,6 +7,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reuse existing TPU/TVU pipelines, sigverify, `window_service`, blockstore, replay stage, and execution paths.
 - No new stage types. Only add small targeted modules where no equivalent exists.
 - All MCP behavior is gated by `feature_set::mcp_protocol_v1::id()`.
+- Activation semantics: a slot is MCP-effective iff that slot's bank has `mcp_protocol_v1` active; pre-activation slots remain legacy-only.
 - Do **not** modify `ShredVariant`, `ShredCommonHeader`, or existing Agave shred pipeline types.
 - MCP shreds use a separate wire format and dedicated column families.
 - Invalid MCP messages are dropped and MUST NOT advance protocol state.
@@ -26,7 +27,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Reconstruction-to-execution bridge reader: `PARTIAL`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
-  - Current limitation: missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
+  - Current limitation: replay execution source remains entry-derived for now, even when `McpExecutionOutput` is present, to avoid leader/non-leader execution-source divergence until MCP-ordered execution is wired into both paths.
+  - Missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -39,7 +41,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Must read from live validator blockstore handles during runtime.
 - `A4` Coverage gap to close before final sign-off:
   - Add multi-node MCP integration coverage for forwarding + two-pass replay-fee path (`block_verification=true` path).
-  - Test should enforce non-leader execution-output observation when 2+ validators are live, and degrade to artifact-only checks in port-constrained environments.
+  - Issue-20 test must run with a real 5-node cluster and enforce non-leader execution-output observation.
+  - Startup failure to allocate required validator ports is a hard failure after bounded retries (no soft skip).
 - `A5` Rollout invariant:
   - MCP CF additions require coordinated node upgrade before feature activation.
 - `A6` MCP control-message backpressure:
@@ -70,6 +73,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - `consensus_meta` carries the consensus-defined data needed to recover/verify that `block_id`.
 - `B4` delayed bankhash availability:
   - There must always be a delayed-slot bankhash before MCP progression.
+  - v1 delayed slot is `slot.saturating_sub(1)`.
   - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
   - No fallback hash value is permitted.
 
@@ -117,7 +121,7 @@ Non-reusable for MCP wire correctness:
     - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
     - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
-    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (this is always `<= NUM_RELAYS * SHRED_DATA_BYTES` because `DATA_SHREDS_PER_FEC_BLOCK <= NUM_RELAYS`)
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (tight bound equals RS data capacity; always `<= NUM_RELAYS * SHRED_DATA_BYTES`)
   - Types:
     - `RelayAttestation`
     - `AggregateAttestation`
@@ -282,6 +286,9 @@ Non-reusable for MCP wire correctness:
   - `RelayAttestation.entries` MUST be sorted by `proposer_index` and deduplicated.
   - Empty `RelayAttestation.entries` is invalid and MUST be rejected.
   - relay-signing domain is `version || slot || relay_index || entries_len || entries` and intentionally excludes `leader_index` (leader-agnostic within slot).
+- Relay attestation emission trigger:
+  - emit once per `(slot, relay_index)` when either proposer coverage is complete (`NUM_PROPOSERS`) or the slot is at least one working-bank slot old.
+  - this defines the relay deadline in implementation terms and avoids unbounded waiting.
 
 ### 4.3 MCP QUIC transport
 
@@ -397,6 +404,13 @@ Implementation point:
   - refresh per-slot `VoteGateInput` from validated consensus-block bytes before MCP vote-gate evaluation.
   - retain and retry pending MCP consensus slots in replay loop so evaluation does not depend on one-shot heaviest-fork selection timing.
 
+### 6.6 Fork semantics
+
+- ConsensusBlock cache is keyed by `slot`; first valid block for a slot wins in-memory for that process lifetime.
+- Conflicting later consensus blocks for the same slot are ignored and logged as conflicts.
+- Replay evaluates pending MCP slots only within `[root, heaviest]`; rooted-out slots are pruned.
+- On restart, in-memory MCP maps are rebuilt from incoming control traffic and blockstore artifacts; no snapshot persistence of in-memory MCP maps is assumed in v1.
+
 ### 6.5 Tests
 
 - threshold behavior (`< REQUIRED_ATTESTATIONS` => empty)
@@ -481,13 +495,13 @@ Reconstruction-to-execution bridge:
 - during block-verification replay (`block_verification=true`) when `mcp_protocol_v1` is active:
   - read `McpExecutionOutput` for the slot from blockstore
   - deserialize the MCP-ordered transaction list
-  - if present and valid, use it as canonical replay transaction input (replacing legacy entry-derived transaction entries)
+  - if present and valid, validate it against bank transaction verification rules
   - malformed `McpExecutionOutput` is a hard replay error for the slot
-  - if missing, fall back to legacy entry-derived replay input in v1 (temporary compatibility mode)
+  - execution source remains legacy entry-derived replay input in v1 (temporary compatibility mode)
 - during leader execution (`block_verification=false`):
   - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
   - the leader's MCP execution output is still persisted for verification by other nodes
-- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point; current replay pipeline produces it post-execution
+- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point and switching both leader and non-leader execution paths to the same MCP-ordered source
 
 ### 7.4 Bank/block ID and vote
 
@@ -501,7 +515,7 @@ Reconstruction-to-execution bridge:
   3. Vote submission path uses `block_id` instead of (or in addition to) legacy bank hash
 - Until prerequisites are met:
   - validators vote on the legacy bank hash (derived from Pipeline A entry execution)
-  - `ConsensusBlock.consensus_meta` is opaque bytes, verified for presence but not interpreted
+  - `ConsensusBlock.consensus_meta` is consensus-layer data: MCP validates structural bounds and signatures, while Alpenglow consensus owns semantic interpretation
   - MCP acts as a consensus overlay that gates voting, not as the authority for block identity
 - underlying vote wire format remains unchanged.
 
@@ -524,13 +538,15 @@ Reconstruction-to-execution bridge:
   - cross-proposer cumulative payer accounting
   - nonce minimum-rent edge case
   - phase-B no re-deduction
-- issue-20 single-node integration:
+- issue-20 integration:
   - strict timeout failure by default (no soft-pass env toggle)
+  - strict 5-node startup with equal stake (20% each) and no soft skip on port failures
   - use live validator blockstore handles during runtime
   - assert all three artifacts are observed: relay attestation, MCP shreds, MCP execution output
+  - assert non-leader MCP execution output is observed for at least one slot where leader differs
+  - emit periodic diagnostics for gossip-visible nodes, vote accounts, and per-validator slot progress
 - additional multi-node integration:
   - verify proposer forwarding fanout and non-leader replay path for MCP two-pass fees when 2+ validators are live
-  - in constrained environments that cannot allocate enough validator UDP ports, skip only the non-leader assertion and keep artifact checks strict
 
 ---
 

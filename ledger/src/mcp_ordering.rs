@@ -120,4 +120,28 @@ mod tests {
         let ids: Vec<_> = ordered_single.into_iter().map(|tx| tx.id).collect();
         assert_eq!(ids, vec!["only"]);
     }
+
+    #[test]
+    fn test_duplicate_transactions_are_not_deduplicated() {
+        let batches = vec![
+            (
+                0,
+                vec![Tx {
+                    id: "dup",
+                    fee: 10,
+                }],
+            ),
+            (
+                1,
+                vec![Tx {
+                    id: "dup",
+                    fee: 10,
+                }],
+            ),
+        ];
+
+        let ordered = order_batches_by_fee_desc(batches, |tx| tx.fee);
+        let ids: Vec<_> = ordered.into_iter().map(|tx| tx.id).collect();
+        assert_eq!(ids, vec!["dup", "dup"]);
+    }
 }

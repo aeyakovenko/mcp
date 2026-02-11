@@ -279,6 +279,8 @@ impl Rocks {
             columns::AlternateIndex::NAME,
             columns::AlternateShredData::NAME,
             columns::AlternateMerkleRootMeta::NAME,
+            // MCP CFs must be present on all validators before feature activation.
+            // Mixed-version clusters should not activate mcp_protocol_v1.
             columns::McpShredData::NAME,
             columns::McpRelayAttestation::NAME,
             columns::McpExecutionOutput::NAME,
