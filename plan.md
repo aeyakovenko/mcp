@@ -125,6 +125,9 @@ Non-reusable for MCP wire correctness:
 - `feature-set/src/lib.rs`:
   - Add `pub mod mcp_protocol_v1 { declare_id!("..."); }`.
   - Register in `FEATURE_NAMES`.
+- Slot feature gate rule:
+  - normative cutover for MCP-effective execution is `slot >= activated_slot(mcp_protocol_v1)`.
+  - ingress/control paths currently use `cluster_nodes::check_feature_activation(feature, slot, root_bank)`; this remains a tracked activation-semantics gap until all paths use the same slot cutover rule.
 
 ### 1.2 MCP constants and wire types
 
@@ -134,7 +137,8 @@ Non-reusable for MCP wire correctness:
     - `NUM_RELAYS = 200`
     - `DATA_SHREDS_PER_FEC_BLOCK = 40`
     - `CODING_SHREDS_PER_FEC_BLOCK = 160`
-    - `SHRED_DATA_BYTES = 863`
+    - `MCP_WITNESS_LEN = ceil(log2(NUM_RELAYS)) = 8`
+    - `SHRED_DATA_BYTES = 863` (derived in Pass 1.4 from fixed wire overhead)
     - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
     - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
     - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
@@ -169,7 +173,15 @@ Non-reusable for MCP wire correctness:
 ### 1.4 MCP shred wire format
 
 - Add `ledger/src/shred/mcp_shred.rs`:
+  - Wire-size constants:
+    - `MCP_SHRED_OVERHEAD = 369` bytes (`slot + proposer_index + shred_index + commitment + witness_len + witness + proposer_sig`)
+    - `MCP_SHRED_DATA_BYTES = PACKET_DATA_SIZE - MCP_SHRED_OVERHEAD = 1232 - 369 = 863`
+    - `MCP_SHRED_WIRE_SIZE = PACKET_DATA_SIZE = 1232`
   - Format: `slot:u64 + proposer_index:u32 + shred_index:u32 + commitment:[u8;32] + shred_data + witness_len:u8 + witness + proposer_sig:[u8;64]`
+  - Data/coding representation:
+    - all 200 MCP shreds use the same wire layout
+    - `shred_index in [0, 39]` carries data shards; `shred_index in [40, 199]` carries RS parity shards
+    - RS operates on payload bytes; MCP wire headers are added after shard generation
   - `is_mcp_shred_packet(packet)` classifier
   - strict parse + verify helpers
   - enforce `witness_len == ceil(log2(NUM_RELAYS))`
@@ -177,7 +189,9 @@ Non-reusable for MCP wire correctness:
 ### 1.5 Reed-Solomon helper visibility
 
 - Keep RS internals in `ledger` crate.
-- Add ledger-level MCP helpers for encode/decode/reconstruct so `core` code does not call `pub(crate)` RS APIs directly.
+- Reuse `ledger/src/mcp_erasure.rs` for payload-to-shard encode/reconstruct helpers.
+- Reuse `turbine/src/mcp_proposer.rs` for MCP shred message construction (`commitment + witnesses + per-relay shred_index`).
+- Avoid direct RS-library calls from replay/window/forwarding paths.
 
 ### 1.6 Tests
 
@@ -187,6 +201,14 @@ Non-reusable for MCP wire correctness:
 - Attestation sorting/duplicate rejection.
 - `witness_len` enforcement.
 - MCP shred packet size and classifier tests.
+- Wire-size invariant tests:
+  - `MCP_SHRED_WIRE_SIZE == PACKET_DATA_SIZE`
+  - `MCP_SHRED_DATA_BYTES + MCP_SHRED_OVERHEAD == MCP_SHRED_WIRE_SIZE`
+- RS robustness tests:
+  - recover payload from any `REQUIRED_RECONSTRUCTION` shards
+  - fail reconstruction with fewer than `REQUIRED_RECONSTRUCTION` shards
+- Mutation tests:
+  - modified commitment/signature/witness fails verification deterministically.
 
 ---
 
@@ -199,6 +221,11 @@ Non-reusable for MCP wire correctness:
 - `ledger/src/leader_schedule.rs`:
   - Add helper that reuses stake-weighted leader sampling with domain-separated seed.
   - `NUM_PROPOSERS`/`NUM_RELAYS` must be imported from `ledger::mcp` (single source of truth), not duplicated locally.
+  - seed construction:
+    - `seed[0..8] = epoch.to_le_bytes()`
+    - `seed[8..] = hash(domain)[..24]`
+  - sampling semantics:
+    - use `repeat = 1` for MCP schedules (independent sample per slot position; no leader-style 4-slot repetition)
   - Domains:
     - proposer: `b"mcp:proposer"`
     - relay: `b"mcp:relay"`
@@ -219,6 +246,8 @@ Non-reusable for MCP wire correctness:
     - `relays_at_slot(slot, bank) -> Option<Vec<Pubkey>>` (len=200)
     - `proposer_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
     - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
+  - Accessor gating:
+    - when MCP feature is inactive in the provided bank, return `None`/empty and do not expose proposer/relay indices.
   - Duplicate identities return all indices (spec §5).
 
 ### 2.4 Tests
@@ -263,6 +292,7 @@ Non-reusable for MCP wire correctness:
   - Agave packets: unchanged existing path.
   - MCP packets:
     - apply slot feature gate
+    - gate is feature-only (not local proposer/relay role), because every validator needs MCP shreds for local reconstruction/vote gate checks
     - bypass Agave shred-id/leader-sigverify assumptions
     - forward through existing `verified_sender` channel for MCP-specific verification in `window_service`
 
@@ -272,6 +302,7 @@ Non-reusable for MCP wire correctness:
 - classifier rejects valid Agave Merkle shreds.
 - Valid MCP shred passes, bad signature/proof fails.
 - MCP CF put/get + purge behavior.
+- Feature toggle coverage at ingress: MCP packets are accepted/rejected based on slot feature gate and do not leak into Agave shred verify path.
 
 ---
 
@@ -344,6 +375,9 @@ Non-reusable for MCP wire correctness:
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`:
   - use existing broadcast entry-batch flow (no new TPU stage/worker).
   - collect per-slot transaction wire bytes and enforce `MAX_PROPOSER_PAYLOAD` with framing overhead.
+  - build MCP shreds through reusable helper path:
+    - `turbine/src/mcp_proposer.rs::encode_payload_to_mcp_shreds()`
+    - `turbine/src/mcp_proposer.rs::build_shred_messages()`
   - on slot completion, encode MCP shreds and dispatch to relay schedule over existing QUIC endpoint sender.
   - proposer activation: local pubkey must appear in `proposer_indices_at_slot`.
   - duplicate proposer indices are valid and dispatch once per owned index.
@@ -600,6 +634,7 @@ Reconstruction-to-execution bridge:
 New files:
 - `ledger/src/mcp.rs`
 - `ledger/src/mcp_merkle.rs`
+- `ledger/src/mcp_erasure.rs`
 - `transaction-view/src/mcp_payload.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
@@ -616,6 +651,7 @@ Modified files:
 - `turbine/src/sigverify_shreds.rs`
 - `turbine/src/retransmit_stage.rs`
 - `turbine/src/quic_endpoint.rs`
+- `turbine/src/mcp_proposer.rs`
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`
 - `core/src/shred_fetch_stage.rs`
 - `core/src/window_service.rs`
