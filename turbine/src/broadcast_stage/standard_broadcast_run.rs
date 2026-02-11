@@ -646,7 +646,8 @@ impl StandardBroadcastRun {
     ) {
         if !bank
             .feature_set
-            .is_active(&feature_set::mcp_protocol_v1::id())
+            .activated_slot(&feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
         {
             return;
         }
@@ -719,7 +720,8 @@ impl StandardBroadcastRun {
                 .unwrap_or_else(|| bank_forks.root_bank());
             let feature_active = bank
                 .feature_set
-                .is_active(&feature_set::mcp_protocol_v1::id());
+                .activated_slot(&feature_set::mcp_protocol_v1::id())
+                .is_some_and(|activated_slot| slot >= activated_slot);
             (
                 feature_active,
                 bank,

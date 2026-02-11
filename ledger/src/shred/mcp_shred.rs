@@ -40,6 +40,10 @@ pub enum McpShredError {
     InvalidSize { expected: usize, actual: usize },
     #[error("invalid MCP witness length: expected {expected}, got {actual}")]
     InvalidWitnessLength { expected: usize, actual: usize },
+    #[error("invalid MCP proposer index: {0}")]
+    InvalidProposerIndex(u32),
+    #[error("invalid MCP shred index: {0}")]
+    InvalidShredIndex(u32),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +129,9 @@ impl McpShred {
                 .unwrap(),
         );
         offset += std::mem::size_of::<u32>();
+        if (proposer_index as usize) >= MCP_NUM_PROPOSERS {
+            return Err(McpShredError::InvalidProposerIndex(proposer_index));
+        }
 
         let shred_index = u32::from_le_bytes(
             data[offset..offset + std::mem::size_of::<u32>()]
@@ -132,6 +139,9 @@ impl McpShred {
                 .unwrap(),
         );
         offset += std::mem::size_of::<u32>();
+        if (shred_index as usize) >= MCP_NUM_RELAYS {
+            return Err(McpShredError::InvalidShredIndex(shred_index));
+        }
 
         let mut commitment = [0u8; 32];
         commitment.copy_from_slice(&data[offset..offset + 32]);
@@ -335,6 +345,56 @@ mod tests {
             }
         );
         assert!(!is_mcp_shred_bytes(&bytes));
+    }
+
+    #[test]
+    fn test_mcp_shred_rejects_out_of_range_proposer_index_in_parser() {
+        let slot = 42;
+        let proposer_index = (MCP_NUM_PROPOSERS + 1) as u32;
+        let shred_index = 0usize;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let keypair = Keypair::new();
+        let proposer_signature = keypair.sign_message(&commitment);
+        let shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index: shred_index as u32,
+            commitment,
+            shred_data: leaves[shred_index],
+            witness,
+            proposer_signature,
+        };
+        let err = McpShred::from_bytes(&shred.to_bytes()).unwrap_err();
+        assert_eq!(err, McpShredError::InvalidProposerIndex(proposer_index));
+    }
+
+    #[test]
+    fn test_mcp_shred_rejects_out_of_range_shred_index_in_parser() {
+        let slot = 42;
+        let proposer_index = 0u32;
+        let shred_index = 0usize;
+        let leaves: Vec<[u8; MCP_SHRED_DATA_BYTES]> =
+            (0..MCP_NUM_RELAYS).map(|i| make_leaf(i as u8)).collect();
+        let (commitment, witness) = build_merkle_witness(slot, proposer_index, &leaves, shred_index);
+        let keypair = Keypair::new();
+        let proposer_signature = keypair.sign_message(&commitment);
+        let shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index: shred_index as u32,
+            commitment,
+            shred_data: leaves[shred_index],
+            witness,
+            proposer_signature,
+        };
+        let mut bytes = shred.to_bytes();
+        let shred_index_offset = std::mem::size_of::<Slot>() + std::mem::size_of::<u32>();
+        bytes[shred_index_offset..shred_index_offset + std::mem::size_of::<u32>()]
+            .copy_from_slice(&(MCP_NUM_RELAYS as u32).to_le_bytes());
+        let err = McpShred::from_bytes(&bytes).unwrap_err();
+        assert_eq!(err, McpShredError::InvalidShredIndex(MCP_NUM_RELAYS as u32));
     }
 
     #[test]

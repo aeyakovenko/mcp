@@ -2626,7 +2626,8 @@ impl ReplayStage {
         let allow_bankless_start = migration_status.is_alpenglow_enabled()
             && parent_bank
                 .feature_set
-                .is_active(&agave_feature_set::mcp_protocol_v1::id());
+                .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                .is_some_and(|activated_slot| parent_bank.slot() >= activated_slot);
 
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
@@ -2860,7 +2861,8 @@ impl ReplayStage {
     ) -> Result<(), SetRootError> {
         let mcp_vote_gate_enabled = bank
             .feature_set
-            .is_active(&agave_feature_set::mcp_protocol_v1::id());
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
         if mcp_vote_gate_enabled {
             mcp_replay::refresh_vote_gate_input(
                 bank.slot(),
@@ -3002,7 +3004,8 @@ impl ReplayStage {
     ) {
         if !heaviest_bank
             .feature_set
-            .is_active(&agave_feature_set::mcp_protocol_v1::id())
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| heaviest_bank.slot() >= activated_slot)
         {
             return;
         }

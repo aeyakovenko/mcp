@@ -360,7 +360,8 @@ fn should_use_mcp_two_pass_fees(block_verification: bool, bank: &Bank) -> bool {
     block_verification
         && bank
             .feature_set
-            .is_active(&feature_set::mcp_protocol_v1::id())
+            .activated_slot(&feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
 }
 
 // Get actual transaction execution costs from transaction commit results
@@ -1788,7 +1789,8 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
 ) -> result::Result<(Vec<ReplayEntry>, usize), BlockstoreProcessorError> {
     if !bank
         .feature_set
-        .is_active(&feature_set::mcp_protocol_v1::id())
+        .activated_slot(&feature_set::mcp_protocol_v1::id())
+        .is_some_and(|activated_slot| slot >= activated_slot)
     {
         return Ok((replay_entries, default_num_txs));
     }

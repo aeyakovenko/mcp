@@ -72,9 +72,11 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
     - MCP-format transactions (latest or legacy MCP wire) execute before legacy Solana-wire transactions.
     - Within each class, sort by `ordering_fee` descending.
     - Fee ties break by transaction signature bytes ascending.
+    - Note: this intentionally overrides MCP spec §3.6 tie behavior (proposer-batch order) for deterministic fee-priority ordering in Agave v1.
   - Dedup policy:
     - Dedup by signature within each single proposer payload only.
     - Do not dedup across proposers; each cross-proposer occurrence is executed and charged once.
+    - Note: cross-proposer dedup policy is an Agave v1 extension (spec is silent).
 - `B3` `block_id` authority:
   - `block_id` is defined by Alpenglow consensus.
   - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
@@ -83,6 +85,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - There must always be a delayed-slot bankhash before MCP progression.
   - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
   - No fallback hash value is permitted.
+  - v1 delayed-slot definition is fixed to `slot - 1` (saturating) until consensus metadata carries an explicit delayed-slot field.
 
 ---
 
@@ -136,11 +139,12 @@ Non-reusable for MCP wire correctness:
     - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
     - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
-    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (this is always `<= NUM_RELAYS * SHRED_DATA_BYTES` because `DATA_SHREDS_PER_FEC_BLOCK <= NUM_RELAYS`)
-  - Types:
-    - `RelayAttestation`
-    - `AggregateAttestation`
-    - `ConsensusBlock`
+    - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (v1 RS-capacity bound; stricter than spec's looser `NUM_RELAYS * SHRED_DATA_BYTES` bound)
+    - invariant: `REQUIRED_RECONSTRUCTION == DATA_SHREDS_PER_FEC_BLOCK` (40) in v1
+  - Add MCP wire types in dedicated files:
+    - `ledger/src/mcp_relay_attestation.rs`
+    - `ledger/src/mcp_aggregate_attestation.rs`
+    - `ledger/src/mcp_consensus_block.rs`
 - Add `transaction-view/src/mcp_payload.rs`:
   - `McpPayload` parser behavior:
     - decode `tx_count + [tx_len, tx_bytes]` framing
@@ -296,11 +300,12 @@ Non-reusable for MCP wire correctness:
 - `ledger/src/blockstore/column.rs`:
   - Add `McpShredData` with index `(Slot, u32 proposer_index, u32 shred_index)`.
   - Add `McpRelayAttestation` with index `(Slot, u32 relay_index)`.
+  - Add `McpExecutionOutput` with index `Slot`.
 - `ledger/src/blockstore_db.rs`:
   - Register CF descriptors.
   - Add names to `columns()` list.
 - `ledger/src/blockstore/blockstore_purge.rs`:
-  - Add both MCP CFs to `purge_range()` and `purge_files_in_range()`.
+  - Add all MCP CFs to `purge_range()` and `purge_files_in_range()`.
 
 ### 3.2 Blockstore APIs
 
@@ -421,8 +426,7 @@ packet ingestion, into dedup and sigverify
   - payload-level dedup is by signature within each proposer only.
   - MCP payload encoder accepts latest and legacy MCP tx bytes, and may carry standard Solana-wire tx bytes for compatibility.
 - MCP payload ordering at proposer output:
-  - MCP-format txs first, then legacy Solana-wire txs.
-  - within each class: `ordering_fee` descending, then signature bytes ascending.
+  - Use policy `B2` (MCP-first classing, fee-desc, signature tie-break, per-proposer dedup).
 
 ### 5.4 Forwarding stage changes
 
@@ -442,10 +446,12 @@ packet ingestion, into dedup and sigverify
 
 - MCP dispatch removes completed slot state and emits one shred per relay index per owned proposer index.
 - Proposer produces 200 shreds (one per relay)
-- Payload size within `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes
+- Payload size within `DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES` = 34,520 bytes
 - RS encode -> decode round-trip
 - Payload bound enforcement.
 - Forwarding routes to proposer addresses in MCP mode for both forwarding clients.
+
+---
 
 ## Pass 6 — Leader Aggregation + ConsensusBlock
 
@@ -539,12 +545,8 @@ Staged rollout guard:
 ### 7.3 Ordering and execution
 
 - Deterministic order:
-  - concat by proposer index
-  - dedup by signature within each proposer payload before global ordering
-  - MCP-format transactions first; legacy Solana-wire transactions last
-  - within each class: `ordering_fee` descending (highest first)
-  - fee ties break by signature bytes ascending
-  - cross-proposer duplicates are not deduplicated; each occurrence executes and is charged once
+  - Use policy `B2`.
+  - Replay concatenates proposer batches by proposer index before applying `B2`.
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -636,24 +638,32 @@ Reconstruction-to-execution bridge:
 New files:
 - `ledger/src/mcp.rs`
 - `ledger/src/mcp_merkle.rs`
+- `ledger/src/mcp_erasure.rs`
+- `ledger/src/mcp_reconstruction.rs`
+- `ledger/src/mcp_ordering.rs`
+- `ledger/src/mcp_relay_attestation.rs`
+- `ledger/src/mcp_aggregate_attestation.rs`
+- `ledger/src/mcp_consensus_block.rs`
 - `ledger/src/mcp_shredder.rs`
 - `transaction-view/src/mcp_payload.rs`
+- `transaction-view/src/mcp_transaction.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
+- `core/src/mcp_vote_gate.rs`
+- `core/src/mcp_relay.rs`
+- `core/src/mcp_relay_submit.rs`
+- `turbine/src/mcp_proposer.rs`
 
 Modified files:
 - `feature-set/src/lib.rs`
 - `ledger/src/leader_schedule.rs`
 - `ledger/src/leader_schedule_cache.rs`
 - `ledger/src/leader_schedule_utils.rs`
-- `ledger/src/mcp_erasure.rs`
-- `ledger/src/mcp_ordering.rs`
 - `ledger/src/blockstore/column.rs`
 - `ledger/src/blockstore_db.rs`
 - `ledger/src/blockstore.rs`
 - `ledger/src/blockstore/blockstore_purge.rs`
 - `turbine/src/sigverify_shreds.rs`
-- `turbine/src/mcp_proposer.rs`
 - `turbine/src/retransmit_stage.rs`
 - `turbine/src/quic_endpoint.rs`
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`
@@ -664,14 +674,10 @@ Modified files:
 - `core/src/tvu.rs`
 - `core/src/replay_stage.rs`
 - `core/src/block_creation_loop.rs`
-- `core/src/mcp_vote_gate.rs`
-- `core/src/mcp_relay.rs`
-- `core/src/mcp_relay_submit.rs`
 - `ledger/src/blockstore_processor.rs`
 - `fee/src/lib.rs`
 - `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
 - `transaction-view/src/lib.rs`
-- `transaction-view/src/mcp_transaction.rs`
 - `svm/src/transaction_processor.rs` (fee-mode plumbing)
 - `local-cluster/tests/local_cluster.rs`
 

@@ -335,7 +335,9 @@ impl Tvu {
             unbounded();
         let (dumped_slots_sender, dumped_slots_receiver) = unbounded();
         let (popular_pruned_forks_sender, popular_pruned_forks_receiver) = unbounded();
-        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) = unbounded();
+        const MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY: usize = 10_000;
+        let (mcp_relay_attestation_sender, mcp_relay_attestation_receiver) =
+            bounded(MCP_RELAY_ATTESTATION_CHANNEL_CAPACITY);
         let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
         let window_service = {
             let epoch_schedule = bank_forks
