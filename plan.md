@@ -41,27 +41,28 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Audit Follow-Ups (from `audit.md`)
 
-- `A1` No silent lock-drop on critical MCP maps (`ConsensusBlock` cache, vote-gate input, included proposers):
-  - Required behavior: no `try_write`/silent `if let Ok(..)` on critical path; use explicit `match` and warn on poisoned locks.
-- `A2` Reconstruction-state poison semantics:
-  - Commitment mismatch must not permanently brick a slot/proposer reconstruction state; next shard insert must reset state.
-- `A3` Local-cluster MCP integration strictness:
-  - Issue-20 test must fail on timeout by default (no env-gated soft pass).
-  - Must read from live validator blockstore handles during runtime.
+- `A1` No silent lock-drop on critical MCP maps (`ConsensusBlock` cache, vote-gate input, included proposers): `RESOLVED`
+  - Critical paths use explicit lock error handling with warning logs; no `try_write` silent drops on MCP state transitions.
+- `A2` Reconstruction-state poison semantics: `RESOLVED`
+  - Commitment mismatch no longer permanently bricks reconstruction state; next shard insert resets poisoned state.
+- `A3` Local-cluster MCP integration strictness: `RESOLVED`
+  - Issue-20 test fails on timeout by default and uses live validator blockstore handles.
 - `A4` Coverage gap closure before final sign-off: `RESOLVED`
   - direct ConsensusBlock content verification is now in 5-node local-cluster integration:
     - validates leader signature
     - validates `consensus_meta.len() == 32`
     - validates delayed bankhash matches delayed-slot bankhash
+    - validates non-empty decodable execution output contains at least one submitted transaction signature
+    - validates execution-output bytes are identical across validators for a shared slot
     - evidence: `local-cluster/tests/local_cluster.rs`
   - explicit two-pass replay-fee per-occurrence assertion is now in block-verification unit coverage:
     - evidence: `ledger/src/blockstore_processor.rs` (`test_execute_batch_mcp_two_pass_charges_fee_per_occurrence`)
   - direct forwarding fanout attribution is now unit-tested at dispatch:
     - evidence: `turbine/src/broadcast_stage/standard_broadcast_run.rs` (`test_maybe_dispatch_mcp_shreds_removes_complete_slot_payload_state`)
-- `A5` Rollout invariant:
-  - MCP CF additions require coordinated node upgrade before feature activation.
-- `A6` MCP control-message backpressure:
-  - TVU MCP control channel must be bounded and ingress must be non-blocking with explicit drop counters.
+- `A5` Rollout invariant: `RESOLVED`
+  - MCP CF additions are registered in blockstore DB and require coordinated node upgrade before feature activation.
+- `A6` MCP control-message backpressure: `RESOLVED`
+  - TVU MCP control channel is bounded and ingress is non-blocking with explicit drop counters.
 
 ## Resolved Policy Decisions
 
