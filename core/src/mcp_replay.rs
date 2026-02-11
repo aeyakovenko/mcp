@@ -26,7 +26,7 @@ use {
     },
     solana_transaction::sanitized::MessageHash,
     std::{
-        collections::{BTreeMap, BTreeSet, HashMap},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         sync::{Arc, RwLock},
     },
 };
@@ -36,7 +36,9 @@ const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReconstructedTransaction {
+    execution_class: mcp_ordering::ExecutionClass,
     ordering_fee: u64,
+    signature: [u8; 64],
     wire_bytes: Vec<u8>,
 }
 
@@ -325,26 +327,34 @@ pub(crate) fn refresh_vote_gate_input(
     }
 }
 
-fn ordering_fee_for_payload_transaction(transaction: &McpPayloadTransaction) -> Option<u64> {
+fn ordering_metadata_for_payload_transaction(
+    transaction: &McpPayloadTransaction,
+) -> Option<(mcp_ordering::ExecutionClass, u64, [u8; 64])> {
     if let Some(mcp_transaction) = transaction.mcp_transaction.as_ref() {
-        return Some(u64::from(
-            mcp_transaction.ordering_fee().unwrap_or_default(),
-        ));
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(mcp_transaction.signatures.first()?.as_ref());
+        let ordering_fee = u64::from(mcp_transaction.ordering_fee().unwrap_or_default());
+        return Some((mcp_ordering::ExecutionClass::Mcp, ordering_fee, signature));
     }
 
     let view =
         SanitizedTransactionView::try_new_sanitized(transaction.wire_bytes.as_slice()).ok()?;
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(view.signatures().first()?.as_ref());
     let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
         view,
         MessageHash::Compute,
         None,
     )
     .ok()?;
-    Some(
-        runtime_tx
-            .compute_budget_instruction_details()
-            .requested_compute_unit_price(),
-    )
+    let ordering_fee = runtime_tx
+        .compute_budget_instruction_details()
+        .requested_compute_unit_price();
+    Some((
+        mcp_ordering::ExecutionClass::Legacy,
+        ordering_fee,
+        signature,
+    ))
 }
 
 fn encode_ordered_execution_output(transactions: &[ReconstructedTransaction]) -> Option<Vec<u8>> {
@@ -463,13 +473,21 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
         };
         reconstructed_any_proposer = true;
 
+        let mut seen_signatures = HashSet::new();
         let transactions = decoded_payload
             .transactions
             .into_iter()
             .filter_map(|tx| {
-                let ordering_fee = ordering_fee_for_payload_transaction(&tx)?;
+                let (execution_class, ordering_fee, signature) =
+                    ordering_metadata_for_payload_transaction(&tx)?;
+                if !seen_signatures.insert(signature) {
+                    // Dedup only within a single proposer's payload.
+                    return None;
+                }
                 Some(ReconstructedTransaction {
+                    execution_class,
                     ordering_fee,
+                    signature,
                     wire_bytes: tx.wire_bytes,
                 })
             })
@@ -491,8 +509,12 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
         return;
     }
 
-    let ordered_transactions =
-        mcp_ordering::order_batches_by_fee_desc(reconstructed_batches, |tx| tx.ordering_fee);
+    let ordered_transactions = mcp_ordering::order_batches_mcp_policy(
+        reconstructed_batches,
+        |tx| tx.execution_class,
+        |tx| tx.ordering_fee,
+        |tx| tx.signature,
+    );
     let Some(encoded_output) = encode_ordered_execution_output(&ordered_transactions) else {
         return;
     };
