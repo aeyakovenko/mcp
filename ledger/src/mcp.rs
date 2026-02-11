@@ -100,6 +100,7 @@ mod tests {
         assert_eq!(REQUIRED_ATTESTATIONS, 120);
         assert_eq!(REQUIRED_INCLUSIONS, 80);
         assert_eq!(REQUIRED_RECONSTRUCTION, 40);
+        assert_eq!(REQUIRED_RECONSTRUCTION, DATA_SHREDS_PER_FEC_BLOCK);
     }
 
     #[test]

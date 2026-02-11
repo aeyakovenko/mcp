@@ -45,7 +45,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Must read from live validator blockstore handles during runtime.
 - `A4` Coverage gap to close before final sign-off:
   - Add multi-node MCP integration coverage for forwarding + two-pass replay-fee path (`block_verification=true` path).
-  - Test should enforce non-leader execution-output observation when 2+ validators are live, and degrade to artifact-only checks in port-constrained environments.
+  - Test should enforce non-leader execution-output observation in a 5-node cluster with strict timeout failures (no soft-pass degradation).
 - `A5` Rollout invariant:
   - MCP CF additions require coordinated node upgrade before feature activation.
 - `A6` MCP control-message backpressure:
@@ -126,18 +126,19 @@ Non-reusable for MCP wire correctness:
 
 ### 1.2 MCP constants and wire types
 
-- Add `ledger/src/mcp.rs`:
-  - Constants:
-    - `NUM_PROPOSERS = 16`
-    - `NUM_RELAYS = 200`
-    - `DATA_SHREDS_PER_FEC_BLOCK = 40`
-    - `CODING_SHREDS_PER_FEC_BLOCK = 160`
-    - `WITNESS_LEN = 8` (ceil(log2(NUM_RELAYS)))
-    - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
-    - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
-    - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
-    - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
-    - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
+  - Add `ledger/src/mcp.rs`:
+    - Constants:
+      - `NUM_PROPOSERS = 16`
+      - `NUM_RELAYS = 200`
+      - `DATA_SHREDS_PER_FEC_BLOCK = 40`
+      - `CODING_SHREDS_PER_FEC_BLOCK = 160`
+      - `WITNESS_LEN = 8` (ceil(log2(NUM_RELAYS)))
+      - `MAX_QUIC_CONTROL_PAYLOAD_BYTES = 512 * 1024`
+      - `ATTESTATION_THRESHOLD = 0.60` (`ceil -> 120`)
+      - `INCLUSION_THRESHOLD = 0.40` (`ceil -> 80`)
+      - `RECONSTRUCTION_THRESHOLD = 0.20` (`ceil -> 40`)
+      - `REQUIRED_ATTESTATIONS = ceil(ATTESTATION_THRESHOLD * NUM_RELAYS) = 120`
+      - `REQUIRED_INCLUSIONS = ceil(INCLUSION_THRESHOLD * NUM_RELAYS) = 80`
     - `REQUIRED_RECONSTRUCTION = ceil(RECONSTRUCTION_THRESHOLD * NUM_RELAYS) = 40`
     - `MAX_PROPOSER_PAYLOAD = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES = 34_520` (v1 RS-capacity bound; stricter than spec's looser `NUM_RELAYS * SHRED_DATA_BYTES` bound)
     - invariant: `REQUIRED_RECONSTRUCTION == DATA_SHREDS_PER_FEC_BLOCK` (40) in v1
@@ -147,7 +148,7 @@ Non-reusable for MCP wire correctness:
     - `ledger/src/mcp_consensus_block.rs`
 - Add `transaction-view/src/mcp_payload.rs`:
   - `McpPayload` parser behavior:
-    - decode `tx_count + [tx_len, tx_bytes]` framing
+    - decode `tx_count:u32_le + [tx_len:u32_le, tx_bytes]` framing
     - for each `tx_bytes`, accept latest MCP §7.1 tx or legacy layout without version prefix
     - carry per-tx format tag for later ordering-key extraction and possible re-encoding
     - after decoding `tx_count` entries, ignore trailing zero bytes and reject trailing non-zero bytes
@@ -281,6 +282,10 @@ Non-reusable for MCP wire correctness:
     - `relay_indices_at_slot(slot, pubkey, bank) -> Vec<u32>`
   - Feature gate check: all helpers must check if `mcp_protocol_v1` is active for the slot by checking inside the given bank; if not, return `None` or empty `Vec`. This ensures proposer/relay logic (e.g., section 5.1 proposer activation) does not activate when MCP is disabled.
   - Duplicate identities: if a validator appears multiple times in a schedule (e.g., at proposer indices 3, 7, 15), the index lookup returns all positions (spec §5). This applies to both proposer and relay schedules.
+  - Slot-to-window mapping:
+    - schedules are generated with length `slots_in_epoch * count`
+    - for slot index `i`, role list is `schedule[i * count .. i * count + count]` with wrap-around
+    - do not use overlapping sliding windows (`start = i`) for MCP roles
 
 ### 2.4 Tests
 
@@ -324,7 +329,7 @@ Non-reusable for MCP wire correctness:
   - MCP partition classifier MUST be strict (`McpShred` wire-size/layout + witness-length/path checks), not a loose size-only check.
   - Agave packets: unchanged existing path.
   - MCP packets:
-    - apply slot feature gate (see §1.1) using the `working_bank` that `run_shred_sigverify()` already uses
+    - apply slot feature gate (see §1.1) by comparing each shred's `slot` against MCP activation slot from the `working_bank` feature set
     - feature is the only filter (no proposer/relay role check) because all validators need MCP shreds for vote gate (spec §3.5: count locally stored shreds >= RECONSTRUCTION_THRESHOLD) and reconstruction
     - bypass Agave shred-id/leader-sigverify assumptions
     - forward through existing `verified_sender` channel for MCP-specific verification in `window_service`
@@ -336,7 +341,7 @@ Non-reusable for MCP wire correctness:
 - Valid MCP shred passes, bad signature/proof fails.
 - MCP CF put/get + purge behavior.
 - Feature flag can toggle between MCP/non MCP pipelines starting from
-packet ingestion, into dedup and sigverify
+  packet ingestion, into dedup and sigverify
 
 ---
 
@@ -354,6 +359,8 @@ packet ingestion, into dedup and sigverify
     - store via MCP blockstore APIs
     - feed relay-attestation tracker
     - accept/store valid relay-broadcast MCP shreds on all validators (no local relay-index storage filter)
+    - for MCP-active slots, invalid MCP shreds are dropped and MUST NOT fall through to legacy Agave shred parsing
+    - pre-activation slots may continue legacy handling
   - Non-MCP path remains unchanged.
 
 ### 4.2 Relay attestation semantics
@@ -523,8 +530,9 @@ Implementation point:
      - drop relay entries that become empty after proposer-signature filtering
   4. enforce global relay threshold using the same relay-count rule from Pass 6 (`>= REQUIRED_ATTESTATIONS`)
   5. implied proposer rules:
-     - multiple commitments => exclude
-     - one commitment with `>= REQUIRED_INCLUSIONS` relay attestations => include
+     - multiple distinct commitments for the same proposer index => exclude proposer (equivocation)
+     - exactly one commitment with `>= REQUIRED_INCLUSIONS` relay attestations => include proposer
+     - all other cases => proposer excluded
   6. local availability check:
      - count only locally stored shreds whose witness validates against included commitment
      - require `>= REQUIRED_RECONSTRUCTION` per included proposer
@@ -546,7 +554,7 @@ Staged rollout guard:
 
 - Deterministic order:
   - Use policy `B2`.
-  - Replay concatenates proposer batches by proposer index before applying `B2`.
+  - Dedup by signature within each proposer payload, then concatenate batches by proposer index, then apply `B2`.
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -562,9 +570,11 @@ Two-phase fee handling (spec §8):
   - required debit:
     - standard tx: `base_fee` (including MCP fee components when present)
     - nonce tx: `base_fee + nonce_min_rent`
+      - `nonce_min_rent = rent.minimum_balance(nonce::state::State::size())` at execution bank
   - debit implementation:
     - standard tx: `Bank::withdraw()`
     - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
+      - helper relies on the precomputed `base_fee + nonce_min_rent` amount and may leave nonce payer at zero after Phase A
   - drop only failing transaction; continue others
 - Phase B (execution):
   - execute filtered tx list with fee deduction disabled
@@ -608,6 +618,9 @@ Reconstruction-to-execution bridge:
 
 - if consensus outputs empty result for slot, record empty MCP execution output for the slot.
 - if a local slot bank exists with a different `block_id`, treat it as fork mismatch and do not record empty output for that slot.
+  - fork-mismatch behavior:
+    - keep slot pending and retry on subsequent replay iterations
+    - do not mark slot dead solely due to this mismatch
 
 ### 7.6 Tests
 
@@ -652,6 +665,7 @@ New files:
 - `core/src/mcp_vote_gate.rs`
 - `core/src/mcp_relay.rs`
 - `core/src/mcp_relay_submit.rs`
+- `core/src/mcp_constant_consistency.rs`
 - `turbine/src/mcp_proposer.rs`
 
 Modified files:
@@ -674,6 +688,7 @@ Modified files:
 - `core/src/tvu.rs`
 - `core/src/replay_stage.rs`
 - `core/src/block_creation_loop.rs`
+- `poh/src/poh_recorder.rs`
 - `ledger/src/blockstore_processor.rs`
 - `fee/src/lib.rs`
 - `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
@@ -690,11 +705,11 @@ Modified files:
 - Pass 4 depends on 1 + 2 + 3.
 - Pass 5 depends on 1 + 2 + 4.
 - Pass 6 depends on 1 + 2 + 4.
-- Pass 7 depends on 1 + 2 + 3 + 6.
+- Pass 7 depends on 1 + 2 + 3 + 5 + 6.
 
 ## Acceptance Invariants
 
-- No MCP packet is parsed by Agave shred wire parsers.
+- For MCP-active slots, no MCP-classified packet is parsed by Agave shred wire parsers.
 - No MCP state transition occurs without feature gate active.
 - All threshold checks use ceil-threshold logic with `NUM_RELAYS=200`.
 - Replay and vote gate use the same attestation filtering rules.

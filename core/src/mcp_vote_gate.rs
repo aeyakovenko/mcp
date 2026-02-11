@@ -86,6 +86,7 @@ pub fn evaluate_vote_gate(input: &VoteGateInput) -> VoteGateDecision {
         .aggregate
         .iter()
         .filter(|relay| relay.relay_signature_valid)
+        .filter(|relay| relay.entries.iter().any(|entry| entry.proposer_signature_valid))
         .collect();
     let valid_relay_count = valid_relays
         .iter()
@@ -317,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_proposer_signatures_are_ignored() {
+    fn test_relays_without_any_valid_proposer_entries_do_not_count() {
         let commitment = [8u8; 32];
         let aggregate = (0..REQUIRED_ATTESTATIONS)
             .map(|i| relay(i as u32, true, vec![(0, commitment, false)]))
@@ -326,7 +327,10 @@ mod tests {
 
         assert_eq!(
             evaluate_vote_gate(&input),
-            VoteGateDecision::Reject(VoteGateRejection::NoIncludedProposers)
+            VoteGateDecision::Reject(VoteGateRejection::InsufficientRelayAttestations {
+                actual: 0,
+                required: REQUIRED_ATTESTATIONS,
+            })
         );
     }
 }

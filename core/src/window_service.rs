@@ -659,7 +659,11 @@ where
             .get(mcp_shred.proposer_index as usize)
             .copied()
         else {
-            legacy_shreds.push((shred, repair, block_location));
+            inc_new_counter_error!("mcp-shred-drop-missing-proposer-pubkey", 1, 1);
+            debug!(
+                "dropping MCP shred for slot {} proposer {}: proposer pubkey missing in schedule",
+                mcp_shred.slot, mcp_shred.proposer_index
+            );
             continue;
         };
         let proposer_index = mcp_shred.proposer_index;
@@ -705,13 +709,15 @@ where
                 mcp_shred_count += 1;
             }
             McpRelayOutcome::Dropped(reason) => {
-                // Fall back to legacy handling for non-MCP bytes that happen to satisfy
-                // the fixed-size MCP envelope checks.
-                match reason {
-                    crate::mcp_relay::McpDropReason::ConflictingShred => {
-                        mcp_shred_count += 1;
-                    }
-                    _ => legacy_shreds.push((shred, repair, block_location)),
+                inc_new_counter_error!("mcp-shred-drop-invalid", 1, 1);
+                // Once bytes are classified as MCP under an active slot, invalid MCP
+                // shreds are dropped and never fed into the legacy shred path.
+                debug!(
+                    "dropping invalid MCP shred for slot {} proposer {} shred {}: {:?}",
+                    mcp_shred.slot, mcp_shred.proposer_index, mcp_shred.shred_index, reason
+                );
+                if reason == crate::mcp_relay::McpDropReason::ConflictingShred {
+                    mcp_shred_count += 1;
                 }
             }
         }

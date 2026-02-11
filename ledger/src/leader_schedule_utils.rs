@@ -3,6 +3,7 @@ use {
         stake_weighted_slot_leaders_domain_separated, IdentityKeyedLeaderSchedule, LeaderSchedule,
         VoteKeyedLeaderSchedule,
     },
+    crate::mcp,
     solana_clock::{Epoch, Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -37,8 +38,9 @@ pub fn leader_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
     }
 }
 
-fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8]) -> Option<LeaderSchedule> {
+fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8], count: u64) -> Option<LeaderSchedule> {
     let use_new_leader_schedule = bank.should_use_vote_keyed_leader_schedule(epoch)?;
+    let schedule_len = bank.get_slots_in_epoch(epoch).saturating_mul(count);
     if use_new_leader_schedule {
         bank.epoch_vote_accounts(epoch).map(|vote_accounts_map| {
             let keyed_stakes: Vec<_> = vote_accounts_map
@@ -49,7 +51,7 @@ fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8]) -> Option<LeaderSchedu
             let vote_keyed_slot_leaders = stake_weighted_slot_leaders_domain_separated(
                 keyed_stakes,
                 epoch,
-                bank.get_slots_in_epoch(epoch),
+                schedule_len,
                 MCP_SCHEDULE_REPEAT,
                 domain,
             );
@@ -67,7 +69,7 @@ fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8]) -> Option<LeaderSchedu
             let slot_leaders = stake_weighted_slot_leaders_domain_separated(
                 keyed_stakes,
                 epoch,
-                bank.get_slots_in_epoch(epoch),
+                schedule_len,
                 MCP_SCHEDULE_REPEAT,
                 domain,
             );
@@ -78,12 +80,12 @@ fn mcp_schedule(epoch: Epoch, bank: &Bank, domain: &[u8]) -> Option<LeaderSchedu
 
 /// Return the proposer schedule for the given epoch.
 pub fn mcp_proposer_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
-    mcp_schedule(epoch, bank, MCP_PROPOSER_DOMAIN)
+    mcp_schedule(epoch, bank, MCP_PROPOSER_DOMAIN, mcp::NUM_PROPOSERS as u64)
 }
 
 /// Return the relay schedule for the given epoch.
 pub fn mcp_relay_schedule(epoch: Epoch, bank: &Bank) -> Option<LeaderSchedule> {
-    mcp_schedule(epoch, bank, MCP_RELAY_DOMAIN)
+    mcp_schedule(epoch, bank, MCP_RELAY_DOMAIN, mcp::NUM_RELAYS as u64)
 }
 
 /// Map of leader base58 identity pubkeys to the slot indices relative to the first epoch slot
@@ -239,5 +241,27 @@ mod tests {
         let p1 = mcp_proposer_schedule(epoch, &bank).unwrap();
         let p2 = mcp_proposer_schedule(epoch, &bank).unwrap();
         assert_eq!(p1.get_slot_leaders(), p2.get_slot_leaders());
+    }
+
+    #[test]
+    fn test_mcp_schedule_length_scales_with_role_count() {
+        let pubkey = solana_pubkey::new_rand();
+        let bank = Bank::new_for_tests(
+            &create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config,
+        );
+        let epoch = 0;
+        let slots_in_epoch = bank.get_slots_in_epoch(epoch);
+        let proposers = mcp_proposer_schedule(epoch, &bank).unwrap();
+        let relays = mcp_relay_schedule(epoch, &bank).unwrap();
+
+        assert_eq!(
+            proposers.get_slot_leaders().len(),
+            usize::try_from(slots_in_epoch * crate::mcp::NUM_PROPOSERS as u64).unwrap()
+        );
+        assert_eq!(
+            relays.get_slot_leaders().len(),
+            usize::try_from(slots_in_epoch * crate::mcp::NUM_RELAYS as u64).unwrap()
+        );
     }
 }

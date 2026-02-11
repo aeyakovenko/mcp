@@ -458,14 +458,14 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             commitment,
             &mut shards,
         ) else {
-            debug!(
+            warn!(
                 "MCP reconstruction failed for slot {} proposer {}: {} valid shards",
                 slot, proposer_index, available_shards
             );
             continue;
         };
         let Ok(decoded_payload) = decode_reconstructed_payload(&payload) else {
-            debug!(
+            warn!(
                 "MCP reconstruction produced undecodable payload for slot {} proposer {}",
                 slot, proposer_index
             );

@@ -180,6 +180,7 @@ impl ForwardAddressGetter {
             return addresses;
         }
 
+        let max_count = max_count.min(NUM_LOOKAHEAD_LEADERS);
         next_leaders(&self.cluster_info, &self.poh_recorder, max_count, |node| {
             node.tpu_forwards(protocol)
         })
