@@ -9254,6 +9254,7 @@ version = "3.1.0"
 dependencies = [
  "agave-feature-set",
  "agave-logger",
+ "agave-transaction-view",
  "assert_matches",
  "bincode",
  "crossbeam-channel",
