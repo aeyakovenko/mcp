@@ -23,15 +23,16 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Leader finalization keeps retrying pending slots when prerequisites are temporarily unavailable (especially delayed bankhash).
   - Replay keeps retrying pending consensus slots independently of fork-choice one-shot behavior.
   - Delayed-slot bankhash source order is: `BankForks` delayed slot, then blockstore frozen bank hash.
-- Alpenglow `block_id` authority wiring: `PARTIAL`
-  - `window_service` now carries a `block_id` sidecar in `ConsensusBlock.consensus_meta` when locally available.
-  - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and sets it on the bank before vote processing.
-  - Current limitation: if sidecar bytes are absent/invalid, replay keeps compatibility fallback to legacy local `block_id` derivation.
+- Alpenglow `block_id` authority wiring: `RESOLVED` (consensus-observed slots)
+  - `window_service` retries MCP consensus-block finalization until an authoritative `block_id` sidecar is locally available.
+  - consensus-block ingestion rejects non-hash-sized `consensus_meta`.
+  - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and defers bank completion if a cached consensus block lacks a usable sidecar.
 - Reconstruction-to-execution bridge reader: `PARTIAL`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
-  - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots; if vote gate passes but output is still missing, replay is deferred.
-  - Current limitation: when vote gate is not yet satisfied, v1 keeps compatibility fallback to legacy entry-derived replay input.
+  - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots.
+  - if a consensus block is cached for the slot, replay defers while vote-gate is unsatisfied or while `McpExecutionOutput` is missing.
+  - Current limitation: before any consensus block is observed for the slot, v1 keeps compatibility fallback to legacy entry-derived replay input.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -580,24 +581,26 @@ Reconstruction-to-execution bridge:
   - deserialize the MCP-ordered transaction list
   - if present and valid, use it as canonical replay transaction input (replacing legacy entry-derived transaction entries)
   - malformed `McpExecutionOutput` is a hard replay error for the slot
-  - if missing, fall back to legacy entry-derived replay input in v1 (temporary compatibility mode)
+  - if missing and a consensus block has already been observed for the slot, replay is deferred (no fallback execution)
+  - if missing before consensus-block observation, v1 compatibility fallback uses legacy entry-derived replay input
 - during leader execution (`block_verification=false`):
   - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
   - the leader's MCP execution output is still persisted for verification by other nodes
-- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point; current replay pipeline produces it post-execution
+- full strict no-fallback for all MCP-active slots still requires pre-execution output production; current replay pipeline guarantees strictness only after consensus-block observation
 
 ### 7.4 Bank/block ID and vote
 
 - Policy target (B3): `block_id` is defined by Alpenglow consensus and MCP treats it as authoritative.
 - Implemented wiring:
   - `ConsensusBlock.consensus_meta` is opaque sidecar bytes; replay interprets a 32-byte payload as authoritative `block_id`.
-  - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)` when available.
-  - replay reads consensus-sidecar `block_id` and sets `bank.block_id` before completion/vote processing.
+  - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)`, and retries finalization until available.
+  - ingestion drops consensus blocks with non-hash-sized `consensus_meta`.
+  - replay reads consensus-sidecar `block_id`, sets `bank.block_id`, and defers bank completion if a cached consensus block lacks an authoritative sidecar.
 - Compatibility behavior in v1:
-  - if sidecar bytes are absent/invalid, replay uses existing local `block_id` derivation fallback.
-  - vote wire format remains unchanged; tower vote path consumes `bank.block_id()` when present.
+  - local `block_id` derivation fallback remains only for slots where no consensus block has yet been observed.
+  - vote wire format remains unchanged; tower vote path consumes `bank.block_id()` and is gated by consensus/vote-gate checks.
 - Strict-authority follow-up:
-  - remove fallback only after consensus-sidecar availability is guaranteed for all MCP-finalized slots.
+  - remove pre-consensus fallback once consensus-block presence is guaranteed before replay execution for every MCP-active slot.
 
 ### 7.5 Empty result
 

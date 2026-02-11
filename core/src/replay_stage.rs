@@ -3569,6 +3569,22 @@ impl ReplayStage {
 
     /// Ensure vote-gated MCP slots have reconstructed execution output available
     /// before replaying entries. If output is not ready yet, replay is deferred.
+    fn has_mcp_consensus_block_for_slot(
+        slot: Slot,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+    ) -> bool {
+        match mcp_consensus_blocks.read() {
+            Ok(consensus_blocks) => consensus_blocks.contains_key(&slot),
+            Err(err) => {
+                warn!(
+                    "failed to read MCP consensus block cache for slot {}: {}",
+                    slot, err
+                );
+                false
+            }
+        }
+    }
+
     fn maybe_prepare_mcp_execution_output_for_replay_slot(
         bank: &Bank,
         blockstore: &Blockstore,
@@ -3598,6 +3614,9 @@ impl ReplayStage {
         {
             return true;
         }
+        if !Self::has_mcp_consensus_block_for_slot(bank.slot(), mcp_consensus_blocks) {
+            return true;
+        }
 
         mcp_replay::refresh_vote_gate_input(
             bank.slot(),
@@ -3613,7 +3632,11 @@ impl ReplayStage {
             mcp_vote_gate_inputs,
             mcp_vote_gate_included_proposers,
         ) {
-            return true;
+            debug!(
+                "deferring replay for slot {}: consensus block observed but vote gate not satisfied",
+                bank.slot()
+            );
+            return false;
         }
 
         mcp_replay::maybe_persist_reconstructed_execution_output(
@@ -4105,6 +4128,16 @@ impl ReplayStage {
                 }
 
                 let is_leader_block = bank.collector_id() == my_pubkey;
+                let consensus_block_seen = bank
+                    .feature_set
+                    .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                    .is_some_and(|activated_slot| {
+                        bank.slot() >= activated_slot
+                            && Self::has_mcp_consensus_block_for_slot(
+                                bank.slot(),
+                                mcp_consensus_blocks,
+                            )
+                    });
                 let authoritative_mcp_block_id = bank
                     .feature_set
                     .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
@@ -4112,6 +4145,13 @@ impl ReplayStage {
                     .and_then(|_| {
                         Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks)
                     });
+                if consensus_block_seen && authoritative_mcp_block_id.is_none() {
+                    debug!(
+                        "deferring completion for slot {}: consensus block missing authoritative block_id sidecar",
+                        bank.slot()
+                    );
+                    continue;
+                }
                 if let Err(result_err) = Self::determine_and_set_block_id(
                     bank,
                     blockstore,

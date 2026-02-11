@@ -23,7 +23,7 @@ use {
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
-    solana_hash::Hash,
+    solana_hash::{Hash, HASH_BYTES},
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{
@@ -170,8 +170,7 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         return true;
     };
 
-    // Carry an authoritative block_id sidecar when available. Keep empty
-    // consensus_meta for compatibility if block_id is not yet derivable.
+    // Carry an authoritative block_id sidecar. Retry finalization until it is available.
     let consensus_meta = working_bank
         .block_id()
         .or_else(|| {
@@ -185,8 +184,11 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
                 .ok()
                 .flatten()
         })
-        .map(|block_id| block_id.to_bytes().to_vec())
-        .unwrap_or_default();
+        .map(|block_id| block_id.to_bytes().to_vec());
+    let Some(consensus_meta) = consensus_meta else {
+        log_skip("missing authoritative block_id");
+        return true;
+    };
 
     let proposer_schedule = leader_schedule_cache
         .proposers_at_slot(slot, Some(&working_bank))
@@ -967,6 +969,15 @@ fn ingest_mcp_control_message(
             if !consensus_block.verify_leader_signature(&leader_pubkey) {
                 return None;
             }
+            if consensus_block.consensus_meta.len() != HASH_BYTES {
+                debug!(
+                    "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta length {}",
+                    consensus_block.slot,
+                    remote_address,
+                    consensus_block.consensus_meta.len(),
+                );
+                return None;
+            }
 
             if let Some(consensus_blocks) = mcp_consensus_blocks {
                 let root_slot = root_bank.slot();
@@ -1422,11 +1433,12 @@ mod test {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = Hash::new_unique();
+        let block_id = Hash::new_unique();
         let mut block = ConsensusBlock::new_unsigned(
             slot,
             leader_index,
             aggregate_bytes,
-            vec![],
+            block_id.to_bytes().to_vec(),
             delayed_bankhash,
         )
         .unwrap();
@@ -1484,11 +1496,12 @@ mod test {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = Hash::new_unique();
+        let block_id = Hash::new_unique();
         let mut block = ConsensusBlock::new_unsigned(
             slot,
             leader_index,
             aggregate_bytes,
-            vec![],
+            block_id.to_bytes().to_vec(),
             delayed_bankhash,
         )
         .unwrap();
@@ -1501,6 +1514,65 @@ mod test {
 
         ingest_mcp_control_message(
             Pubkey::new_unique(),
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            &frame,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+        );
+
+        assert!(consensus_blocks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ingest_mcp_consensus_block_rejects_invalid_consensus_meta_length() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_index = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .and_then(|proposers| {
+                proposers
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in MCP proposer schedule");
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_bankhash = Hash::new_unique();
+        let mut block = ConsensusBlock::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            vec![7u8; HASH_BYTES - 1],
+            delayed_bankhash,
+        )
+        .unwrap();
+        block.sign_leader(&leader).unwrap();
+        let payload = block.to_wire_bytes().unwrap();
+        let mut frame = Vec::with_capacity(1 + payload.len());
+        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame.extend_from_slice(&payload);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+
+        ingest_mcp_control_message(
+            leader.pubkey(),
             SocketAddr::from(([127, 0, 0, 1], 1234)),
             &frame,
             &blockstore,
