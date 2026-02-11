@@ -97,7 +97,7 @@ use {
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface as feature,
-    solana_fee::{FeeFeatures, MCP_NUM_PROPOSERS},
+    solana_fee::FeeFeatures,
     solana_fee_calculator::FeeRateGovernor,
     solana_fee_structure::{FeeBudgetLimits, FeeDetails, FeeStructure},
     solana_genesis_config::GenesisConfig,
@@ -3513,16 +3513,7 @@ impl Bank {
                 continue;
             };
             let is_durable_nonce_tx = tx.get_durable_nonce(require_static_nonce_account).is_some();
-            let mut fee = match fee_details
-                .total_fee()
-                .checked_mul(MCP_NUM_PROPOSERS as u64)
-            {
-                Some(fee) => fee,
-                None => {
-                    *fee_result = Err(TransactionError::InsufficientFundsForFee);
-                    continue;
-                }
-            };
+            let mut fee = fee_details.total_fee();
             if is_durable_nonce_tx {
                 fee = match fee.checked_add(nonce_min_balance) {
                     Some(fee) => fee,

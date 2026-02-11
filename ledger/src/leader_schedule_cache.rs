@@ -261,10 +261,13 @@ impl LeaderScheduleCache {
     ) -> Option<Vec<Pubkey>> {
         let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
         let schedule = if let Some(bank) = bank {
-            if !bank
+            let Some(activated_slot) = bank
                 .feature_set
-                .is_active(&feature_set::mcp_protocol_v1::id())
-            {
+                .activated_slot(&feature_set::mcp_protocol_v1::id())
+            else {
+                return None;
+            };
+            if slot < activated_slot {
                 return None;
             }
             // Forbid asking for slots in an unconfirmed epoch.

@@ -1831,14 +1831,70 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         ));
     }
 
-    // Keep replay execution source aligned across leader and non-leader nodes
-    // until MCP-ordered execution is wired into both paths.
+    let replay_entries = override_replay_entries_with_transactions(replay_entries, transactions);
+    let replay_num_txs = transaction_wires.len();
     debug!(
-        "slot {} validated MCP execution output with {} transaction(s); execution override deferred",
-        slot,
-        transaction_wires.len()
+        "slot {} overriding replay transaction source from MCP execution output ({} txs)",
+        slot, replay_num_txs
     );
-    Ok((replay_entries, default_num_txs))
+    Ok((replay_entries, replay_num_txs))
+}
+
+fn override_replay_entries_with_transactions(
+    replay_entries: Vec<ReplayEntry>,
+    transactions: Vec<RuntimeTransaction<SanitizedTransaction>>,
+) -> Vec<ReplayEntry> {
+    let mut remaining_transactions = transactions.into_iter();
+    let mut overridden_entries = Vec::with_capacity(replay_entries.len().saturating_add(1));
+    let mut last_transaction_entry_index: Option<usize> = None;
+    let mut first_transaction_starting_index: Option<usize> = None;
+
+    for ReplayEntry {
+        entry,
+        starting_index,
+    } in replay_entries
+    {
+        match entry {
+            EntryType::Tick(hash) => {
+                overridden_entries.push(ReplayEntry {
+                    entry: EntryType::Tick(hash),
+                    starting_index,
+                });
+            }
+            EntryType::Transactions(existing_transactions) => {
+                first_transaction_starting_index.get_or_insert(starting_index);
+                let chunk_len = existing_transactions.len();
+                let chunk: Vec<_> = remaining_transactions.by_ref().take(chunk_len).collect();
+                if chunk.is_empty() {
+                    continue;
+                }
+                last_transaction_entry_index = Some(overridden_entries.len());
+                overridden_entries.push(ReplayEntry {
+                    entry: EntryType::Transactions(chunk),
+                    starting_index,
+                });
+            }
+        }
+    }
+
+    let mut trailing_transactions: Vec<_> = remaining_transactions.collect();
+    if trailing_transactions.is_empty() {
+        return overridden_entries;
+    }
+
+    if let Some(index) = last_transaction_entry_index {
+        if let EntryType::Transactions(existing_transactions) = &mut overridden_entries[index].entry
+        {
+            existing_transactions.append(&mut trailing_transactions);
+        }
+    } else {
+        overridden_entries.push(ReplayEntry {
+            entry: EntryType::Transactions(trailing_transactions),
+            starting_index: first_transaction_starting_index.unwrap_or_default(),
+        });
+    }
+
+    overridden_entries
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5807,8 +5863,8 @@ pub mod tests {
     }
 
     #[test]
-    fn test_maybe_override_replay_entries_with_mcp_execution_output_validates_but_preserves_replay_entries()
-    {
+    fn test_maybe_override_replay_entries_with_mcp_execution_output_validates_and_overrides_replay_entries(
+    ) {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let dummy_leader_pubkey = solana_pubkey::new_rand();
@@ -5859,10 +5915,10 @@ pub mod tests {
             )
             .unwrap();
 
-        assert_eq!(overridden_num_txs, 1);
+        assert_eq!(overridden_num_txs, 2);
         assert_eq!(overridden_entries.len(), 1);
         match &overridden_entries[0].entry {
-            EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 1),
+            EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 2),
             EntryType::Tick(_) => panic!("expected transaction entry"),
         }
     }

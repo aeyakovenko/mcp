@@ -62,8 +62,13 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Note: this dual-format behavior requires explicit spec compatibility text.
 - `B2` `ordering_fee` direction:
   - Execute highest-paying transactions first.
-  - Ordering rule is `ordering_fee` descending.
-  - Stable tie-break remains concatenated position (after proposer-index concatenation).
+  - Ordering policy:
+    - MCP-format transactions (latest or legacy MCP wire) execute before legacy Solana-wire transactions.
+    - Within each class, sort by `ordering_fee` descending.
+    - Fee ties break by transaction signature bytes ascending.
+  - Dedup policy:
+    - Dedup by signature within each single proposer payload only.
+    - Do not dedup across proposers; each cross-proposer occurrence is executed and charged once.
 - `B3` `block_id` authority:
   - `block_id` is defined by Alpenglow consensus.
   - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
@@ -402,53 +407,18 @@ packet ingestion, into dedup and sigverify
   - reject slot-mismatch vs PoH recorder start slot
   - reject malformed inputs (`mixins.len() != transaction_batches.len()` or any empty transaction batch)
 
-### 5.4 TPU proposer worker
+### 5.3 Proposer admission and payload policy
 
-**Implementation: `core/src/mcp_proposer.rs` + `core/src/tpu.rs`**
+- Reuse existing BankingStage admission checks (no new proposer worker/thread).
+- Proposer-side admission invariants:
+  - fee payer reservation check enforces capacity for `NUM_PROPOSERS * base_fee` before acceptance into proposer payload candidates.
+  - payload-level dedup is by signature within each proposer only.
+  - MCP payload encoder accepts latest and legacy MCP tx bytes, and may carry standard Solana-wire tx bytes for compatibility.
+- MCP payload ordering at proposer output:
+  - MCP-format txs first, then legacy Solana-wire txs.
+  - within each class: `ordering_fee` descending, then signature bytes ascending.
 
-The MCP proposer is **bankless** (no execution, no PoH) but needs to validate transactions and extract ordering fees. This is achieved via `McpProposerContext`, a lightweight struct that extracts only what's needed from a frozen parent bank:
-
-```rust
-pub struct McpProposerContext {
-    feature_set: Arc<FeatureSet>,
-    fee_structure: FeeStructure,
-    rent: Rent,
-    lamports_per_signature: u64,
-    accounts: Arc<Accounts>,        // For loading fee payer balances
-    ancestors: Ancestors,
-    cost_tracker: RwLock<CostTracker>,  // 1/16th limits
-}
-```
-
-**Key methods (reuse patterns from consumer.rs:460-493):**
-- `validate_fee_payer()` — Extracts compute budget limits, calculates fee, loads fee payer account, validates balance
-- `try_add_cost()` — Enforces per-proposer 1/16th CU limits via CostTracker
-- `extract_ordering_fee()` — Returns `compute_unit_price` from transaction's compute budget instructions
-
-
-**Thread flow (If feature is active, `tpu.rs` spawns "solMcpProposer" thread):**
-1. Wait for slot where this validator is a proposer (via `leader_schedule_cache.proposer_indices_at_slot()`)
-2. Create `McpProposerContext::new(&parent_bank)` — cost tracker initialized with 1/16th limits
-3. Receive cloned packets from sigverify (via `mcp_proposer_receiver`)
-4. For each packet:
-   - Deserialize via `ImmutableDeserializedPacket::new()` pattern
-   - Build `RuntimeTransaction` via `build_sanitized_transaction()`
-   - Validate fee payer: `context.validate_fee_payer(&tx)` → returns `ordering_fee`
-   - Validate cost budget: `context.try_add_cost(&tx)` → rejects if exceeds 1/16th
-   - Collect valid transactions as `ValidatedTransaction { transaction, ordering_fee }`
-5. Sort by ordering_fee descending (stable sort preserves insertion order for ties)
-6. Serialize to `McpPayload` (max `MAX_PROPOSER_PAYLOAD` = `DATA_SHREDS * SHRED_DATA_BYTES`)
-7. RS encode via `reed_solomon_erasure::ReedSolomon::new(40, 160)` directly
-8. Compute Merkle commitment per spec section 6 using `mcp_merkle_tree()` from `mcp_merkle.rs`
-9. Build `McpShred` for each relay index (0..199) with witness + proposer_signature
-   - Relay `i` receives shred with `shred_index = i`
-   - Relays 0-39 receive data shreds (original payload), relays 40-199 receive coding shreds (RS parity)
-10. Look up relay addresses via `relays_at_slot()` + `ClusterInfo::lookup_contact_info()`
-11. Send one shred per relay to their TVU address
-
-**MCP transaction format note (PENDING SPEC AMENDMENT):** See SPEC AMENDMENT REQUIREMENT in section 1.2. McpPayload carries standard Solana wire-format transactions. The `ordering_fee` is derived from the existing `compute_unit_price` set via `SetComputeUnitPrice` instruction. Transactions without `SetComputeUnitPrice` get `ordering_fee = 0`.
-
-### 5.5 Forwarding stage changes
+### 5.4 Forwarding stage changes
 
 - `core/src/forwarding_stage.rs` + `core/src/next_leader.rs`:
   - MCP mode resolves proposer forward addresses using schedule cache and same lookahead slot-offset policy used today.
@@ -457,39 +427,17 @@ pub struct McpProposerContext {
     - `TpuClientNext`: `get_forward_addresses_from_tpu_info` must also resolve MCP proposer addresses when `mcp_protocol_v1` is active, using the same schedule cache lookup
   - preserve non-MCP behavior unchanged.
 
-### 5.6 Explicit non-change
+### 5.5 Explicit non-change
 
 - Do not globally divide BankingStage QoS limits in `core/src/banking_stage/qos_service.rs` in v1.
 - Per-proposer limits are handled by proposer admission and replay validation paths.
 
-### 5.7 Per-proposer CU budgets
-
-**Handled directly in `McpProposerContext::new()`:**
-
-The `CostTracker` is initialized with 1/16th of block limits:
-```rust
-cost_tracker.set_limits(
-    account_cost_limit / NUM_PROPOSERS,
-    block_cost_limit / NUM_PROPOSERS,
-    vote_cost_limit / NUM_PROPOSERS,
-);
-```
-
-This ensures each proposer's payload doesn't exceed its share. No changes needed to `qos_service.rs` — the per-proposer tracking is local to the MCP proposer thread.
-
-### 5.8 Tests
+### 5.6 Tests
 
 - MCP dispatch removes completed slot state and emits one shred per relay index per owned proposer index.
-
-- Context created with 1/16th limits
-- Rejects tx when payer has no balance
-- Correctly extracts compute_unit_price (0 if no SetComputeUnitPrice)
-- Transactions sorted descending, ties preserve insertion order
 - Proposer produces 200 shreds (one per relay)
 - Payload size within `DATA_SHREDS * SHRED_DATA_BYTES` = 34,520 bytes
 - RS encode -> decode round-trip
-- TransactionSigVerifier clones to MCP proposer channel
-- Proposer worker emits exactly one shred per relay index.
 - Payload bound enforcement.
 - Forwarding routes to proposer addresses in MCP mode for both forwarding clients.
 
@@ -586,9 +534,11 @@ Staged rollout guard:
 
 - Deterministic order:
   - concat by proposer index
-  - apply `ordering_fee` descending (highest fee first)
-  - stable tie-break by concatenated position
-  - duplicate transactions are not deduplicated in v1; each occurrence executes independently in deterministic order
+  - dedup by signature within each proposer payload before global ordering
+  - MCP-format transactions first; legacy Solana-wire transactions last
+  - within each class: `ordering_fee` descending (highest first)
+  - fee ties break by signature bytes ascending
+  - cross-proposer duplicates are not deduplicated; each occurrence executes and is charged once
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -602,8 +552,8 @@ Two-phase fee handling (spec §8):
   - per-transaction checks for signature/basic validity
   - per-slot cumulative payer map in memory
   - required debit:
-    - standard tx: `base_fee * NUM_PROPOSERS`
-    - nonce tx: `base_fee * NUM_PROPOSERS + nonce_min_rent`
+    - standard tx: `base_fee` (including MCP fee components when present)
+    - nonce tx: `base_fee + nonce_min_rent`
   - debit implementation:
     - standard tx: `Bank::withdraw()`
     - nonce tx: dedicated MCP nonce helper to debit the precomputed amount exactly once
@@ -635,7 +585,7 @@ Reconstruction-to-execution bridge:
 
 **DEFERRED — requires Alpenglow consensus integration.**
 
-- Per policy B3, `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
+- Target invariant (policy B3): `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
 - `ConsensusBlock` currently carries `delayed_bankhash` and `consensus_meta` but does NOT carry an explicit `block_id` field, because `block_id` derivation depends on Alpenglow consensus logic that is not yet integrated.
 - Prerequisites before this section can be implemented:
   1. Alpenglow consensus provides a `block_id` value (or the derivation rule) in `ConsensusBlock.consensus_meta`
@@ -681,6 +631,7 @@ Reconstruction-to-execution bridge:
 New files:
 - `ledger/src/mcp.rs`
 - `ledger/src/mcp_merkle.rs`
+- `ledger/src/mcp_shredder.rs`
 - `transaction-view/src/mcp_payload.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
@@ -690,11 +641,14 @@ Modified files:
 - `ledger/src/leader_schedule.rs`
 - `ledger/src/leader_schedule_cache.rs`
 - `ledger/src/leader_schedule_utils.rs`
+- `ledger/src/mcp_erasure.rs`
+- `ledger/src/mcp_ordering.rs`
 - `ledger/src/blockstore/column.rs`
 - `ledger/src/blockstore_db.rs`
 - `ledger/src/blockstore.rs`
 - `ledger/src/blockstore/blockstore_purge.rs`
 - `turbine/src/sigverify_shreds.rs`
+- `turbine/src/mcp_proposer.rs`
 - `turbine/src/retransmit_stage.rs`
 - `turbine/src/quic_endpoint.rs`
 - `turbine/src/broadcast_stage/standard_broadcast_run.rs`
@@ -709,6 +663,7 @@ Modified files:
 - `core/src/mcp_relay.rs`
 - `core/src/mcp_relay_submit.rs`
 - `ledger/src/blockstore_processor.rs`
+- `fee/src/lib.rs`
 - `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
 - `transaction-view/src/lib.rs`
 - `transaction-view/src/mcp_transaction.rs`

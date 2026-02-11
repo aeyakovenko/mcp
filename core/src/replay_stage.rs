@@ -3050,7 +3050,13 @@ impl ReplayStage {
                 continue;
             }
 
-            let slot_bank = slot_bank.unwrap_or_else(|| heaviest_bank.clone());
+            let Some(slot_bank) = slot_bank else {
+                debug!(
+                    "skipping pending MCP consensus slot {} this pass: slot bank unavailable",
+                    slot
+                );
+                continue;
+            };
             mcp_replay::refresh_vote_gate_input(
                 slot,
                 slot_bank.as_ref(),

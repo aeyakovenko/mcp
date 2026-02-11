@@ -510,13 +510,10 @@ fn check_feature_activation(
     feature_set: &FeatureSet,
     epoch_schedule: &EpochSchedule,
 ) -> bool {
+    let _ = epoch_schedule;
     match feature_set.activated_slot(feature) {
         None => false,
-        Some(feature_slot) => {
-            let feature_epoch = epoch_schedule.get_epoch(feature_slot);
-            let shred_epoch = epoch_schedule.get_epoch(shred_slot);
-            feature_epoch < shred_epoch
-        }
+        Some(feature_slot) => shred_slot >= feature_slot,
     }
 }
 
@@ -600,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_active_mcp_shred_packet_obeys_feature_epoch_gate() {
+    fn test_is_active_mcp_shred_packet_obeys_feature_slot_gate() {
         let slot = 500_000u64;
         let witness_len_offset = std::mem::size_of::<Slot>()
             + std::mem::size_of::<u32>()
@@ -624,7 +621,14 @@ mod tests {
         ));
 
         let mut feature_set = feature_set;
-        feature_set.activate(&agave_feature_set::mcp_protocol_v1::id(), 0);
+        feature_set.activate(&agave_feature_set::mcp_protocol_v1::id(), slot + 1);
+        assert!(!is_active_mcp_shred_packet(
+            PacketRef::Packet(&packet),
+            &feature_set,
+            &epoch_schedule,
+        ));
+
+        feature_set.activate(&agave_feature_set::mcp_protocol_v1::id(), slot);
         assert!(is_active_mcp_shred_packet(
             PacketRef::Packet(&packet),
             &feature_set,
