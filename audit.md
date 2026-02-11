@@ -1,8 +1,8 @@
 # MCP Audit (Current)
 
 Date: 2026-02-11
-Branch: `issue-20-mcp-local-cluster-test`
-Scope: current-state audit after revalidation and targeted fixes.
+Branch: `master`
+Scope: current-state audit on integrated master after revalidation and targeted fixes.
 
 ## Verdict
 
