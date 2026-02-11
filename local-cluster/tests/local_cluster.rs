@@ -7800,12 +7800,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .expect("artifact slot should contain at least one parseable relay attestation");
     let relay_pubkey = relay_pubkey_for(observed_slot, relay_index)
         .expect("relay schedule should contain observed attestation relay index");
+    let valid_relay_entries = relay_attestation.valid_entries(|proposer_index| {
+        proposer_pubkey_for(observed_slot, proposer_index)
+    });
     assert!(
         relay_attestation.verify_relay_signature(&relay_pubkey)
-            && !relay_attestation.entries.is_empty(),
-        "observed relay attestation failed validation at slot {} relay {}",
+            && !relay_attestation.entries.is_empty()
+            && valid_relay_entries.len() == relay_attestation.entries.len(),
+        "observed relay attestation failed validation at slot {} relay {} (valid entries: {} / {})",
         observed_slot,
-        relay_index
+        relay_index,
+        valid_relay_entries.len(),
+        relay_attestation.entries.len()
     );
 
     let mut decodable_execution_output = None;
