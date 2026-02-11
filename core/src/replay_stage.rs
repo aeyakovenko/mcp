@@ -3053,7 +3053,7 @@ impl ReplayStage {
                 .get_mcp_execution_output(slot)
                 .ok()
                 .flatten()
-                .is_some()
+                .is_some_and(|output| !output.is_empty())
             {
                 continue;
             }
@@ -3609,15 +3609,18 @@ impl ReplayStage {
             return true;
         }
 
-        if blockstore
+        let existing_output = blockstore
             .get_mcp_execution_output(bank.slot())
             .ok()
-            .flatten()
-            .is_some()
+            .flatten();
+        if existing_output
+            .as_ref()
+            .is_some_and(|output| !output.is_empty())
         {
             return true;
         }
         if !Self::has_mcp_consensus_block_for_slot(bank.slot(), mcp_consensus_blocks) {
+            let _ = blockstore.put_mcp_empty_execution_output_if_absent(bank.slot());
             return true;
         }
 
@@ -3655,7 +3658,7 @@ impl ReplayStage {
             .get_mcp_execution_output(bank.slot())
             .ok()
             .flatten()
-            .is_some()
+            .is_some_and(|output| !output.is_empty())
         {
             return true;
         }
@@ -5600,6 +5603,48 @@ pub(crate) mod tests {
         assert_eq!(
             ReplayStage::mcp_authoritative_block_id_for_slot(slot, &store),
             None
+        );
+    }
+
+    #[test]
+    fn test_maybe_prepare_mcp_execution_output_for_replay_slot_writes_empty_placeholder_without_consensus(
+    ) {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&replay_bank);
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+
+        assert!(
+            ReplayStage::maybe_prepare_mcp_execution_output_for_replay_slot(
+                replay_bank.as_ref(),
+                &blockstore,
+                &bank_forks,
+                &leader_schedule_cache,
+                &mcp_consensus_blocks,
+                &mcp_vote_gate_inputs,
+                &mcp_vote_gate_included_proposers,
+            )
+        );
+        assert_eq!(
+            blockstore.get_mcp_execution_output(1).unwrap(),
+            Some(vec![])
         );
     }
 

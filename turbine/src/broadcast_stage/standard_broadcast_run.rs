@@ -7,14 +7,19 @@ use {
     },
     crate::{cluster_nodes::ClusterNodesCache, mcp_proposer},
     agave_feature_set as feature_set,
+    agave_transaction_view::{
+        mcp_transaction::McpTransaction, transaction_view::SanitizedTransactionView,
+    },
     crossbeam_channel::Sender,
     solana_entry::block_component::BlockComponent,
+    solana_fee_structure::FeeBudgetLimits,
     solana_gossip::contact_info::Protocol,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore_meta::BlockLocation,
         leader_schedule_cache::LeaderScheduleCache,
+        mcp, mcp_ordering,
         shred::{
             ProcessShredsStats, ReedSolomonCache, Shred, ShredType, Shredder,
             MAX_CODE_SHREDS_PER_SLOT, MAX_DATA_SHREDS_PER_SLOT,
@@ -23,11 +28,19 @@ use {
     solana_metrics::inc_new_counter_error,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
+    solana_runtime_transaction::{
+        runtime_transaction::RuntimeTransaction, transaction_meta::StaticMeta,
+    },
     solana_sha256_hasher::hashv,
     solana_time_utils::AtomicInterval,
+    solana_transaction::{sanitized::MessageHash, versioned::VersionedTransaction},
     solana_votor::event::VotorEventSender,
     solana_votor_messages::migration::MigrationStatus,
-    std::{borrow::Cow, collections::HashMap, sync::RwLock},
+    std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+        sync::RwLock,
+    },
     tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
 
@@ -64,11 +77,23 @@ enum BroadcastError {
     TooManyShreds,
 }
 
+#[derive(Clone)]
+struct McpPayloadTransaction {
+    wire_bytes: Vec<u8>,
+    execution_class: mcp_ordering::ExecutionClass,
+    ordering_fee: u64,
+    signature: [u8; 64],
+    fee_payer: Pubkey,
+    base_fee: u64,
+}
+
 struct McpSlotDispatchState {
     seen_batches: usize,
     expected_batches: Option<usize>,
-    payload_transactions: Vec<Vec<u8>>,
+    payload_transactions: Vec<McpPayloadTransaction>,
     payload_len_bytes: usize,
+    payer_fee_reservations: HashMap<Pubkey, u64>,
+    seen_signatures: HashSet<[u8; 64]>,
 }
 
 const MCP_DISPATCH_STATE_MAX_SLOTS: usize = 1024;
@@ -84,13 +109,38 @@ impl Default for McpSlotDispatchState {
             payload_transactions: Vec::new(),
             // tx_count prefix is always present in encoded payload.
             payload_len_bytes: MCP_PAYLOAD_COUNT_PREFIX_BYTES,
+            payer_fee_reservations: HashMap::new(),
+            seen_signatures: HashSet::new(),
         }
     }
 }
 
 impl McpSlotDispatchState {
-    fn try_push_transaction(&mut self, serialized_tx: Vec<u8>) -> bool {
-        let Some(tx_wire_len) = MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(serialized_tx.len())
+    fn try_push_transaction(&mut self, bank: &Bank, transaction: McpPayloadTransaction) -> bool {
+        if self.seen_signatures.contains(&transaction.signature) {
+            // Per-proposer dedup is by signature only.
+            return true;
+        }
+
+        let Some(per_proposer_reservation) =
+            transaction.base_fee.checked_mul(mcp::NUM_PROPOSERS as u64)
+        else {
+            return true;
+        };
+        let current_reserved = self
+            .payer_fee_reservations
+            .get(&transaction.fee_payer)
+            .copied()
+            .unwrap_or_default();
+        let Some(next_reserved) = current_reserved.checked_add(per_proposer_reservation) else {
+            return true;
+        };
+        if bank.get_balance(&transaction.fee_payer) < next_reserved {
+            return true;
+        }
+
+        let Some(tx_wire_len) =
+            MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(transaction.wire_bytes.len())
         else {
             return false;
         };
@@ -101,8 +151,12 @@ impl McpSlotDispatchState {
             return false;
         }
 
-        self.payload_transactions.push(serialized_tx);
+        let signature = transaction.signature;
+        let fee_payer = transaction.fee_payer;
+        self.payload_transactions.push(transaction);
         self.payload_len_bytes = next_payload_len;
+        self.payer_fee_reservations.insert(fee_payer, next_reserved);
+        self.seen_signatures.insert(signature);
         true
     }
 }
@@ -127,6 +181,82 @@ fn encode_mcp_payload(transactions: Vec<Vec<u8>>) -> Option<Vec<u8>> {
 
 impl StandardBroadcastRun {
     const MCP_DISPATCH_SEND_RETRY_LIMIT: usize = 3;
+
+    fn mcp_payload_transaction_from_entry_tx(
+        bank: &Bank,
+        transaction: &VersionedTransaction,
+    ) -> Option<McpPayloadTransaction> {
+        let wire_bytes = bincode::serialize(transaction).ok()?;
+
+        if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(&wire_bytes) {
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(mcp_transaction.signatures.first()?.as_ref());
+            let fee_payer = *mcp_transaction.addresses.first()?;
+            let signature_fee = u64::try_from(mcp_transaction.signatures.len())
+                .ok()?
+                .saturating_mul(bank.fee_structure().lamports_per_signature);
+            let inclusion_fee = u64::from(mcp_transaction.inclusion_fee().unwrap_or_default());
+            let ordering_fee = u64::from(mcp_transaction.ordering_fee().unwrap_or_default());
+            let base_fee = signature_fee
+                .saturating_add(inclusion_fee)
+                .saturating_add(ordering_fee);
+
+            return Some(McpPayloadTransaction {
+                wire_bytes,
+                execution_class: mcp_ordering::ExecutionClass::Mcp,
+                ordering_fee,
+                signature,
+                fee_payer,
+                base_fee,
+            });
+        }
+
+        let view = SanitizedTransactionView::try_new_sanitized(wire_bytes.as_slice()).ok()?;
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(view.signatures().first()?.as_ref());
+        let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
+            view,
+            MessageHash::Compute,
+            None,
+        )
+        .ok()?;
+        let ordering_fee = runtime_tx
+            .compute_budget_instruction_details()
+            .requested_compute_unit_price();
+        let prioritization_fee = runtime_tx
+            .compute_budget_instruction_details()
+            .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
+            .ok()
+            .map(|limits| u64::from(FeeBudgetLimits::from(limits).prioritization_fee))
+            .unwrap_or_default();
+        let signature_fee = runtime_tx
+            .signature_details()
+            .total_signatures()
+            .saturating_mul(bank.fee_structure().lamports_per_signature);
+        let base_fee = signature_fee.saturating_add(prioritization_fee);
+        let fee_payer = *transaction.message.static_account_keys().first()?;
+
+        Some(McpPayloadTransaction {
+            wire_bytes,
+            execution_class: mcp_ordering::ExecutionClass::Legacy,
+            ordering_fee,
+            signature,
+            fee_payer,
+            base_fee,
+        })
+    }
+
+    fn order_mcp_payload_transactions(transactions: Vec<McpPayloadTransaction>) -> Vec<Vec<u8>> {
+        mcp_ordering::order_batches_mcp_policy(
+            vec![(0u32, transactions)],
+            |tx| tx.execution_class,
+            |tx| tx.ordering_fee,
+            |tx| tx.signature,
+        )
+        .into_iter()
+        .map(|tx| tx.wire_bytes)
+        .collect()
+    }
 
     pub(super) fn new(
         identity: Pubkey,
@@ -681,14 +811,16 @@ impl StandardBroadcastRun {
         };
         for entry in entries {
             for tx in &entry.transactions {
-                let Ok(serialized_tx) = bincode::serialize(tx) else {
+                let Some(payload_transaction) =
+                    Self::mcp_payload_transaction_from_entry_tx(bank, tx)
+                else {
                     warn!(
-                        "MCP proposer payload serialization failed for slot {}",
+                        "MCP proposer payload metadata extraction failed for slot {}",
                         bank.slot()
                     );
-                    return;
+                    continue;
                 };
-                if !slot_state.try_push_transaction(serialized_tx) {
+                if !slot_state.try_push_transaction(bank, payload_transaction) {
                     return;
                 }
             }
@@ -759,9 +891,9 @@ impl StandardBroadcastRun {
                 .map(|num_expected_batches| slot_state.seen_batches >= num_expected_batches)
                 .unwrap_or(false);
             if is_slot_complete {
-                state
-                    .remove(&slot)
-                    .map(|slot_state| slot_state.payload_transactions)
+                state.remove(&slot).map(|slot_state| {
+                    Self::order_mcp_payload_transactions(slot_state.payload_transactions)
+                })
             } else {
                 None
             }
@@ -979,6 +1111,7 @@ mod test {
     use {
         super::*,
         rand::Rng,
+        solana_account::{AccountSharedData, WritableAccount},
         solana_entry::entry::create_ticks,
         solana_genesis_config::GenesisConfig,
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
@@ -1064,6 +1197,23 @@ mod test {
         setup_with_mcp_feature(num_shreds_per_slot, false)
     }
 
+    fn make_payload_tx(
+        wire_len: usize,
+        signature_byte: u8,
+        fee_payer: Pubkey,
+        base_fee: u64,
+        ordering_fee: u64,
+    ) -> McpPayloadTransaction {
+        McpPayloadTransaction {
+            wire_bytes: vec![signature_byte; wire_len],
+            execution_class: mcp_ordering::ExecutionClass::Legacy,
+            ordering_fee,
+            signature: [signature_byte; 64],
+            fee_payer,
+            base_fee,
+        }
+    }
+
     #[test]
     fn test_encode_mcp_payload_frames_transactions() {
         let tx0 = vec![1u8, 2, 3];
@@ -1081,12 +1231,78 @@ mod test {
 
     #[test]
     fn test_slot_dispatch_state_enforces_payload_bound_with_framing_overhead() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
         let mut state = McpSlotDispatchState::default();
-        let max_size_tx = vec![0u8; mcp_proposer::MCP_MAX_PAYLOAD_SIZE];
-        assert!(!state.try_push_transaction(max_size_tx));
+        let max_size_tx = make_payload_tx(
+            mcp_proposer::MCP_MAX_PAYLOAD_SIZE,
+            1,
+            Pubkey::new_unique(),
+            0,
+            0,
+        );
+        assert!(!state.try_push_transaction(bank.as_ref(), max_size_tx));
 
-        let valid = vec![0u8; mcp_proposer::MCP_MAX_PAYLOAD_SIZE - 8];
-        assert!(state.try_push_transaction(valid));
+        let valid = make_payload_tx(
+            mcp_proposer::MCP_MAX_PAYLOAD_SIZE - 8,
+            2,
+            Pubkey::new_unique(),
+            0,
+            0,
+        );
+        assert!(state.try_push_transaction(bank.as_ref(), valid));
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_dedups_by_signature() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let mut state = McpSlotDispatchState::default();
+        let fee_payer = Pubkey::new_unique();
+
+        let first = make_payload_tx(16, 7, fee_payer, 0, 0);
+        assert!(state.try_push_transaction(bank.as_ref(), first));
+        let duplicate = make_payload_tx(32, 7, fee_payer, 0, 100);
+        assert!(state.try_push_transaction(bank.as_ref(), duplicate));
+
+        assert_eq!(state.payload_transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_slot_dispatch_state_requires_num_proposers_fee_reservation() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let fee_payer = Pubkey::new_unique();
+        let mut account = AccountSharedData::new(0, 0, &Pubkey::default());
+        account.set_lamports((mcp::NUM_PROPOSERS as u64).saturating_sub(1));
+        bank.store_account(&fee_payer, &account);
+
+        let mut state = McpSlotDispatchState::default();
+        let rejected = make_payload_tx(16, 3, fee_payer, 1, 0);
+        assert!(state.try_push_transaction(bank.as_ref(), rejected));
+        assert!(state.payload_transactions.is_empty());
+
+        account.set_lamports(mcp::NUM_PROPOSERS as u64);
+        bank.store_account(&fee_payer, &account);
+        let accepted = make_payload_tx(16, 4, fee_payer, 1, 0);
+        assert!(state.try_push_transaction(bank.as_ref(), accepted));
+        assert_eq!(state.payload_transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_order_mcp_payload_transactions_uses_b2_policy() {
+        let fee_payer = Pubkey::new_unique();
+        let ordered = StandardBroadcastRun::order_mcp_payload_transactions(vec![
+            make_payload_tx(1, 9, fee_payer, 0, 1),
+            make_payload_tx(1, 1, fee_payer, 0, 7),
+            make_payload_tx(1, 2, fee_payer, 0, 7),
+        ]);
+
+        // Higher ordering_fee first, then signature bytes ascending for ties.
+        assert_eq!(ordered, vec![vec![1u8], vec![2u8], vec![9u8]]);
     }
 
     #[test]
@@ -1118,7 +1334,10 @@ mod test {
         let mut slot_state = McpSlotDispatchState::default();
         slot_state.seen_batches = 1;
         slot_state.expected_batches = Some(1);
-        assert!(slot_state.try_push_transaction(vec![1u8, 2, 3, 4]));
+        assert!(slot_state.try_push_transaction(
+            bank.as_ref(),
+            make_payload_tx(4, 5, Pubkey::new_unique(), 0, 0),
+        ));
         standard_broadcast_run
             .mcp_dispatch_state
             .lock()

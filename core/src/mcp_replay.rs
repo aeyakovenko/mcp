@@ -380,13 +380,10 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
     leader_schedule_cache: &LeaderScheduleCache,
     mcp_vote_gate_included_proposers: &RwLock<HashMap<Slot, BTreeMap<u32, Commitment>>>,
 ) {
-    if blockstore
-        .get_mcp_execution_output(slot)
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return;
+    if let Some(existing_output) = blockstore.get_mcp_execution_output(slot).ok().flatten() {
+        if !existing_output.is_empty() {
+            return;
+        }
     }
 
     let included_proposers = match mcp_vote_gate_included_proposers.read() {
@@ -504,7 +501,9 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             slot, reconstructed_any_proposer
         );
         if reconstructed_any_proposer {
-            let _ = blockstore.put_mcp_empty_execution_output_if_absent(slot);
+            if let Some(encoded_empty_output) = encode_ordered_execution_output(&[]) {
+                let _ = blockstore.put_mcp_execution_output(slot, &encoded_empty_output);
+            }
         }
         return;
     }
@@ -748,7 +747,7 @@ mod tests {
 
         assert_eq!(
             blockstore.get_mcp_execution_output(slot).unwrap(),
-            Some(vec![])
+            Some(0u32.to_le_bytes().to_vec())
         );
     }
 }

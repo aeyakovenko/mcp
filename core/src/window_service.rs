@@ -586,6 +586,7 @@ fn run_insert<F>(
     mcp_relay_attestation_sender: Option<&Sender<RelayAttestationV1>>,
     pending_mcp_attestation_entries: &mut HashMap<Slot, BTreeMap<u32, RelayAttestationEntry>>,
     emitted_mcp_attestation_slots: &mut HashSet<Slot>,
+    suppressed_mcp_attestation_proposers: &mut HashMap<Slot, HashSet<u32>>,
 ) -> Result<()>
 where
     F: Fn(PossibleDuplicateShred),
@@ -612,6 +613,7 @@ where
         .saturating_sub(MCP_ATTESTATION_STATE_RETENTION_SLOTS);
     pending_mcp_attestation_entries.retain(|slot, _| *slot >= min_retained_slot);
     emitted_mcp_attestation_slots.retain(|slot| *slot >= min_retained_slot);
+    suppressed_mcp_attestation_proposers.retain(|slot, _| *slot >= min_retained_slot);
 
     for (shred, repair, block_location) in shreds {
         if accept_repairs_only && !repair {
@@ -698,6 +700,12 @@ where
                     }
                 }
                 if !emitted_mcp_attestation_slots.contains(&slot) {
+                    let proposer_suppressed = suppressed_mcp_attestation_proposers
+                        .get(&slot)
+                        .is_some_and(|suppressed| suppressed.contains(&proposer_index));
+                    if proposer_suppressed {
+                        continue;
+                    }
                     pending_mcp_attestation_entries
                         .entry(slot)
                         .or_default()
@@ -718,6 +726,14 @@ where
                 );
                 if reason == crate::mcp_relay::McpDropReason::ConflictingShred {
                     mcp_shred_count += 1;
+                    suppressed_mcp_attestation_proposers
+                        .entry(mcp_shred.slot)
+                        .or_default()
+                        .insert(mcp_shred.proposer_index);
+                    if let Some(entries) = pending_mcp_attestation_entries.get_mut(&mcp_shred.slot)
+                    {
+                        entries.remove(&mcp_shred.proposer_index);
+                    }
                 }
             }
         }
@@ -794,11 +810,7 @@ where
                 match attestation_sender.try_send(attestation) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
-                        inc_new_counter_error!(
-                            "mcp-relay-attestation-send-dropped-full",
-                            1,
-                            1
-                        );
+                        inc_new_counter_error!("mcp-relay-attestation-send-dropped-full", 1, 1);
                         debug!(
                             "dropping MCP relay attestation for slot {} relay {}: channel full",
                             slot, relay_index
@@ -1243,6 +1255,8 @@ impl WindowService {
                     BTreeMap<u32, RelayAttestationEntry>,
                 > = HashMap::new();
                 let mut emitted_mcp_attestation_slots: HashSet<Slot> = HashSet::new();
+                let mut suppressed_mcp_attestation_proposers: HashMap<Slot, HashSet<u32>> =
+                    HashMap::new();
                 let mut pending_mcp_consensus_slots: HashSet<Slot> = HashSet::new();
                 const MCP_PENDING_CONSENSUS_RETENTION_SLOTS: Slot = 1024;
                 let mut last_print = Instant::now();
@@ -1267,6 +1281,7 @@ impl WindowService {
                         mcp_relay_attestation_sender.as_ref(),
                         &mut pending_mcp_attestation_entries,
                         &mut emitted_mcp_attestation_slots,
+                        &mut suppressed_mcp_attestation_proposers,
                     ) {
                         ws_metrics.record_error(&e);
                         if Self::should_exit_on_error(e, &handle_error) {
