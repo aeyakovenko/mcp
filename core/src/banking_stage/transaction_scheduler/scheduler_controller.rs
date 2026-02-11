@@ -202,9 +202,11 @@ where
             .zip(transactions)
             .zip(results.iter_mut())
         {
-            *result = check_result
-                .and_then(|_| Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters))
-                .is_ok();
+            // This scheduler path ingests standard Solana transactions.
+            // MCP payload transactions are validated in their dedicated replay path.
+            let fee_check_result =
+                Consumer::check_fee_payer_unlocked(bank, *tx, &mut error_counters);
+            *result = check_result.and_then(|_| fee_check_result).is_ok();
         }
     }
 
