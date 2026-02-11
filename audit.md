@@ -1,95 +1,80 @@
-# MCP Audit (Post-Fix Self Audit)
+# MCP Audit (Post-Remediation)
 
 Date: 2026-02-11
 Branch: `issue-20-mcp-local-cluster-test`
 Authoritative constraint: `carllin/solana@81bc2690987f7424bc54a60c663e92db42abdd3d`
-Scope: integration branch + consistency against `plan.md`
+Scope: implementation + `plan.md` consistency after systematic remediation
 
 ## Verdict
 
-- `plan.md` consistency: `PASS`
-- code vs `plan.md`: `PASS`
-- PR-series consistency on integration branch: `PASS` (integration branch reconciles prior standalone PR deltas)
-- succinctness: `PASS` (ordering policy centralized; file lists corrected)
+- `plan.md` internal consistency: `PASS`
+- implementation vs `plan.md`: `PASS`
+- prior open findings: `PASS` (all resolved or clarified as intentional policy)
+- MCP local-cluster integration strictness (issue-20): `PASS` (5-node, strict timeout failure)
 
-## Self PR Audit
+## Fixes Applied
 
-- Reviewed cumulative behavior from PR series (#24-#42, #44, #45) as integrated on this branch.
-- No unresolved integration-branch regressions found against `plan.md`.
-- Historical standalone-PR divergences are superseded by the integrated branch state validated in this audit.
-
-## Systematic Fixes Applied
-
-1. Slot-effective MCP feature gate consistency across entry points.
-- Replaced `is_active()` checks with slot-effective `activated_slot()` checks where MCP logic is slot-dependent.
+1. MCP schedule sampling now matches plan/spec intent (`slots_in_epoch * count` sampling, per-slot disjoint windows).
 - Evidence:
-  - `core/src/replay_stage.rs`
-  - `ledger/src/blockstore_processor.rs`
-  - `turbine/src/broadcast_stage/standard_broadcast_run.rs`
-  - `core/src/forwarding_stage.rs`
+  - `ledger/src/leader_schedule_utils.rs`
+  - `ledger/src/leader_schedule_cache.rs`
 
-2. Strict consensus-observed replay gating and authoritative `block_id` enforcement.
-- Replay now defers execution/completion for consensus-observed slots until:
-  - vote gate passes
-  - `McpExecutionOutput` exists
-  - authoritative `block_id` sidecar is usable
-- Evidence:
-  - `core/src/replay_stage.rs`
-  - `core/src/window_service.rs`
-
-3. ConsensusBlock sidecar validation tightened on ingest.
-- Consensus blocks with non-32-byte `consensus_meta` are dropped.
-- Added ingest test for invalid sidecar length.
+2. Invalid MCP shreds no longer fall through to legacy path for MCP-active slots.
 - Evidence:
   - `core/src/window_service.rs`
 
-4. Forwarding fanout behavior fixed for both forwarding clients in MCP mode.
-- `ConnectionCacheClient` now fans out to all resolved proposer forwarding addresses.
-- `TpuClientNext` fanout configuration now targets MCP proposer count.
+3. Pre-activation forwarding fanout is capped to standard lookahead; MCP fanout preserved post-activation.
 - Evidence:
   - `core/src/forwarding_stage.rs`
 
-5. MCP control-path backpressure tightened.
-- Relay-attestation channel in TVU changed from unbounded to bounded.
-- Relay-attestation enqueue in `window_service` changed to non-blocking `try_send` with explicit drop counters for `Full` and `Disconnected` cases.
+4. Vote-gate relay threshold excludes relays whose proposer entries are all invalid after signature filtering.
 - Evidence:
-  - `core/src/tvu.rs`
-  - `core/src/window_service.rs`
+  - `core/src/mcp_vote_gate.rs`
 
-6. MCP shred strict parser bounds added.
-- `McpShred::from_bytes()` now rejects out-of-range proposer/shred indices.
-- Added parser tests for both index bounds.
+5. Relay-attestation dispatch retry behavior now matches naming and requirements.
+- Added bounded retries and explicit drop counters (`full`/`closed`).
 - Evidence:
-  - `ledger/src/shred/mcp_shred.rs`
+  - `core/src/mcp_relay_submit.rs`
 
-7. Phase-A zero-fee payer validation hardened.
-- Removed zero-fee bypass so fee payer/account validation still runs through withdraw path.
+6. Reconstruction failures for vote-gate-included proposers now log at warning level.
 - Evidence:
-  - `runtime/src/bank.rs`
+  - `core/src/mcp_replay.rs`
 
-8. `plan.md` corrected for spec/policy clarity and implementation reality.
-- Explicitly documents B2 as an intentional spec override and cross-proposer dedup as an Agave extension.
-- Adds `McpExecutionOutput` CF to storage section.
-- Adds v1 delayed-slot definition (`slot - 1`) and RS/invariant notes.
-- Fixes file classification lists and reduces repeated ordering text.
+7. Constant-invariant coverage tightened.
+- Added explicit test for `REQUIRED_RECONSTRUCTION == DATA_SHREDS_PER_FEC_BLOCK`.
+- Evidence:
+  - `ledger/src/mcp.rs`
+
+8. `plan.md` tightened and synchronized with implementation.
+- Clarified framing widths, slot-gate wording, schedule window mapping, dedup ordering sequence, nonce rent term, empty-result fork mismatch behavior, dependency order, file lists, and MCP-active-slot parser invariant.
 - Evidence:
   - `plan.md`
 
-## Remaining Issues
+## Clarified Policy (Intentional, Not a Blocker)
 
-- None identified as blockers or correctness regressions in current integration branch scope.
-- Intentional compatibility behavior retained and documented in `plan.md`:
-  - pre-consensus replay compatibility fallback remains allowed in v1.
+- Nonce Phase-A charging intentionally debits `base_fee + nonce_min_rent` exactly once and may reduce nonce fee payer to zero in Phase A; this matches current tests and plan wording.
 
 ## Tests Run
 
-- `cargo check -p solana-core -p solana-ledger -p solana-runtime -p solana-turbine`
-- `cargo test -p solana-ledger test_mcp_shred_rejects_out_of_range_proposer_index_in_parser -- --nocapture`
-- `cargo test -p solana-ledger test_mcp_shred_rejects_out_of_range_shred_index_in_parser -- --nocapture`
+- `cargo check -p solana-core -p solana-ledger -p solana-runtime -p solana-turbine -p agave-transaction-view`
+- `cargo test -p solana-ledger test_mcp_schedule_is_deterministic -- --nocapture`
+- `cargo test -p solana-ledger test_mcp_schedule_length_scales_with_role_count -- --nocapture`
+- `cargo test -p solana-ledger test_mcp_schedule_accessors_are_cached_and_sized -- --nocapture`
+- `cargo test -p solana-ledger test_mcp_relay_schedule_handles_short_epoch_schedules -- --nocapture`
+- `cargo test -p solana-ledger test_threshold_counts -- --nocapture`
+- `cargo test -p solana-core test_relays_without_any_valid_proposer_entries_do_not_count -- --nocapture`
 - `cargo test -p solana-core test_ingest_mcp_consensus_block_rejects_invalid_consensus_meta_length -- --nocapture`
-- `cargo test -p solana-core test_mcp_authoritative_block_id_for_slot_reads_hash_sized_consensus_meta -- --nocapture`
 - `cargo test -p solana-core test_maybe_finalize_consensus_block_from_relay_attestations -- --nocapture`
-- `cargo test -p solana-core test_maybe_finalize_consensus_block_requires_delayed_bankhash -- --nocapture`
 - `cargo test -p solana-core forwarding_stage::tests::test_forwarding -- --nocapture`
+- `cargo test -p solana-core mcp_relay_submit::tests::test_attestation_roundtrip_and_signature_checks -- --nocapture`
 - `cargo test -p solana-runtime collect_fees_only_for -- --nocapture`
 - `cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture`
+
+## Remaining Blockers
+
+- `B-1` Strict no-fallback MCP replay is not fully enforced for pre-consensus-observation slots.
+  - Current behavior: when MCP is active but no `ConsensusBlock` has been observed yet for a slot, replay may still use legacy entry-derived input as compatibility fallback.
+  - This is the only remaining blocker to claim fully strict end-to-end MCP replay semantics for all MCP-active slots.
+  - Evidence:
+    - `plan.md` release blocker `Reconstruction-to-execution bridge reader: PARTIAL`
+    - `plan.md` notes at `Reconstruction-to-execution bridge` (`v1 compatibility fallback`)

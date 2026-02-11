@@ -14,11 +14,16 @@ use {
             RELAY_ATTESTATION_V1,
         },
     },
+    solana_metrics::inc_new_counter_error,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signature::{Signature, SIGNATURE_BYTES},
     solana_turbine::cluster_nodes,
-    std::net::SocketAddr,
+    std::{
+        net::SocketAddr,
+        thread::sleep,
+        time::Duration,
+    },
     thiserror::Error,
     tokio::sync::mpsc::{error::TrySendError as AsyncTrySendError, Sender as AsyncSender},
 };
@@ -32,6 +37,7 @@ pub const MAX_RELAY_ATTESTATION_BYTES: usize = 1
     + (mcp::NUM_PROPOSERS * (4 + 32 + SIGNATURE_BYTES))
     + SIGNATURE_BYTES;
 pub const MAX_RELAY_ATTESTATION_FRAME_BYTES: usize = 1 + MAX_RELAY_ATTESTATION_BYTES;
+const MCP_RELAY_DISPATCH_SEND_RETRY_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelayAttestationEntry {
@@ -316,7 +322,26 @@ fn try_send_dispatch_frame_with_retry(
     leader_addr: SocketAddr,
     payload: Bytes,
 ) -> Result<(), AsyncTrySendError<(SocketAddr, Bytes)>> {
-    quic_endpoint_sender.try_send((leader_addr, payload))
+    let mut send_item = (leader_addr, payload);
+    for attempt in 0..=MCP_RELAY_DISPATCH_SEND_RETRY_LIMIT {
+        match quic_endpoint_sender.try_send(send_item) {
+            Ok(()) => return Ok(()),
+            Err(AsyncTrySendError::Closed(returned)) => {
+                inc_new_counter_error!("mcp-relay-attestation-dispatch-dropped-closed", 1, 1);
+                return Err(AsyncTrySendError::Closed(returned));
+            }
+            Err(AsyncTrySendError::Full(returned)) => {
+                if attempt == MCP_RELAY_DISPATCH_SEND_RETRY_LIMIT {
+                    inc_new_counter_error!("mcp-relay-attestation-dispatch-dropped-full", 1, 1);
+                    return Err(AsyncTrySendError::Full(returned));
+                }
+                send_item = returned;
+                let backoff_micros = 50u64.saturating_mul((attempt + 1) as u64);
+                sleep(Duration::from_micros(backoff_micros));
+            }
+        }
+    }
+    unreachable!("retry loop must return");
 }
 
 #[cfg(test)]
