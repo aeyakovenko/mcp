@@ -7,7 +7,7 @@ use {
     },
     agave_feature_set::FeatureSet,
     bytes::Bytes,
-    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
+    crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender, TrySendError},
     itertools::Itertools,
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_epoch_schedule::EpochSchedule,
@@ -16,6 +16,7 @@ use {
     solana_ledger::shred::{
         self, mcp_shred::is_mcp_shred_bytes, should_discard_shred, ShredFetchStats,
     },
+    solana_metrics::inc_new_counter_error,
     solana_packet::{Meta, PACKET_DATA_SIZE},
     solana_perf::packet::{
         BytesPacket, BytesPacketBatch, PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef,
@@ -460,8 +461,22 @@ pub(crate) fn receive_quic_datagrams(
                     Some(MCP_CONTROL_MSG_RELAY_ATTESTATION | MCP_CONTROL_MSG_CONSENSUS_BLOCK)
                 ) {
                     if let Some(sender) = mcp_control_message_sender.as_ref() {
-                        if sender.send((pubkey, addr, bytes)).is_err() {
-                            return None;
+                        match sender.try_send((pubkey, addr, bytes)) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => {
+                                inc_new_counter_error!(
+                                    "shred_fetch_stage-mcp_control_message_channel_full",
+                                    1
+                                );
+                                return None;
+                            }
+                            Err(TrySendError::Disconnected(_)) => {
+                                inc_new_counter_error!(
+                                    "shred_fetch_stage-mcp_control_message_channel_disconnected",
+                                    1
+                                );
+                                return None;
+                            }
                         }
                     }
                     return None;

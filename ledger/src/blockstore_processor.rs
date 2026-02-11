@@ -9,6 +9,7 @@ use {
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
     agave_feature_set as feature_set,
+    agave_transaction_view::mcp_transaction::McpTransaction,
     chrono_humanize::{Accuracy, HumanTime, Tense},
     crossbeam_channel::Sender,
     itertools::Itertools,
@@ -31,6 +32,9 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_measure::{measure::Measure, measure_us},
+    solana_message::{
+        compiled_instruction::CompiledInstruction, Message, MessageHeader, VersionedMessage,
+    },
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
     solana_runtime::{
@@ -230,8 +234,11 @@ pub fn execute_batch<'a>(
     let mcp_two_pass_fees = should_use_mcp_two_pass_fees(block_verification, bank);
     let (commit_results, balance_collector) = if mcp_two_pass_fees {
         let mut fee_error_counters = TransactionErrorMetrics::default();
-        let fee_collection_results =
-            bank.collect_fees_only_for_transactions(batch, MAX_PROCESSING_AGE, &mut fee_error_counters);
+        let fee_collection_results = bank.collect_fees_only_for_transactions(
+            batch,
+            MAX_PROCESSING_AGE,
+            &mut fee_error_counters,
+        );
 
         let mut phase_b_lock_results = batch.lock_results().clone();
         for (lock_result, fee_result) in phase_b_lock_results
@@ -350,7 +357,10 @@ pub fn execute_batch<'a>(
 }
 
 fn should_use_mcp_two_pass_fees(block_verification: bool, bank: &Bank) -> bool {
-    block_verification && bank.feature_set.is_active(&feature_set::mcp_protocol_v1::id())
+    block_verification
+        && bank
+            .feature_set
+            .is_active(&feature_set::mcp_protocol_v1::id())
 }
 
 // Get actual transaction execution costs from transaction commit results
@@ -857,6 +867,9 @@ pub enum BlockstoreProcessorError {
 
     #[error("invalid hard fork slot {0}")]
     InvalidHardFork(Slot),
+
+    #[error("invalid MCP execution output for slot {slot}: {reason}")]
+    InvalidMcpExecutionOutput { slot: Slot, reason: String },
 
     #[error("root bank with mismatched capitalization at {0}")]
     RootBankWithMismatchedCapitalization(Slot),
@@ -1598,6 +1611,7 @@ pub fn confirm_slot(
 
                 confirm_slot_entries(
                     bank,
+                    Some(blockstore),
                     replay_tx_thread_pool,
                     (entries, num_shreds as u64, slot_full),
                     timing,
@@ -1639,9 +1653,234 @@ pub fn confirm_slot(
     Ok(())
 }
 
+fn read_le_u32(
+    bytes: &[u8],
+    offset: &mut usize,
+    slot: Slot,
+    field: &str,
+) -> result::Result<u32, BlockstoreProcessorError> {
+    const U32_LEN: usize = std::mem::size_of::<u32>();
+    let Some(end) = offset.checked_add(U32_LEN) else {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: format!("offset overflow while reading {field}"),
+        });
+    };
+    let Some(slice) = bytes.get(*offset..end) else {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: format!("truncated MCP execution output while reading {field}"),
+        });
+    };
+    *offset = end;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn decode_mcp_execution_output_wire_transactions(
+    slot: Slot,
+    encoded_output: &[u8],
+) -> result::Result<Vec<Vec<u8>>, BlockstoreProcessorError> {
+    if encoded_output.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut offset = 0usize;
+    let tx_count = usize::try_from(read_le_u32(encoded_output, &mut offset, slot, "tx_count")?)
+        .map_err(|_| BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: "tx_count does not fit usize".to_string(),
+        })?;
+
+    let mut transactions = Vec::with_capacity(tx_count);
+    for tx_index in 0..tx_count {
+        let tx_len = usize::try_from(read_le_u32(
+            encoded_output,
+            &mut offset,
+            slot,
+            &format!("tx_len[{tx_index}]"),
+        )?)
+        .map_err(|_| BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: format!("tx_len[{tx_index}] does not fit usize"),
+        })?;
+        let Some(end) = offset.checked_add(tx_len) else {
+            return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+                slot,
+                reason: format!("tx_len overflow at tx[{tx_index}]"),
+            });
+        };
+        let Some(tx_bytes) = encoded_output.get(offset..end) else {
+            return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+                slot,
+                reason: format!("truncated tx bytes at tx[{tx_index}]"),
+            });
+        };
+        transactions.push(tx_bytes.to_vec());
+        offset = end;
+    }
+
+    if encoded_output[offset..].iter().any(|byte| *byte != 0) {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: "trailing non-zero padding in MCP execution output".to_string(),
+        });
+    }
+
+    Ok(transactions)
+}
+
+fn mcp_transaction_to_versioned_transaction(
+    mcp_transaction: McpTransaction,
+) -> VersionedTransaction {
+    let instructions = mcp_transaction
+        .instruction_headers
+        .into_iter()
+        .zip(mcp_transaction.instruction_payloads)
+        .map(|(header, payload)| CompiledInstruction {
+            program_id_index: header.program_account_index,
+            accounts: payload.account_indexes,
+            data: payload.instruction_data,
+        })
+        .collect::<Vec<_>>();
+
+    VersionedTransaction {
+        signatures: mcp_transaction.signatures,
+        message: VersionedMessage::Legacy(Message {
+            header: MessageHeader {
+                num_required_signatures: mcp_transaction.legacy_header.num_required_signatures,
+                num_readonly_signed_accounts: mcp_transaction.legacy_header.num_readonly_signed,
+                num_readonly_unsigned_accounts: mcp_transaction.legacy_header.num_readonly_unsigned,
+            },
+            account_keys: mcp_transaction.addresses,
+            recent_blockhash: Hash::new_from_array(mcp_transaction.lifetime_specifier),
+            instructions,
+        }),
+    }
+}
+
+fn versioned_transaction_from_mcp_wire_bytes(
+    slot: Slot,
+    tx_index: usize,
+    tx_wire_bytes: &[u8],
+) -> result::Result<VersionedTransaction, BlockstoreProcessorError> {
+    if let Ok(versioned_tx) = bincode::deserialize::<VersionedTransaction>(tx_wire_bytes) {
+        return Ok(versioned_tx);
+    }
+
+    let mcp_transaction = McpTransaction::from_bytes_compat(tx_wire_bytes).map_err(|err| {
+        BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: format!(
+                "tx[{tx_index}] is neither bincode VersionedTransaction nor MCP format: {err:?}"
+            ),
+        }
+    })?;
+    Ok(mcp_transaction_to_versioned_transaction(mcp_transaction))
+}
+
+fn maybe_override_replay_entries_with_mcp_execution_output(
+    slot: Slot,
+    bank: &BankWithScheduler,
+    skip_verification: bool,
+    blockstore: Option<&Blockstore>,
+    replay_entries: Vec<ReplayEntry>,
+    default_num_txs: usize,
+) -> result::Result<(Vec<ReplayEntry>, usize), BlockstoreProcessorError> {
+    if !bank
+        .feature_set
+        .is_active(&feature_set::mcp_protocol_v1::id())
+    {
+        return Ok((replay_entries, default_num_txs));
+    }
+
+    let Some(blockstore) = blockstore else {
+        return Ok((replay_entries, default_num_txs));
+    };
+    let Some(encoded_output) = blockstore.get_mcp_execution_output(slot)? else {
+        return Ok((replay_entries, default_num_txs));
+    };
+
+    let verification_mode = if skip_verification {
+        TransactionVerificationMode::HashOnly
+    } else {
+        TransactionVerificationMode::FullVerification
+    };
+
+    let transaction_wires = decode_mcp_execution_output_wire_transactions(slot, &encoded_output)?;
+    let mut transactions = transaction_wires
+        .iter()
+        .enumerate()
+        .map(|(tx_index, tx_wire_bytes)| {
+            let versioned_tx =
+                versioned_transaction_from_mcp_wire_bytes(slot, tx_index, tx_wire_bytes)?;
+            bank.verify_transaction(versioned_tx, verification_mode)
+                .map_err(|err| BlockstoreProcessorError::InvalidMcpExecutionOutput {
+                    slot,
+                    reason: format!("tx[{tx_index}] failed bank.verify_transaction: {err:?}"),
+                })
+        })
+        .collect::<result::Result<Vec<_>, _>>()?;
+
+    if bank.vote_only_bank()
+        && transactions
+            .iter()
+            .any(|tx| !tx.is_simple_vote_transaction())
+    {
+        return Err(BlockstoreProcessorError::UserTransactionsInVoteOnlyBank(
+            slot,
+        ));
+    }
+
+    let mut replaced_replay_entries = Vec::with_capacity(replay_entries.len() + 1);
+    let mut inserted_transactions = false;
+    let mut saw_original_transaction_entry = false;
+    for ReplayEntry {
+        entry,
+        starting_index,
+    } in replay_entries
+    {
+        match entry {
+            EntryType::Tick(hash) => replaced_replay_entries.push(ReplayEntry {
+                entry: EntryType::Tick(hash),
+                starting_index,
+            }),
+            EntryType::Transactions(_) => {
+                saw_original_transaction_entry = true;
+                if !inserted_transactions {
+                    inserted_transactions = true;
+                    if !transactions.is_empty() {
+                        replaced_replay_entries.push(ReplayEntry {
+                            entry: EntryType::Transactions(std::mem::take(&mut transactions)),
+                            starting_index,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if !saw_original_transaction_entry && !transaction_wires.is_empty() {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: "MCP execution output has transactions but replay entries have no transaction entry to replace".to_string(),
+        });
+    }
+    if !transactions.is_empty() {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason:
+                "failed to consume all MCP execution transactions while replacing replay entries"
+                    .to_string(),
+        });
+    }
+
+    Ok((replaced_replay_entries, transaction_wires.len()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn confirm_slot_entries(
     bank: &BankWithScheduler,
+    mcp_execution_output_blockstore: Option<&Blockstore>,
     replay_tx_thread_pool: &ThreadPool,
     slot_entries_load_result: (Vec<Entry>, u64, bool),
     timing: &mut ConfirmationTiming,
@@ -1800,6 +2039,20 @@ fn confirm_slot_entries(
             })
         })
         .collect::<result::Result<Vec<_>, _>>()?;
+    let (replay_entries, replay_num_txs) = maybe_override_replay_entries_with_mcp_execution_output(
+        slot,
+        bank,
+        skip_verification,
+        mcp_execution_output_blockstore,
+        replay_entries,
+        num_txs,
+    )?;
+    if replay_num_txs != num_txs {
+        debug!(
+            "slot {} replay transaction count overridden by MCP execution output: {} -> {}",
+            slot, num_txs, replay_num_txs
+        );
+    }
 
     let process_result = process_entries(
         bank,
@@ -1849,7 +2102,7 @@ fn confirm_slot_entries(
 
     progress.num_shreds += num_shreds;
     progress.num_entries += num_entries;
-    progress.num_txs += num_txs;
+    progress.num_txs += replay_num_txs;
     if let Some(last_entry_hash) = last_entry_hash {
         progress.last_entry = last_entry_hash;
     }
@@ -2561,6 +2814,10 @@ pub mod tests {
             },
         },
         agave_feature_set as feature_set,
+        agave_transaction_view::mcp_transaction::{
+            InstructionHeader as McpInstructionHeader, InstructionPayload as McpInstructionPayload,
+            LegacyHeader as McpLegacyHeader, McpTransaction, MCP_TX_LATEST_VERSION,
+        },
         assert_matches::assert_matches,
         rand::{thread_rng, Rng},
         solana_account::{AccountSharedData, WritableAccount},
@@ -2570,6 +2827,7 @@ pub mod tests {
         solana_hash::Hash,
         solana_instruction::{error::InstructionError, Instruction},
         solana_keypair::Keypair,
+        solana_message::VersionedMessage,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_program_runtime::declare_process_instruction,
         solana_pubkey::Pubkey,
@@ -2583,6 +2841,7 @@ pub mod tests {
                 SchedulingContext,
             },
         },
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_svm::transaction_processor::ExecutionRecordingConfig,
         solana_system_interface::error::SystemError,
@@ -5094,6 +5353,7 @@ pub mod tests {
         let replay_tx_thread_pool = create_thread_pool(1);
         confirm_slot_entries(
             &BankWithScheduler::new_without_scheduler(bank.clone()),
+            None,
             &replay_tx_thread_pool,
             (slot_entries, 0, slot_full),
             &mut ConfirmationTiming::default(),
@@ -5189,6 +5449,7 @@ pub mod tests {
 
         confirm_slot_entries(
             &bank,
+            None,
             &replay_tx_thread_pool,
             (vec![entry], 0, false),
             &mut timing,
@@ -5235,6 +5496,7 @@ pub mod tests {
 
         confirm_slot_entries(
             &bank,
+            None,
             &replay_tx_thread_pool,
             (vec![entry], 0, false),
             &mut timing,
@@ -5501,6 +5763,143 @@ pub mod tests {
         assert!(!should_use_mcp_two_pass_fees(true, &bank));
         bank.activate_feature(&feature_id);
         assert!(should_use_mcp_two_pass_fees(true, &bank));
+    }
+
+    fn encode_mcp_execution_output_for_tests(transactions: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
+        for tx in transactions {
+            bytes.extend_from_slice(&(tx.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(tx);
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_decode_mcp_execution_output_wire_transactions_roundtrip() {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(60_000, &dummy_leader_pubkey, 100);
+        let tx_a = bincode::serialize(&system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            genesis_config.hash(),
+        ))
+        .unwrap();
+        let tx_b = bincode::serialize(&system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            2,
+            genesis_config.hash(),
+        ))
+        .unwrap();
+        let encoded = encode_mcp_execution_output_for_tests(&[tx_a.clone(), tx_b.clone()]);
+        let decoded = decode_mcp_execution_output_wire_transactions(42, &encoded).unwrap();
+        assert_eq!(decoded, vec![tx_a, tx_b]);
+    }
+
+    #[test]
+    fn test_versioned_transaction_from_mcp_wire_bytes_accepts_legacy_mcp_format() {
+        let lifetime_specifier = [7u8; 32];
+        let mcp_transaction = McpTransaction {
+            version: MCP_TX_LATEST_VERSION,
+            legacy_header: McpLegacyHeader {
+                num_required_signatures: 1,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 0,
+            },
+            transaction_config_mask: 0,
+            lifetime_specifier,
+            addresses: vec![Pubkey::new_unique()],
+            config_values: vec![],
+            instruction_headers: vec![McpInstructionHeader {
+                program_account_index: 0,
+                num_instruction_accounts: 0,
+                num_instruction_data_bytes: 0,
+            }],
+            instruction_payloads: vec![McpInstructionPayload {
+                account_indexes: vec![],
+                instruction_data: vec![],
+            }],
+            signatures: vec![Signature::default()],
+        };
+        let legacy_wire = mcp_transaction.to_bytes()[1..].to_vec();
+
+        let versioned = versioned_transaction_from_mcp_wire_bytes(11, 0, &legacy_wire).unwrap();
+        let VersionedMessage::Legacy(message) = versioned.message else {
+            panic!("expected legacy message for MCP legacy wire format");
+        };
+        assert_eq!(
+            message.recent_blockhash,
+            Hash::new_from_array(lifetime_specifier)
+        );
+        assert_eq!(message.header.num_required_signatures, 1);
+        assert_eq!(message.account_keys.len(), 1);
+        assert_eq!(versioned.signatures.len(), 1);
+    }
+
+    #[test]
+    fn test_maybe_override_replay_entries_with_mcp_execution_output_replaces_transactions() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(60_000, &dummy_leader_pubkey, 100);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank = Arc::new(bank);
+        let bank = BankWithScheduler::new_without_scheduler(bank);
+        let slot = bank.slot();
+
+        let tx_a = system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        );
+        let tx_b = system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            2,
+            bank.last_blockhash(),
+        );
+        let encoded = encode_mcp_execution_output_for_tests(&[
+            bincode::serialize(&tx_a).unwrap(),
+            bincode::serialize(&tx_b).unwrap(),
+        ]);
+        blockstore.put_mcp_execution_output(slot, &encoded).unwrap();
+
+        let replay_entries = vec![ReplayEntry {
+            entry: EntryType::Transactions(vec![RuntimeTransaction::from_transaction_for_tests(
+                tx_a,
+            )]),
+            starting_index: 0,
+        }];
+
+        let (overridden_entries, overridden_num_txs) =
+            maybe_override_replay_entries_with_mcp_execution_output(
+                slot,
+                &bank,
+                false,
+                Some(&blockstore),
+                replay_entries,
+                1,
+            )
+            .unwrap();
+
+        assert_eq!(overridden_num_txs, 2);
+        assert_eq!(overridden_entries.len(), 1);
+        match &overridden_entries[0].entry {
+            EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 2),
+            EntryType::Tick(_) => panic!("expected transaction entry"),
+        }
     }
 
     #[test]

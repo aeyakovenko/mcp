@@ -238,7 +238,9 @@ impl Tvu {
 
         let (fetch_sender, fetch_receiver) = EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let (bls_packet_sender, bls_packet_receiver) = bounded(MAX_ALPENGLOW_PACKET_NUM);
-        let (mcp_control_message_sender, mcp_control_message_receiver) = unbounded();
+        const MCP_CONTROL_MESSAGE_CHANNEL_CAPACITY: usize = 10_000;
+        let (mcp_control_message_sender, mcp_control_message_receiver) =
+            bounded(MCP_CONTROL_MESSAGE_CHANNEL_CAPACITY);
 
         let repair_socket = Arc::new(repair_socket);
         let ancestor_hashes_socket = Arc::new(ancestor_hashes_socket);

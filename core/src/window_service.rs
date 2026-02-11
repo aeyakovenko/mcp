@@ -120,7 +120,8 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     let log_skip = |reason: &str| {
         trace!(
             "MCP consensus finalize skipped for slot {}: {}",
-            slot, reason
+            slot,
+            reason
         );
     };
     let Some(consensus_blocks) = mcp_consensus_blocks else {
@@ -1568,7 +1569,7 @@ mod test {
         let cluster_info =
             ClusterInfo::new(contact_info, leader.clone(), SocketAddrSpace::Unspecified);
         let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
-        maybe_finalize_and_broadcast_mcp_consensus_block(
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
             slot,
             &leader.pubkey(),
             &cluster_info,
@@ -1578,6 +1579,7 @@ mod test {
             Some(&consensus_blocks),
             None,
         );
+        assert!(!should_retry);
 
         let block_bytes = consensus_blocks
             .read()
@@ -1658,7 +1660,7 @@ mod test {
         let cluster_info =
             ClusterInfo::new(contact_info, leader.clone(), SocketAddrSpace::Unspecified);
         let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
-        maybe_finalize_and_broadcast_mcp_consensus_block(
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
             slot,
             &leader.pubkey(),
             &cluster_info,
@@ -1668,8 +1670,101 @@ mod test {
             Some(&consensus_blocks),
             None,
         );
+        assert!(should_retry);
 
         assert!(consensus_blocks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_maybe_finalize_consensus_block_uses_blockstore_delayed_bankhash() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Arc::new(Keypair::new());
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let delayed_slot = slot.saturating_sub(1);
+        let delayed_bankhash = Hash::new_unique();
+        blockstore.insert_bank_hash(delayed_slot, delayed_bankhash, false);
+
+        let proposer_schedule = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .expect("MCP proposer schedule missing");
+        let proposer_index = proposer_schedule
+            .iter()
+            .position(|pubkey| *pubkey == leader.pubkey())
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("leader should appear in MCP proposer schedule");
+        let relay_schedule = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .expect("MCP relay schedule missing");
+
+        let commitment = [31u8; 32];
+        let proposer_signature = leader.sign_message(&commitment);
+        let relay_indices: Vec<u32> = relay_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(relay_index, pubkey)| {
+                if *pubkey == leader.pubkey() {
+                    u32::try_from(relay_index).ok()
+                } else {
+                    None
+                }
+            })
+            .take(mcp::REQUIRED_ATTESTATIONS)
+            .collect();
+        assert_eq!(relay_indices.len(), mcp::REQUIRED_ATTESTATIONS);
+
+        for relay_index in relay_indices {
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries: vec![RelayAttestationEntry {
+                    proposer_index,
+                    commitment,
+                    proposer_signature,
+                }],
+                relay_signature: Signature::default(),
+            };
+            let signing_bytes = attestation.signing_bytes().unwrap();
+            attestation.relay_signature = leader.sign_message(&signing_bytes);
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation.to_bytes().unwrap())
+                .unwrap();
+        }
+
+        let contact_info = ContactInfo::new_localhost(&leader.pubkey(), timestamp());
+        let cluster_info =
+            ClusterInfo::new(contact_info, leader.clone(), SocketAddrSpace::Unspecified);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
+            slot,
+            &leader.pubkey(),
+            &cluster_info,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            None,
+        );
+        assert!(!should_retry);
+
+        let block_bytes = consensus_blocks
+            .read()
+            .unwrap()
+            .get(&slot)
+            .cloned()
+            .expect("consensus block should be finalized");
+        let block = ConsensusBlock::from_wire_bytes(&block_bytes).unwrap();
+        assert_eq!(block.delayed_bankhash, delayed_bankhash);
     }
 
     #[test]

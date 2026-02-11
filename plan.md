@@ -19,6 +19,31 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - Bankless recording caller wiring: `RESOLVED`
   - `PohRecorder::record_bankless` is called from production block recording when no working bank is installed.
   - Wiring point: `core/src/block_creation_loop.rs`.
+- Deterministic pending-slot retry + delayed bankhash sourcing: `RESOLVED`
+  - Leader finalization keeps retrying pending slots when prerequisites are temporarily unavailable (especially delayed bankhash).
+  - Replay keeps retrying pending consensus slots independently of fork-choice one-shot behavior.
+  - Delayed-slot bankhash source order is: `BankForks` delayed slot, then blockstore frozen bank hash.
+- Reconstruction-to-execution bridge reader: `PARTIAL`
+  - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
+  - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
+  - Current limitation: missing `McpExecutionOutput` still falls back to legacy entry-derived execution because output production is currently post-execution in replay; strict "must exist pre-execution" enforcement is blocked by pipeline ordering.
+
+## Audit Follow-Ups (from `audit.md`)
+
+- `A1` No silent lock-drop on critical MCP maps (`ConsensusBlock` cache, vote-gate input, included proposers):
+  - Required behavior: no `try_write`/silent `if let Ok(..)` on critical path; use explicit `match` and warn on poisoned locks.
+- `A2` Reconstruction-state poison semantics:
+  - Commitment mismatch must not permanently brick a slot/proposer reconstruction state; next shard insert must reset state.
+- `A3` Local-cluster MCP integration strictness:
+  - Issue-20 test must fail on timeout by default (no env-gated soft pass).
+  - Must read from live validator blockstore handles during runtime.
+- `A4` Coverage gap to close before final sign-off:
+  - Add multi-node MCP integration coverage for forwarding + two-pass replay-fee path (`block_verification=true` path).
+  - Test should enforce non-leader execution-output observation when 2+ validators are live, and degrade to artifact-only checks in port-constrained environments.
+- `A5` Rollout invariant:
+  - MCP CF additions require coordinated node upgrade before feature activation.
+- `A6` MCP control-message backpressure:
+  - TVU MCP control channel must be bounded and ingress must be non-blocking with explicit drop counters.
 
 ## Resolved Policy Decisions
 
@@ -149,6 +174,7 @@ Non-reusable for MCP wire correctness:
 
 - `ledger/src/leader_schedule.rs`:
   - Add helper that reuses stake-weighted leader sampling with domain-separated seed.
+  - `NUM_PROPOSERS`/`NUM_RELAYS` must be imported from `ledger::mcp` (single source of truth), not duplicated locally.
   - Domains:
     - proposer: `b"mcp:proposer"`
     - relay: `b"mcp:relay"`
@@ -264,6 +290,8 @@ Non-reusable for MCP wire correctness:
   - `0x01` RelayAttestation
   - `0x02` ConsensusBlock
 - Leader resolution reuses existing leader-schedule lookup and TVU QUIC contact info.
+- Dispatch retries are bounded and instrumented; dropped sends must increment explicit counters.
+- TVU MCP control ingress channel is bounded; fetch-stage enqueue is non-blocking with explicit full/disconnected drop counters.
 - Reject unknown type and oversize frame.
 
 ### 4.4 Relay shred broadcast
@@ -306,8 +334,8 @@ Non-reusable for MCP wire correctness:
 - `core/src/forwarding_stage.rs` + `core/src/next_leader.rs`:
   - MCP mode resolves proposer forward addresses using schedule cache and same lookahead slot-offset policy used today.
   - implement fanout behavior for both forwarding clients:
-    - `ConnectionCacheClient`
-    - `TpuClientNext`
+    - `ConnectionCacheClient`: `ForwardAddressGetter::get_non_vote_forwarding_addresses` resolves proposer addresses via `mcp_leader_schedule_cache`
+    - `TpuClientNext`: `get_forward_addresses_from_tpu_info` must also resolve MCP proposer addresses when `mcp_protocol_v1` is active, using the same schedule cache lookup
   - preserve non-MCP behavior unchanged.
 
 ### 5.4 Explicit non-change
@@ -352,7 +380,9 @@ When this node is leader for slot `s` and attestation quorum is present:
 3. build `AggregateAttestation`
 4. construct/sign `ConsensusBlock` with:
    - `consensus_meta` and authoritative `block_id` from Alpenglow consensus (`B3`)
-   - `delayed_bankhash` for the consensus-defined delayed slot; if unavailable locally, defer finalization and do not submit yet
+   - `delayed_bankhash` for the consensus-defined delayed slot
+   - delayed-bankhash lookup order: delayed-slot `BankForks` entry, then blockstore frozen bank hash
+   - if delayed-bankhash is unavailable, keep slot in a pending-finalization set and retry each insert loop until available or rooted-out
 
 Implementation point:
 - `core/src/window_service.rs::maybe_finalize_and_broadcast_mcp_consensus_block`
@@ -365,6 +395,7 @@ Implementation point:
 
 - `core/src/replay_stage.rs` + `core/src/mcp_replay.rs`:
   - refresh per-slot `VoteGateInput` from validated consensus-block bytes before MCP vote-gate evaluation.
+  - retain and retry pending MCP consensus slots in replay loop so evaluation does not depend on one-shot heaviest-fork selection timing.
 
 ### 6.5 Tests
 
@@ -383,7 +414,9 @@ Implementation point:
 
 - `core/src/mcp_replay.rs` (called from replay loop):
   1. verify leader signature and leader index for slot
-  2. verify delayed bankhash by consensus-defined delayed slot; if local delayed bankhash is unavailable, do not vote and keep block pending
+  2. verify delayed bankhash by consensus-defined delayed slot
+     - if consensus block for slot is missing, keep slot pending and retry
+     - if local delayed bankhash is unavailable, keep slot pending and retry
   3. verify relay/proposer signatures and ignore invalid entries
      - drop relay entries that become empty after proposer-signature filtering
   4. enforce global relay threshold using the same relay-count rule from Pass 6 (`>= REQUIRED_ATTESTATIONS`)
@@ -396,6 +429,7 @@ Implementation point:
 
 Staged rollout guard:
 - replay-stage vote-gate lookups must be non-consuming; repeated evaluations for the same slot must see identical gate input.
+- critical-path map updates must never silently fail on lock contention/poisoning; all failures are explicit and logged.
 
 ### 7.2 Reconstruction
 
@@ -403,6 +437,7 @@ Staged rollout guard:
   - load shreds from MCP CF
   - decode + re-encode + recompute commitment via ledger helper
   - discard proposer batch on commitment mismatch
+  - commitment mismatch may poison current attempt, but next shard insert must reset state (no permanent poison for slot/proposer)
   - decode payload tx list with dual-format `B1` parser (latest + legacy)
 
 ### 7.3 Ordering and execution
@@ -411,6 +446,7 @@ Staged rollout guard:
   - concat by proposer index
   - apply `ordering_fee` descending (highest fee first)
   - stable tie-break by concatenated position
+  - duplicate transactions are not deduplicated in v1; each occurrence executes independently in deterministic order
 
 - Replay execution wiring:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
@@ -438,10 +474,35 @@ Implementation wiring:
 - keep default non-MCP execution path unchanged
 - use explicit fee-mode control already plumbed through SVM (`skip_fee_collection`)
 - apply phase-A fee failures as execution filters for phase B
+- add explicit multi-node integration coverage for this path (single-node leader-only tests do not exercise `block_verification=true`)
+
+Reconstruction-to-execution bridge:
+- `McpExecutionOutput` stored via `put_mcp_execution_output()` MUST have a production reader
+- during block-verification replay (`block_verification=true`) when `mcp_protocol_v1` is active:
+  - read `McpExecutionOutput` for the slot from blockstore
+  - deserialize the MCP-ordered transaction list
+  - if present and valid, use it as canonical replay transaction input (replacing legacy entry-derived transaction entries)
+  - malformed `McpExecutionOutput` is a hard replay error for the slot
+  - if missing, fall back to legacy entry-derived replay input in v1 (temporary compatibility mode)
+- during leader execution (`block_verification=false`):
+  - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
+  - the leader's MCP execution output is still persisted for verification by other nodes
+- strict no-fallback mode requires moving `McpExecutionOutput` production to a pre-execution point; current replay pipeline produces it post-execution
 
 ### 7.4 Bank/block ID and vote
 
-- set `bank.block_id()` directly from the Alpenglow-consensus `block_id` carried in `ConsensusBlock` (`B3`).
+**DEFERRED — requires Alpenglow consensus integration.**
+
+- Per policy B3, `block_id` is defined by Alpenglow consensus and MCP MUST treat it as authoritative.
+- `ConsensusBlock` currently carries `delayed_bankhash` and `consensus_meta` but does NOT carry an explicit `block_id` field, because `block_id` derivation depends on Alpenglow consensus logic that is not yet integrated.
+- Prerequisites before this section can be implemented:
+  1. Alpenglow consensus provides a `block_id` value (or the derivation rule) in `ConsensusBlock.consensus_meta`
+  2. `Bank` exposes a setter for `block_id` that can be called after vote-gate validation
+  3. Vote submission path uses `block_id` instead of (or in addition to) legacy bank hash
+- Until prerequisites are met:
+  - validators vote on the legacy bank hash (derived from Pipeline A entry execution)
+  - `ConsensusBlock.consensus_meta` is opaque bytes, verified for presence but not interpreted
+  - MCP acts as a consensus overlay that gates voting, not as the authority for block identity
 - underlying vote wire format remains unchanged.
 
 ### 7.5 Empty result
@@ -455,6 +516,7 @@ Implementation wiring:
 - delayed bankhash availability gate: leader does not finalize and validator does not vote until delayed-slot bankhash is available locally
 - reconstruction mismatch rejection
 - deterministic ordering behavior
+- execution-output reader behavior: strict decode for malformed payloads; MCP-wire (latest/legacy) and standard-wire transactions decode into replay input
 - dual-format payload acceptance: mixed latest + legacy tx bytes decode correctly
 - producer serialization preference: latest format emitted when available, legacy retained otherwise
 - two-phase fees:
@@ -462,7 +524,13 @@ Implementation wiring:
   - cross-proposer cumulative payer accounting
   - nonce minimum-rent edge case
   - phase-B no re-deduction
-- end-to-end integration: small deterministic MCP slot flow
+- issue-20 single-node integration:
+  - strict timeout failure by default (no soft-pass env toggle)
+  - use live validator blockstore handles during runtime
+  - assert all three artifacts are observed: relay attestation, MCP shreds, MCP execution output
+- additional multi-node integration:
+  - verify proposer forwarding fanout and non-leader replay path for MCP two-pass fees when 2+ validators are live
+  - in constrained environments that cannot allocate enough validator UDP ports, skip only the non-leader assertion and keep artifact checks strict
 
 ---
 
@@ -474,7 +542,6 @@ New files:
 - `transaction-view/src/mcp_payload.rs`
 - `ledger/src/shred/mcp_shred.rs`
 - `core/src/mcp_replay.rs`
-- `core/src/mcp_quic.rs` (or equivalent small helper)
 
 Modified files:
 - `feature-set/src/lib.rs`
@@ -486,23 +553,25 @@ Modified files:
 - `ledger/src/blockstore.rs`
 - `ledger/src/blockstore/blockstore_purge.rs`
 - `turbine/src/sigverify_shreds.rs`
+- `turbine/src/retransmit_stage.rs`
+- `turbine/src/quic_endpoint.rs`
+- `turbine/src/broadcast_stage/standard_broadcast_run.rs`
+- `core/src/shred_fetch_stage.rs`
 - `core/src/window_service.rs`
-- `core/src/ed25519_sigverifier.rs`
-- `core/src/vortexor_receiver_adapter.rs`
 - `core/src/forwarding_stage.rs`
 - `core/src/next_leader.rs`
-- `gossip/src/contact_info.rs`
-- `gossip/src/node.rs`
-- `gossip/src/cluster_info.rs`
 - `core/src/tvu.rs`
-- `core/src/tpu.rs`
 - `core/src/replay_stage.rs`
+- `core/src/block_creation_loop.rs`
+- `core/src/mcp_vote_gate.rs`
+- `core/src/mcp_relay.rs`
+- `core/src/mcp_relay_submit.rs`
 - `ledger/src/blockstore_processor.rs`
 - `runtime/src/bank.rs` (MCP-specific execution entrypoint plumbing)
 - `transaction-view/src/lib.rs`
 - `transaction-view/src/mcp_transaction.rs`
 - `svm/src/transaction_processor.rs` (fee-mode plumbing)
-- `core/src/validator.rs` (socket wiring)
+- `local-cluster/tests/local_cluster.rs`
 
 ---
 
@@ -522,3 +591,9 @@ Modified files:
 - All threshold checks use ceil-threshold logic with `NUM_RELAYS=200`.
 - Replay and vote gate use the same attestation filtering rules.
 - Unknown versions, unsorted entries, duplicate entries, invalid signatures/proofs are rejected deterministically.
+- Delayed-bankhash gating is strict: no leader finalization or validator vote progression without local delayed-slot bankhash availability.
+- Pending-slot retry paths are deterministic in both window-service finalization and replay vote-gate evaluation.
+- Critical MCP shared-map lock failures are never silently ignored; failures are explicit and logged.
+- MCP control ingress is bounded; enqueue drops are explicit and counted.
+- `McpExecutionOutput` decode failures are explicit replay errors (never silently ignored).
+- Cross-crate MCP constants remain aligned via dedicated consistency tests.

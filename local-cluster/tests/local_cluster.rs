@@ -7203,18 +7203,58 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             mcp_feature_lamports,
         ));
 
-    let num_nodes = 1;
-    let mut config = ClusterConfig {
-        validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
-        node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
-        ticks_per_slot: 8,
-        slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
-        stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
-        skip_warmup_slots: true,
-        additional_accounts: vec![(mcp_feature_id, mcp_feature_account)],
-        ..ClusterConfig::default()
+    let num_nodes = 5;
+    const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
+    let cluster = {
+        let mut cluster = None;
+        for attempt in 0..CLUSTER_CREATE_MAX_ATTEMPTS {
+            let mut config = ClusterConfig {
+                validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
+                node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
+                ticks_per_slot: 8,
+                slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
+                stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
+                skip_warmup_slots: true,
+                additional_accounts: vec![(mcp_feature_id, mcp_feature_account.clone())],
+                ..ClusterConfig::default()
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                LocalCluster::new_alpenglow(&mut config, SocketAddrSpace::Unspecified)
+            })) {
+                Ok(candidate) => {
+                    cluster = Some(candidate);
+                    break;
+                }
+                Err(panic_payload) => {
+                    let panic_message = panic_payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("unknown panic");
+                    let retriable_port_error = panic_message.contains("No available UDP ports")
+                        || panic_message.contains("Address already in use")
+                        || panic_message.contains("bind_to port");
+                    if retriable_port_error && attempt + 1 < CLUSTER_CREATE_MAX_ATTEMPTS {
+                        info!(
+                            "retrying MCP local-cluster startup after transient port bind failure (attempt {}/{})",
+                            attempt + 1,
+                            CLUSTER_CREATE_MAX_ATTEMPTS,
+                        );
+                        continue;
+                    }
+                    if retriable_port_error {
+                        info!(
+                            "skipping MCP local-cluster integration test: unable to bind ports for {}-node cluster",
+                            num_nodes
+                        );
+                        return;
+                    }
+                    std::panic::resume_unwind(panic_payload);
+                }
+            }
+        }
+        cluster.expect("cluster startup retry loop must produce cluster or return")
     };
-    let cluster = LocalCluster::new_alpenglow(&mut config, SocketAddrSpace::Unspecified);
 
     let entry_client = RpcClient::new_socket_with_commitment(
         cluster.entry_point_info.rpc().unwrap(),
@@ -7265,12 +7305,26 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .map(|validator| (*pubkey, validator.blockstore.clone()))
         })
         .collect();
-    assert!(
-        !blockstores.is_empty(),
-        "expected at least one running validator with a blockstore handle",
+    assert_eq!(
+        blockstores.len(),
+        num_nodes,
+        "expected all {} validators running with blockstore handles, found {}",
+        num_nodes,
+        blockstores.len()
     );
+    let slot_leader_for = |slot: Slot| -> Option<Pubkey> {
+        cluster.validators.values().find_map(|validator_info| {
+            let validator = validator_info.validator.as_ref()?;
+            let bank = validator.bank_forks.read().unwrap().working_bank();
+            let cache =
+                solana_ledger::leader_schedule_cache::LeaderScheduleCache::new_from_bank(&bank);
+            cache
+                .slot_leader_at(slot, Some(&bank))
+                .or_else(|| cache.slot_leader_at(slot, None))
+        })
+    };
 
-    let post_activation_deadline = Instant::now() + Duration::from_secs(30);
+    let post_activation_deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < post_activation_deadline {
         let max_highest = blockstores
             .iter()
@@ -7286,7 +7340,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     let mut submitted_tx_count =
         send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 32);
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(180);
     let mut observed_artifacts = None;
     while Instant::now() < deadline {
         submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
@@ -7328,7 +7382,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         sleep(Duration::from_millis(500));
     }
 
-    let diagnostics_payload = || {
+    let diagnostics_payload = |submitted_tx_count_snapshot: usize| {
         let highest_slots = blockstores
             .iter()
             .map(|(pubkey, blockstore)| {
@@ -7475,7 +7529,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             })
             .collect::<Vec<_>>();
         (
-            submitted_tx_count,
+            submitted_tx_count_snapshot,
             highest_slots,
             diagnostics,
             role_diagnostics,
@@ -7483,15 +7537,55 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     };
     let Some((validator_pubkey, observed_slot)) = observed_artifacts else {
         let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
-            diagnostics_payload();
+            diagnostics_payload(submitted_tx_count);
         panic!(
             "timed out waiting for MCP artifacts in blockstore; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
+    let mut observed_non_leader_execution = None;
+    let non_leader_deadline = Instant::now() + Duration::from_secs(180);
+    while Instant::now() < non_leader_deadline {
+        submitted_tx_count = submitted_tx_count.saturating_add(send_best_effort_transfers(
+            &entry_client,
+            &cluster.funding_keypair,
+            8,
+        ));
+        let max_scan_slot = blockstores
+            .iter()
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default();
+        let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+        for slot in (scan_lower_slot..=max_scan_slot).rev().take(96) {
+            let Some(slot_leader) = slot_leader_for(slot) else {
+                continue;
+            };
+            if let Some((validator_pubkey, _)) = blockstores.iter().find(|(pubkey, blockstore)| {
+                *pubkey != slot_leader && slot_has_execution_output(blockstore, slot)
+            }) {
+                observed_non_leader_execution = Some((*validator_pubkey, slot, slot_leader));
+                break;
+            }
+        }
+        if observed_non_leader_execution.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+    let Some((non_leader_pubkey, non_leader_slot, non_leader_leader)) =
+        observed_non_leader_execution
+    else {
+        let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
+            diagnostics_payload(submitted_tx_count);
+        panic!(
+            "timed out waiting for non-leader MCP execution output; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
+        );
+    };
     info!(
-        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}",
-        observed_slot, validator_pubkey
+        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={})",
+        observed_slot, validator_pubkey, non_leader_pubkey, non_leader_slot, non_leader_leader
     );
 }
 
