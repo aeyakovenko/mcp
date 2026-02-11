@@ -13,6 +13,7 @@ edition = { workspace = true }
 agave-unstable-api = []
 
 [dependencies]
+agave-transaction-view = { workspace = true }
 agave-feature-set = { workspace = true }
 agave-votor = { workspace = true }
 agave-votor-messages = { workspace = true }
@@ -33,6 +34,7 @@ rustls = { workspace = true }
 solana-clock = { workspace = true }
 solana-cluster-type = { workspace = true }
 solana-entry = { workspace = true }
+solana-fee-structure = { workspace = true }
 solana-gossip = { workspace = true }
 solana-hash = { workspace = true }
 solana-keypair = { workspace = true }
@@ -50,6 +52,7 @@ solana-rayon-threadlimit = { workspace = true }
 solana-rpc = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
+solana-runtime-transaction = { workspace = true }
 solana-sha256-hasher = { workspace = true }
 solana-signature = { workspace = true }
 solana-signer = { workspace = true }
@@ -57,6 +60,7 @@ solana-streamer = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-time-utils = { workspace = true }
 solana-tls-utils = { workspace = true }
+solana-transaction = { workspace = true }
 solana-transaction-error = { workspace = true }
 static_assertions = { workspace = true }
 thiserror = { workspace = true }
@@ -72,6 +76,7 @@ assert_matches = { workspace = true }
 bencher = { workspace = true }
 bs58 = { workspace = true }
 conditional-mod = { workspace = true }
+solana-account = { workspace = true }
 solana-genesis-config = { workspace = true }
 solana-ledger = { workspace = true, features = ["agave-unstable-api","dev-context-only-utils"] }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }

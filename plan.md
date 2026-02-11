@@ -27,12 +27,17 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - `window_service` retries MCP consensus-block finalization until an authoritative `block_id` sidecar is locally available.
   - consensus-block ingestion rejects non-hash-sized `consensus_meta`.
   - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and defers bank completion if a cached consensus block lacks a usable sidecar.
-- Reconstruction-to-execution bridge reader: `PARTIAL`
+- Proposer admission + payload policy wiring: `RESOLVED`
+  - proposer-side admission enforces `NUM_PROPOSERS * base_fee` payer reservation before payload acceptance.
+  - payload dedup is signature-based within proposer payload construction.
+  - proposer output applies `B2` ordering before MCP payload encoding.
+- Reconstruction-to-execution bridge reader: `RESOLVED`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
   - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots.
   - if a consensus block is cached for the slot, replay defers while vote-gate is unsatisfied or while `McpExecutionOutput` is missing.
-  - Current limitation: before any consensus block is observed for the slot, v1 keeps compatibility fallback to legacy entry-derived replay input.
+  - if no consensus block is cached yet, replay stores an empty `McpExecutionOutput` placeholder and replays without legacy entry-transaction fallback.
+  - reconstruction can upgrade an empty placeholder to a non-empty MCP execution output once vote-gate and reconstruction data are available.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -594,11 +599,11 @@ Reconstruction-to-execution bridge:
   - if present and valid, use it as canonical replay transaction input (replacing legacy entry-derived transaction entries)
   - malformed `McpExecutionOutput` is a hard replay error for the slot
   - if missing and a consensus block has already been observed for the slot, replay is deferred (no fallback execution)
-  - if missing before consensus-block observation, v1 compatibility fallback uses legacy entry-derived replay input
+  - if missing before consensus-block observation, replay writes an empty `McpExecutionOutput` placeholder and executes no entry transactions for that slot
 - during leader execution (`block_verification=false`):
   - legacy banking-stage path continues unchanged; MCP reconstruction does not apply to the leader's own execution
   - the leader's MCP execution output is still persisted for verification by other nodes
-- full strict no-fallback for all MCP-active slots still requires pre-execution output production; current replay pipeline guarantees strictness only after consensus-block observation
+- strict no-fallback now holds for all MCP-active replay slots: replay input is always sourced from `McpExecutionOutput` (possibly empty), never from legacy entry transactions.
 
 ### 7.4 Bank/block ID and vote
 
