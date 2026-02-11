@@ -15,6 +15,8 @@ pub const CODING_SHREDS_PER_FEC_BLOCK: usize = 160;
 
 /// Data bytes carried by each MCP shred.
 pub const SHRED_DATA_BYTES: usize = 863;
+/// QUIC control payload cap used by MCP control message codecs.
+pub const MAX_QUIC_CONTROL_PAYLOAD_BYTES: usize = 512 * 1024;
 
 /// Threshold ratios in rational form to keep compile-time arithmetic exact.
 pub const ATTESTATION_THRESHOLD_NUMERATOR: usize = 3;
@@ -46,19 +48,21 @@ pub const REQUIRED_RECONSTRUCTION: usize = ceil_threshold_count(
 /// We use the lower of the two spec expressions:
 /// - NUM_RELAYS * SHRED_DATA_BYTES
 /// - DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES
-///
-/// For MCP v1 constants, `DATA_SHREDS_PER_FEC_BLOCK (40)` is always lower than
-/// `NUM_RELAYS (200)`, so the RS-capacity expression is the binding limit.
-pub const MAX_PROPOSER_PAYLOAD: usize = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES;
+pub const MAX_PROPOSER_PAYLOAD: usize =
+    if NUM_RELAYS * SHRED_DATA_BYTES < DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES {
+        NUM_RELAYS * SHRED_DATA_BYTES
+    } else {
+        DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES
+    };
 
+/// Compatibility alias retained for existing MCP helpers.
+pub const MAX_PAYLOAD_BYTES: usize = MAX_PROPOSER_PAYLOAD;
 /// Expected witness length for MCP Merkle proofs.
 pub const MCP_WITNESS_LEN: usize = ceil_log2(NUM_RELAYS);
 
 /// ceil((numerator / denominator) * total), integer-only.
 pub const fn ceil_threshold_count(numerator: usize, denominator: usize, total: usize) -> usize {
-    if denominator == 0 {
-        return 0;
-    }
+    assert!(denominator != 0, "threshold denominator must be non-zero");
     // ceil(a / b) for integers is (a + b - 1) / b.
     let scaled = numerator * total;
     (scaled + denominator - 1) / denominator
@@ -96,6 +100,7 @@ mod tests {
         assert_eq!(REQUIRED_ATTESTATIONS, 120);
         assert_eq!(REQUIRED_INCLUSIONS, 80);
         assert_eq!(REQUIRED_RECONSTRUCTION, 40);
+        assert_eq!(REQUIRED_RECONSTRUCTION, DATA_SHREDS_PER_FEC_BLOCK);
     }
 
     #[test]
@@ -103,11 +108,30 @@ mod tests {
         let upper_spec_bound = NUM_RELAYS * SHRED_DATA_BYTES;
         let rs_capacity_bound = DATA_SHREDS_PER_FEC_BLOCK * SHRED_DATA_BYTES;
         assert_eq!(MAX_PROPOSER_PAYLOAD, rs_capacity_bound);
+        assert_eq!(MAX_PAYLOAD_BYTES, MAX_PROPOSER_PAYLOAD);
         assert!(MAX_PROPOSER_PAYLOAD <= upper_spec_bound);
     }
 
     #[test]
     fn test_witness_len_for_num_relays() {
         assert_eq!(MCP_WITNESS_LEN, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold denominator must be non-zero")]
+    fn test_threshold_count_guard_zero_denominator() {
+        let _ = ceil_threshold_count(3, 0, 200);
+    }
+
+    #[test]
+    fn test_ceil_log2_edge_cases() {
+        assert_eq!(ceil_log2(0), 0);
+        assert_eq!(ceil_log2(1), 0);
+        assert_eq!(ceil_log2(2), 1);
+    }
+
+    #[test]
+    fn test_threshold_count_handles_ratio_above_one() {
+        assert_eq!(ceil_threshold_count(6, 5, 200), 240);
     }
 }

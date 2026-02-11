@@ -199,6 +199,8 @@ impl Rocks {
             new_cf_descriptor::<columns::AlternateIndex>(options, oldest_slot),
             new_cf_descriptor::<columns::AlternateShredData>(options, oldest_slot),
             new_cf_descriptor::<columns::AlternateMerkleRootMeta>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpShredData>(options, oldest_slot),
+            new_cf_descriptor::<columns::McpRelayAttestation>(options, oldest_slot),
             new_cf_descriptor::<columns::McpExecutionOutput>(options, oldest_slot),
             new_cf_descriptor::<columns::ParentMeta>(options, oldest_slot),
             new_cf_descriptor::<columns::DoubleMerkleMeta>(options, oldest_slot),
@@ -250,7 +252,7 @@ impl Rocks {
         cf_descriptors
     }
 
-    const fn columns() -> [&'static str; 28] {
+    const fn columns() -> [&'static str; 30] {
         [
             columns::ErasureMeta::NAME,
             columns::DeadSlots::NAME,
@@ -277,6 +279,10 @@ impl Rocks {
             columns::AlternateIndex::NAME,
             columns::AlternateShredData::NAME,
             columns::AlternateMerkleRootMeta::NAME,
+            // MCP CFs must be present on all validators before feature activation.
+            // Mixed-version clusters should not activate mcp_protocol_v1.
+            columns::McpShredData::NAME,
+            columns::McpRelayAttestation::NAME,
             columns::McpExecutionOutput::NAME,
             columns::ParentMeta::NAME,
             columns::DoubleMerkleMeta::NAME,
