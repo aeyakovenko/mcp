@@ -1049,7 +1049,7 @@ impl StandardBroadcastRun {
                 Ok(messages) => messages,
                 Err(err) => {
                     warn!("MCP proposer dispatch skipped for slot {slot}: {err}");
-                    return;
+                    continue;
                 }
             };
             for (relay_target, message) in relay_targets.iter().zip(messages.iter()) {
