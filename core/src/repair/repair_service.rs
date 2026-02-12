@@ -160,6 +160,7 @@ impl RepairMetrics {
 #[derive(Default, Debug)]
 pub struct RepairStats {
     pub shred: RepairStatsGroup,
+    pub mcp_shred: RepairStatsGroup,
     pub highest_shred: RepairStatsGroup,
     pub orphan: RepairStatsGroup,
     pub shred_for_block_id: RepairStatsGroup,
@@ -170,6 +171,7 @@ pub struct RepairStats {
 impl RepairStats {
     fn report(&self) {
         let repair_total = self.shred.count
+            + self.mcp_shred.count
             + self.highest_shred.count
             + self.orphan.count
             + self.shred_for_block_id.count;
@@ -177,6 +179,7 @@ impl RepairStats {
             .shred
             .slot_pubkeys
             .iter()
+            .chain(self.mcp_shred.slot_pubkeys.iter())
             .chain(self.highest_shred.slot_pubkeys.iter())
             .chain(self.orphan.slot_pubkeys.iter())
             .chain(self.shred_for_block_id.slot_pubkeys.iter())
@@ -189,6 +192,7 @@ impl RepairStats {
                 "repair_service-my_requests",
                 ("repair-total", repair_total, i64),
                 ("shred-count", self.shred.count, i64),
+                ("mcp-shred-count", self.mcp_shred.count, i64),
                 ("highest-shred-count", self.highest_shred.count, i64),
                 ("orphan-count", self.orphan.count, i64),
                 ("shred-for-block-id-count", self.shred_for_block_id.count, i64),
@@ -1051,6 +1055,49 @@ impl RepairService {
         }
     }
 
+    pub fn request_repair_for_mcp_shred_from_peer(
+        cluster_info: Arc<ClusterInfo>,
+        cluster_slots: Arc<ClusterSlots>,
+        pubkey: Option<Pubkey>,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+        repair_socket: &UdpSocket,
+        outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
+    ) {
+        let mut repair_peers = vec![];
+
+        if let Some(pubkey) = pubkey {
+            let peer_repair_addr =
+                cluster_info.lookup_contact_info(&pubkey, |node| node.serve_repair(Protocol::UDP));
+            if let Some(Some(peer_repair_addr)) = peer_repair_addr {
+                trace!("Repair peer {pubkey} has valid repair socket: {peer_repair_addr:?}");
+                repair_peers.push((pubkey, peer_repair_addr));
+            }
+        };
+
+        if repair_peers.is_empty() {
+            debug!(
+                "No pubkey was provided or no valid repair socket was found. Sampling a set of \
+                 repair peers instead."
+            );
+            repair_peers = Self::get_repair_peers(cluster_info.clone(), cluster_slots, slot);
+        }
+
+        for (pubkey, peer_repair_addr) in repair_peers {
+            Self::request_repair_for_mcp_shred_from_address(
+                cluster_info.clone(),
+                pubkey,
+                peer_repair_addr,
+                slot,
+                proposer_index,
+                shred_index,
+                repair_socket,
+                outstanding_repair_requests.clone(),
+            );
+        }
+    }
+
     fn request_repair_for_shred_from_address(
         cluster_info: Arc<ClusterInfo>,
         pubkey: Pubkey,
@@ -1088,6 +1135,48 @@ impl RepairService {
             }
             Err(SendPktsError::IoError(err, _num_failed)) => {
                 error!("batch_send failed to send packet - error = {err:?}");
+            }
+        }
+    }
+
+    fn request_repair_for_mcp_shred_from_address(
+        cluster_info: Arc<ClusterInfo>,
+        pubkey: Pubkey,
+        address: SocketAddr,
+        slot: u64,
+        proposer_index: u32,
+        shred_index: u32,
+        repair_socket: &UdpSocket,
+        outstanding_repair_requests: Arc<RwLock<OutstandingShredRepairs>>,
+    ) {
+        let identity_keypair = cluster_info.keypair();
+        let repair_request = ShredRepairType::McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let nonce = outstanding_repair_requests
+            .write()
+            .unwrap()
+            .add_request(repair_request, timestamp());
+
+        let header = RepairRequestHeader::new(cluster_info.id(), pubkey, timestamp(), nonce);
+        let request_proto = RepairProtocol::McpWindowIndex {
+            header,
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let packet_buf =
+            ServeRepair::repair_proto_to_bytes(&request_proto, &identity_keypair).unwrap();
+        let reqs = [(&packet_buf, address)];
+
+        match batch_send(repair_socket, reqs) {
+            Ok(()) => {
+                debug!("successfully sent MCP repair request to {pubkey} / {address}!");
+            }
+            Err(SendPktsError::IoError(err, _num_failed)) => {
+                error!("batch_send failed to send MCP repair packet - error = {err:?}");
             }
         }
     }

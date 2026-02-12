@@ -402,12 +402,18 @@ fn verify_repair_nonce(
     outstanding_repair_requests: &mut OutstandingShredRepairs,
 ) -> bool {
     debug_assert!(packet.meta().flags.contains(PacketFlags::REPAIR));
-    let Some((shred, Some(nonce))) = shred::layout::get_shred_and_repair_nonce(packet) else {
+    let Some((shred, nonce)) = shred::layout::get_shred_and_repair_nonce(packet) else {
         return false;
     };
-    outstanding_repair_requests
-        .register_response(nonce, shred, now, |_| ())
-        .is_some()
+    match nonce {
+        Some(nonce) => outstanding_repair_requests
+            .register_response(nonce, shred, now, |_| ())
+            .is_some(),
+        None if is_mcp_shred_bytes(shred) => outstanding_repair_requests
+            .register_response_without_nonce(shred, now, |_| ())
+            .is_some(),
+        None => false,
+    }
 }
 
 fn is_active_mcp_shred_packet(
@@ -521,11 +527,14 @@ fn check_feature_activation(
 mod tests {
     use {
         super::*,
+        crate::repair::serve_repair::ShredRepairType,
         crossbeam_channel::unbounded,
         solana_ledger::shred::mcp_shred::{
-            MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+            McpShred, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
         },
         solana_packet::PacketFlags,
+        solana_signature::Signature,
+        solana_time_utils::timestamp,
         std::thread,
     };
 
@@ -633,6 +642,39 @@ mod tests {
             PacketRef::Packet(&packet),
             &feature_set,
             &epoch_schedule,
+        ));
+    }
+
+    #[test]
+    fn test_verify_repair_nonce_accepts_mcp_shred_without_nonce() {
+        let now = timestamp();
+        let mut outstanding = OutstandingShredRepairs::default();
+        let request = ShredRepairType::McpShred {
+            slot: 55,
+            proposer_index: 3,
+            shred_index: 4,
+        };
+        outstanding.add_request(request, now);
+
+        let mcp_shred = McpShred {
+            slot: 55,
+            proposer_index: 3,
+            shred_index: 4,
+            commitment: [0u8; 32],
+            shred_data: [0u8; MCP_SHRED_DATA_BYTES],
+            witness: [[0u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        let mcp_bytes = mcp_shred.to_bytes();
+        let mut packet = solana_perf::packet::Packet::default();
+        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet.meta_mut().size = mcp_bytes.len();
+        packet.meta_mut().flags |= PacketFlags::REPAIR;
+
+        assert!(verify_repair_nonce(
+            PacketRef::Packet(&packet),
+            now,
+            &mut outstanding
         ));
     }
 }
