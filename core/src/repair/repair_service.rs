@@ -700,7 +700,10 @@ impl RepairService {
                             ) {
                                 repairs.push(repair_request);
                             }
-                            break;
+                            if repairs.len() >= max_new_repairs {
+                                break;
+                            }
+                            continue;
                         }
                         Err(err) => {
                             debug!(
@@ -1506,7 +1509,7 @@ mod test {
                 make_chaining_slot_entries, make_many_slot_entries, make_slot_entries, Blockstore,
             },
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
-            get_tmp_ledger_path_auto_delete,
+            get_tmp_ledger_path_auto_delete, mcp,
             mcp_relay_attestation::{RelayAttestation, RelayAttestationEntry},
             shred::max_ticks_per_n_shreds,
         },
@@ -1669,14 +1672,14 @@ mod test {
             MAX_REPAIR_LENGTH,
             &mut outstanding_repairs,
         );
-        assert_eq!(
-            repairs,
-            vec![ShredRepairType::McpShred {
+        let expected: Vec<_> = (0..mcp::NUM_RELAYS as u32)
+            .map(|shred_index| ShredRepairType::McpShred {
                 slot,
                 proposer_index,
-                shred_index: 0,
-            }]
-        );
+                shred_index,
+            })
+            .collect();
+        assert_eq!(repairs, expected);
 
         let duplicate_repairs = RepairService::identify_mcp_repairs(
             &blockstore,
@@ -1720,14 +1723,14 @@ mod test {
             MAX_REPAIR_LENGTH,
             &mut HashMap::default(),
         );
-        assert_eq!(
-            repairs,
-            vec![ShredRepairType::McpShred {
+        let expected: Vec<_> = (0..mcp::NUM_RELAYS as u32)
+            .map(|shred_index| ShredRepairType::McpShred {
                 slot: pending_slot,
                 proposer_index,
-                shred_index: 0,
-            }]
-        );
+                shred_index,
+            })
+            .collect();
+        assert_eq!(repairs, expected);
     }
 
     #[test]

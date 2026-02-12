@@ -66,7 +66,6 @@ use {
 type DuplicateSlotSender = Sender<Slot>;
 pub(crate) type DuplicateSlotReceiver = Receiver<Slot>;
 const MCP_CONTROL_MSG_CONSENSUS_BLOCK: u8 = 0x02;
-const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
 const MCP_CONTROL_SEND_RETRY_LIMIT: usize = 3;
 
 fn relay_indices_for_pubkey(relays: &[Pubkey], local_pubkey: &Pubkey) -> Vec<u32> {
@@ -323,7 +322,7 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
 
         let inserted = match consensus_blocks.write() {
             Ok(mut blocks) => {
-                let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+                let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
                 blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
                 if let Some(existing) = blocks.get(&slot) {
                     if existing != &consensus_bytes {
@@ -1018,7 +1017,7 @@ fn ingest_mcp_control_message(
                 match consensus_blocks.write() {
                     Ok(mut consensus_blocks) => {
                         let min_slot =
-                            root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+                            root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
                         consensus_blocks.retain(|slot, _| *slot >= min_slot);
                         if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
                             if existing != payload {
