@@ -4035,7 +4035,8 @@ impl ReplayStage {
             .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
             .is_some_and(|activated_slot| bank.slot() >= activated_slot)
             && Self::has_mcp_consensus_block_for_slot(bank.slot(), mcp_consensus_blocks)
-            && Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks).is_none()
+            && Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks)
+                .is_none()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5631,10 +5632,12 @@ pub(crate) mod tests {
             .clone_without_scheduler();
 
         let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
-        assert!(!ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
-            replay_bank.as_ref(),
-            &mcp_consensus_blocks,
-        ));
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
 
         let aggregate_bytes = AggregateAttestation::new_canonical(1, 0, vec![])
             .unwrap()
@@ -5654,10 +5657,12 @@ pub(crate) mod tests {
             .unwrap()
             .insert(1, invalid_consensus_block.to_wire_bytes().unwrap());
 
-        assert!(ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
-            replay_bank.as_ref(),
-            &mcp_consensus_blocks,
-        ));
+        assert!(
+            ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
 
         let block_id = Hash::new_unique();
         let mut consensus_block = ConsensusBlock::new_unsigned(
@@ -5674,10 +5679,12 @@ pub(crate) mod tests {
             .unwrap()
             .insert(1, consensus_block.to_wire_bytes().unwrap());
 
-        assert!(!ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
-            replay_bank.as_ref(),
-            &mcp_consensus_blocks,
-        ));
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
     }
 
     #[test]
@@ -5698,10 +5705,12 @@ pub(crate) mod tests {
             .clone_without_scheduler();
 
         let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
-        assert!(!ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
-            replay_bank.as_ref(),
-            &mcp_consensus_blocks,
-        ));
+        assert!(
+            !ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+                replay_bank.as_ref(),
+                &mcp_consensus_blocks,
+            )
+        );
     }
 
     #[test]

@@ -114,13 +114,8 @@ pub trait RepairHandler {
         shred_index: u32,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let packet = self.repair_response_packet_mcp(
-            slot,
-            proposer_index,
-            shred_index,
-            from_addr,
-            nonce,
-        )?;
+        let packet =
+            self.repair_response_packet_mcp(slot, proposer_index, shred_index, from_addr, nonce)?;
         Some(
             PinnedPacketBatch::new_unpinned_with_recycler_data(
                 recycler,

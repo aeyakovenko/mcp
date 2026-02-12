@@ -1566,6 +1566,17 @@ pub fn confirm_slot(
         }
         load_result
     }?;
+    // Snapshot the execution output once per slot-replay call to avoid
+    // per-component source changes within the same slot.
+    let mcp_execution_output = if bank
+        .feature_set
+        .activated_slot(&feature_set::mcp_protocol_v1::id())
+        .is_some_and(|activated_slot| slot >= activated_slot)
+    {
+        blockstore.get_mcp_execution_output(slot)?
+    } else {
+        None
+    };
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1612,7 +1623,7 @@ pub fn confirm_slot(
 
                 confirm_slot_entries(
                     bank,
-                    Some(blockstore),
+                    mcp_execution_output.as_deref(),
                     replay_tx_thread_pool,
                     (entries, num_shreds as u64, slot_full),
                     timing,
@@ -1763,9 +1774,9 @@ fn versioned_transaction_from_mcp_wire_bytes(
     slot: Slot,
     tx_index: usize,
     tx_wire_bytes: &[u8],
-) -> result::Result<VersionedTransaction, BlockstoreProcessorError> {
+) -> result::Result<(VersionedTransaction, Option<(u64, u64)>), BlockstoreProcessorError> {
     if let Ok(versioned_tx) = bincode::deserialize::<VersionedTransaction>(tx_wire_bytes) {
-        return Ok(versioned_tx);
+        return Ok((versioned_tx, None));
     }
 
     let mcp_transaction = McpTransaction::from_bytes_compat(tx_wire_bytes).map_err(|err| {
@@ -1776,14 +1787,21 @@ fn versioned_transaction_from_mcp_wire_bytes(
             ),
         }
     })?;
-    Ok(mcp_transaction_to_versioned_transaction(mcp_transaction))
+    let mcp_fee_components = Some((
+        u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
+        mcp_transaction.ordering_fee_with_fallback(),
+    ));
+    Ok((
+        mcp_transaction_to_versioned_transaction(mcp_transaction),
+        mcp_fee_components,
+    ))
 }
 
 fn maybe_override_replay_entries_with_mcp_execution_output(
     slot: Slot,
     bank: &BankWithScheduler,
     skip_verification: bool,
-    blockstore: Option<&Blockstore>,
+    mcp_execution_output: Option<&[u8]>,
     replay_entries: Vec<ReplayEntry>,
     default_num_txs: usize,
 ) -> result::Result<(Vec<ReplayEntry>, usize), BlockstoreProcessorError> {
@@ -1795,10 +1813,7 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         return Ok((replay_entries, default_num_txs));
     }
 
-    let Some(blockstore) = blockstore else {
-        return Ok((replay_entries, default_num_txs));
-    };
-    let Some(encoded_output) = blockstore.get_mcp_execution_output(slot)? else {
+    let Some(encoded_output) = mcp_execution_output else {
         return Ok((replay_entries, default_num_txs));
     };
 
@@ -1813,15 +1828,18 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         .iter()
         .enumerate()
         .map(|(tx_index, tx_wire_bytes)| {
-            let versioned_tx =
+            let (versioned_tx, mcp_fee_components) =
                 versioned_transaction_from_mcp_wire_bytes(slot, tx_index, tx_wire_bytes)?;
-            bank.verify_transaction(versioned_tx, verification_mode)
+            let mut transaction = bank
+                .verify_transaction(versioned_tx, verification_mode)
                 .map_err(|err| BlockstoreProcessorError::InvalidMcpExecutionOutput {
                     slot,
                     reason: format!("tx[{tx_index}] failed bank.verify_transaction: {err:?}"),
-                })
+                })?;
+            transaction.set_mcp_fee_components(mcp_fee_components);
+            Ok(transaction)
         })
-        .collect::<result::Result<Vec<_>, _>>()?;
+        .collect::<result::Result<Vec<_>, BlockstoreProcessorError>>()?;
 
     if bank.vote_only_bank()
         && transactions
@@ -1902,7 +1920,7 @@ fn override_replay_entries_with_transactions(
 #[allow(clippy::too_many_arguments)]
 fn confirm_slot_entries(
     bank: &BankWithScheduler,
-    mcp_execution_output_blockstore: Option<&Blockstore>,
+    mcp_execution_output: Option<&[u8]>,
     replay_tx_thread_pool: &ThreadPool,
     slot_entries_load_result: (Vec<Entry>, u64, bool),
     timing: &mut ConfirmationTiming,
@@ -2065,7 +2083,7 @@ fn confirm_slot_entries(
         slot,
         bank,
         skip_verification,
-        mcp_execution_output_blockstore,
+        mcp_execution_output,
         replay_entries,
         num_txs,
     )?;
@@ -5919,7 +5937,9 @@ pub mod tests {
         };
         let legacy_wire = mcp_transaction.to_bytes()[1..].to_vec();
 
-        let versioned = versioned_transaction_from_mcp_wire_bytes(11, 0, &legacy_wire).unwrap();
+        let (versioned, mcp_fee_components) =
+            versioned_transaction_from_mcp_wire_bytes(11, 0, &legacy_wire).unwrap();
+        assert_eq!(mcp_fee_components, Some((0, 0)));
         let VersionedMessage::Legacy(message) = versioned.message else {
             panic!("expected legacy message for MCP legacy wire format");
         };
@@ -5930,6 +5950,40 @@ pub mod tests {
         assert_eq!(message.header.num_required_signatures, 1);
         assert_eq!(message.account_keys.len(), 1);
         assert_eq!(versioned.signatures.len(), 1);
+    }
+
+    #[test]
+    fn test_versioned_transaction_from_mcp_wire_bytes_keeps_mcp_fee_components() {
+        let lifetime_specifier = [9u8; 32];
+        let mcp_transaction = McpTransaction {
+            version: MCP_TX_LATEST_VERSION,
+            legacy_header: McpLegacyHeader {
+                num_required_signatures: 1,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 0,
+            },
+            transaction_config_mask: (1u32
+                << agave_transaction_view::mcp_transaction::MCP_TX_CONFIG_BIT_INCLUSION_FEE)
+                | (1u32 << agave_transaction_view::mcp_transaction::MCP_TX_CONFIG_BIT_ORDERING_FEE),
+            lifetime_specifier,
+            addresses: vec![Pubkey::new_unique()],
+            config_values: vec![17, 33],
+            instruction_headers: vec![McpInstructionHeader {
+                program_account_index: 0,
+                num_instruction_accounts: 0,
+                num_instruction_data_bytes: 0,
+            }],
+            instruction_payloads: vec![McpInstructionPayload {
+                account_indexes: vec![],
+                instruction_data: vec![],
+            }],
+            signatures: vec![Signature::default()],
+        };
+        let legacy_wire = mcp_transaction.to_bytes()[1..].to_vec();
+
+        let (_versioned, mcp_fee_components) =
+            versioned_transaction_from_mcp_wire_bytes(12, 0, &legacy_wire).unwrap();
+        assert_eq!(mcp_fee_components, Some((17, 33)));
     }
 
     #[test]
@@ -5979,7 +6033,7 @@ pub mod tests {
                 slot,
                 &bank,
                 false,
-                Some(&blockstore),
+                Some(encoded.as_slice()),
                 replay_entries,
                 1,
             )

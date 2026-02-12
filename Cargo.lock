@@ -445,6 +445,7 @@ dependencies = [
  "agave-transaction-view",
  "bincode",
  "criterion",
+ "solana-compute-budget-instruction",
  "solana-hash",
  "solana-instruction",
  "solana-keypair",

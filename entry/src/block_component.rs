@@ -507,7 +507,8 @@ impl BlockComponent {
     }
 
     pub fn infer_is_entry_batch(data: &[u8]) -> Option<bool> {
-        let bytes: [u8; Self::ENTRY_COUNT_SIZE] = data.get(..Self::ENTRY_COUNT_SIZE)?.try_into().ok()?;
+        let bytes: [u8; Self::ENTRY_COUNT_SIZE] =
+            data.get(..Self::ENTRY_COUNT_SIZE)?.try_into().ok()?;
         let entry_count = u64::from_le_bytes(bytes);
         Some(entry_count != 0 || data.len() == Self::ENTRY_COUNT_SIZE)
     }
@@ -621,12 +622,8 @@ mod tests {
             block_user_agent: b"test-agent".to_vec(),
             final_cert: Some(FinalCertificate::new_for_tests()),
             skip_reward_cert: Some(
-                SkipRewardCertificate::try_new(
-                    1234,
-                    BLSSignatureCompressed::default(),
-                    vec![4, 2],
-                )
-                .unwrap(),
+                SkipRewardCertificate::try_new(1234, BLSSignatureCompressed::default(), vec![4, 2])
+                    .unwrap(),
             ),
             notar_reward_cert: Some(
                 NotarRewardCertificate::try_new(
@@ -717,8 +714,14 @@ mod tests {
         ));
         let marker_bytes = wincode::serialize(&marker).unwrap();
         assert!(marker_bytes.len() > BlockComponent::ENTRY_COUNT_SIZE);
-        assert_eq!(BlockComponent::infer_is_entry_batch(&marker_bytes), Some(false));
-        assert_eq!(BlockComponent::infer_is_block_marker(&marker_bytes), Some(true));
+        assert_eq!(
+            BlockComponent::infer_is_entry_batch(&marker_bytes),
+            Some(false)
+        );
+        assert_eq!(
+            BlockComponent::infer_is_block_marker(&marker_bytes),
+            Some(true)
+        );
     }
 
     #[test]
