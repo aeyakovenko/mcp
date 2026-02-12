@@ -250,4 +250,16 @@ mod tests {
         let decoded = decode_payload(&mut shards, payload.len()).unwrap();
         assert_eq!(decoded, payload);
     }
+
+    #[test]
+    fn test_reconstruction_from_data_shards_only() {
+        let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        let encoded = encode_fec_set(&payload).unwrap();
+        let mut shards = vec![None; MCP_NUM_RELAYS];
+        for src in 0..MCP_DATA_SHREDS_PER_FEC_BLOCK {
+            shards[src] = Some(encoded[src]);
+        }
+        let decoded = decode_payload(&mut shards, payload.len()).unwrap();
+        assert_eq!(decoded, payload);
+    }
 }

@@ -320,4 +320,61 @@ mod tests {
         assert_eq!(root, single_root);
         assert_eq!(witnesses[2].as_slice(), single_witness.as_slice());
     }
+
+    #[test]
+    fn test_domain_separation_formulas_for_leaf_and_internal_node_hashes() {
+        let single = vec![[11u8; 4]];
+        let single_root = commitment_root(7, 3, &single).unwrap();
+        let expected_leaf = hashv(&[
+            &LEAF_DOMAIN,
+            &7u64.to_le_bytes(),
+            &3u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &single[0],
+        ])
+        .to_bytes();
+        assert_eq!(single_root, expected_leaf);
+
+        let pair = vec![[1u8; 4], [2u8; 4]];
+        let pair_root = commitment_root(9, 4, &pair).unwrap();
+        let left_leaf = hashv(&[
+            &LEAF_DOMAIN,
+            &9u64.to_le_bytes(),
+            &4u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &pair[0],
+        ])
+        .to_bytes();
+        let right_leaf = hashv(&[
+            &LEAF_DOMAIN,
+            &9u64.to_le_bytes(),
+            &4u32.to_le_bytes(),
+            &1u32.to_le_bytes(),
+            &pair[1],
+        ])
+        .to_bytes();
+        let expected_pair_root = hashv(&[&NODE_DOMAIN, &left_leaf, &right_leaf]).to_bytes();
+        assert_eq!(pair_root, expected_pair_root);
+    }
+
+    #[test]
+    fn test_verify_witness_rejects_tampered_shred_data() {
+        let shreds = vec![[9u8; 4], [8u8; 4], [7u8; 4], [6u8; 4]];
+        let leaf_index = 1usize;
+        let (root, witness) = witness_for_leaf(5, 1, &shreds, leaf_index).unwrap();
+        let mut tampered = shreds[leaf_index];
+        tampered[0] ^= 1;
+        assert!(
+            !verify_witness(
+                5,
+                1,
+                leaf_index as u32,
+                &tampered,
+                &witness,
+                &root,
+                shreds.len(),
+            )
+            .unwrap()
+        );
+    }
 }
