@@ -2,54 +2,61 @@
 
 Date: 2026-02-12
 Branch: `master`
-Scope: confirm current audit concerns, land fixes on `master`, and re-validate with targeted tests.
+Commit: `65568a2a79` (plus local uncommitted fixes in this pass)
+Scope: re-check `audit.md` concerns, confirm in code, land fixes, and re-validate local-cluster MCP integration.
 
-## Verdict
+## Executive Summary
 
-- MCP implementation remains feature-complete vs `plan.md`.
-- Confirmed audit gaps addressed in this pass: 4.
-- Remaining open implementation concerns: 2 (unchanged, intentionally tracked).
+All previously reported critical blockers in `audit.md` are now fixed on `master`:
 
-## Confirmed Concerns and Status
+1. B3 deferral no longer over-defers pre-consensus MCP slots.
+2. `BlockComponent` empty-entry decode no longer collides with `BlockMarker` decode.
 
-1. Relay attestation proposer-entry signature validation in local-cluster integration test.
-- Status: `RESOLVED`.
-- Evidence: `local-cluster/tests/local_cluster.rs` now requires all attestation entries to pass `valid_entries(...)` against proposer schedule.
+The MCP local-cluster integration test now passes end-to-end.
 
-2. Vote-gate inclusion boundary coverage (`REQUIRED_INCLUSIONS` 79 vs 80).
-- Status: `RESOLVED`.
-- Evidence: new unit test in `core/src/mcp_vote_gate.rs` (`test_inclusion_threshold_boundary_requires_at_least_80_relays`).
+## Concern Revalidation
 
-3. Explicit Merkle domain-separation test coverage.
-- Status: `RESOLVED`.
-- Evidence: new unit test in `ledger/src/mcp_merkle.rs` (`test_domain_separation_formulas_for_leaf_and_internal_node_hashes`).
+### 1) B3 deferral overreach
 
-4. Data-shards-only erasure recovery coverage.
-- Status: `RESOLVED`.
-- Evidence: new unit test in `ledger/src/mcp_erasure.rs` (`test_reconstruction_from_data_shards_only`).
+- Prior concern: MCP-active slots were deferred even when no consensus block existed yet.
+- Confirmed on code before fix at `core/src/replay_stage.rs`.
+- Fix: `should_defer_for_missing_mcp_authoritative_block_id` now requires:
+  - MCP feature active for slot
+  - **and** `has_mcp_consensus_block_for_slot(slot, store)`
+  - **and** missing/invalid authoritative sidecar block-id
+- File: `core/src/replay_stage.rs`
 
-## Remaining Open Concerns
+### 2) Empty `EntryBatch` decode collision
 
-1. MCP shred repair protocol extension for `(slot, proposer_index, shred_index)` indexing.
-- Status: `OPEN`.
-- Notes: existing repair protocol remains slot+shred-index based.
+- Prior concern: serialized `EntryBatch(vec![])` (`8` zero bytes) was interpreted as `BlockMarker` and failed with `ReadSizeLimit(2)`.
+- Confirmed on code before fix at `entry/src/block_component.rs`.
+- Fix: decode path disambiguates `entry_count == 0` by buffer length:
+  - exactly `ENTRY_COUNT_SIZE` bytes => `EntryBatch(vec![])`
+  - otherwise => `BlockMarker(...)`
+- Added round-trip assertion for `BlockComponent::EntryBatch(vec![])`.
+- File: `entry/src/block_component.rs`
 
-2. B3 strictness deviation: block-id fallback path still exists for some missing-sidecar conditions.
-- Status: `OPEN`.
-- Notes: still treated as acknowledged v1 deviation.
+## Validation Runs (Post-fix)
 
-## Validation Runs
+Passed:
 
-Passed in this pass:
-
-- `cargo test -p solana-core mcp_vote_gate -- --nocapture`
-- `cargo test -p solana-ledger mcp_merkle -- --nocapture`
-- `cargo test -p solana-ledger mcp_erasure -- --nocapture`
+- `cargo test -p solana-core test_should_defer_for_missing_mcp_authoritative_block_id_for_active_mcp_slot -- --nocapture`
+- `cargo test -p solana-core test_should_not_defer_for_missing_mcp_authoritative_block_id_before_feature_activation -- --nocapture`
 - `cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture`
+  - Result: `ok` (1 passed)
+  - Regression symptoms from prior audit (stuck root at 63, repeated `ReadSizeLimit(2)` dead-slot loop) are no longer present.
 
-## Files Updated This Pass
+Also passed:
 
-- `core/src/mcp_vote_gate.rs`
-- `ledger/src/mcp_merkle.rs`
-- `ledger/src/mcp_erasure.rs`
-- `audit.md`
+- `cargo check -p solana-core -p solana-entry`
+
+## Residual Notes
+
+- `cargo test -p solana-entry round_trips -- --nocapture` currently fails due pre-existing test-only API drift in reward-certificate helpers (`new_for_tests` not found); unrelated to MCP fixes.
+- `cargo check -p solana-local-cluster` currently fails on an unrelated `QuicServerParams::default_for_tests` symbol mismatch in `local-cluster/src/cluster_tests.rs`; MCP integration test itself passes.
+
+## Current Verdict
+
+- Critical audit blockers: `CLOSED`
+- MCP local-cluster integration (issue-20 target): `PASS`
+- Additional branch propagation is required only if issue branches are behind this master commit.
