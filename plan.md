@@ -628,9 +628,10 @@ Reconstruction-to-execution bridge:
   - `ConsensusBlock.consensus_meta` is opaque sidecar bytes; replay interprets a 32-byte payload as authoritative `block_id`.
   - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)`, and retries finalization until available.
   - ingestion drops consensus blocks with non-hash-sized `consensus_meta`.
-  - replay reads consensus-sidecar `block_id`, sets `bank.block_id`, and defers bank completion if a cached consensus block lacks an authoritative sidecar.
+  - replay reads consensus-sidecar `block_id`, sets `bank.block_id`, and defers bank completion only when a consensus block is present but lacks a usable authoritative sidecar.
 - Current v1 strictness:
-  - for every MCP-active replay slot, missing/invalid authoritative sidecar defers completion; no local `block_id` derivation fallback is used.
+  - pre-consensus MCP-active slots may still use existing local `block_id` derivation for liveness.
+  - once a consensus block is present for the slot, missing/invalid authoritative sidecar defers completion and blocks voting/finalization for that slot.
   - vote wire format remains unchanged; tower vote path consumes `bank.block_id()` and is gated by consensus/vote-gate checks.
 
 ### 7.5 Empty result
