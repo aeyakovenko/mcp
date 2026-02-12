@@ -152,6 +152,7 @@ impl McpProposerDispatchState {
         let Some(per_proposer_reservation) =
             transaction.base_fee.checked_mul(mcp::NUM_PROPOSERS as u64)
         else {
+            inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
             return true;
         };
         let current_reserved = self
@@ -160,9 +161,11 @@ impl McpProposerDispatchState {
             .copied()
             .unwrap_or_default();
         let Some(next_reserved) = current_reserved.checked_add(per_proposer_reservation) else {
+            inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
             return true;
         };
         if bank.get_balance(&transaction.fee_payer) < next_reserved {
+            inc_new_counter_error!("mcp-proposer-dispatch-insufficient-funds", 1, 1);
             return true;
         }
 

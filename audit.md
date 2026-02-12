@@ -1,390 +1,247 @@
-# MCP Adversarial Audit — Reachability Focus (Master)
+# MCP Adversarial Audit — Wiring, Parallel Systems, Semantic Bugs (Master)
 
 Date: 2026-02-12
-Branch: `master` (commit `c95a559d1e`)
+Branch: `master`
 Perspective: Principal engineer + security researcher, assuming adversarial/lazy developer.
-Scope: **Production call-path reachability** of every MCP subsystem vs plan.md, NOT just code existence.
+Scope: **Bad wiring, parallel-system anti-patterns, semantic bugs, dead code.** Builds on prior reachability audit.
 
 ---
 
 ## Executive Summary
 
-This audit **corrects the prior Correction Addendum**. All 5 claimed "wiring gaps" are **CLOSED** in the current codebase. The addendum's line-number references and descriptions matched an earlier code snapshot that has since been updated. The prior audit methodology over-weighted plan.md's self-reported gap notes (which are now stale) and under-weighted tracing actual call graphs.
-
-**All major MCP production paths are LIVE and reachable.** The one genuine structural gap is that MCP shred repair has no automatic trigger — only an admin-RPC entry point.
+All 5 prior addendum "wiring gaps" remain **REFUTED** (code is live). The **1 critical semantic bug** found in the prior round (relay attestation signature invalidation) is now **FIXED** with two new unit tests. The dispatch-abort bug is also **FIXED**. The remaining medium-severity semantics from the prior pass are now either **FIXED** (fee reservation parity, dispatch drop observability, replay TOCTOU) or **DISMISSED as non-reproducible** in production ingress (malformed `consensus_meta` deferral). This audit still tracks **1 parallel-system anti-pattern** worth evaluating (control messaging; sigverify GPU and legacy PoH dismissed as irrelevant post-Alpenglow) and a significantly **expanded dead-code inventory** (27+ dead public functions, 1 dead file).
 
 ### Verdicts
 
 | Area | Status |
 |------|--------|
-| Implementation vs plan.md | **PASS** (all plan items implemented; plan.md gap notes at lines 30-37, 83 are STALE) |
-| Addendum claim 1 (McpFeePayerTracker dead) | **REFUTED** — live via 3 scheduler paths |
-| Addendum claim 2 (validate_fee_payer_for_mcp dead) | **REFUTED** — called from claim 1's path |
-| Addendum claim 3 (per-proposer dedup missing) | **REFUTED** — per-proposer state maintained |
-| Addendum claim 4 (ordering-fee fallback wrong) | **REFUTED** — `ordering_fee_with_fallback()` in all paths |
-| Addendum claim 5 (replay drops fee components) | **REFUTED** — `set_mcp_fee_components` at line 1831 |
-| Local-cluster e2e test | **PASS** (80.49s, all artifacts verified) |
-| MCP repair automatic trigger | **GAP** — admin-RPC only, no automatic repair loop |
-| Security attack surface | **ACCEPTABLE** (no critical/high vulnerabilities) |
-| Code quality (zero stubs/TODOs) | **PASS** |
-| Test coverage (193 tests) | **GOOD** |
+| Local-cluster e2e test | **PASS** |
+| Parallel-system anti-patterns | **1 FOUND** (control messaging); 2 dismissed (sigverify GPU deprecated, legacy PoH N/A post-Alpenglow) |
+| Critical semantic bugs | **0** — relay attestation entry filtering bug **FIXED** (2 new unit tests) |
+| Medium semantic bugs | **0 OPEN** — 4 prior items fixed, 1 prior item dismissed as non-repro on production ingress |
+| Dead code | **EXPANDED** (27+ dead pub fns, 1 dead file: `mcp_shredder.rs`) |
+| Feature gate coverage | **PASS** (all production paths gated; 3 low-severity defense-in-depth gaps) |
 
 ---
 
-## 1. Addendum Corrections — All 5 Claims Refuted
+## 1. Parallel-System Anti-Pattern Audit
 
-### Claim 1: "McpFeePayerTracker path is dead"
+The user identified that MCP repair was originally built as a parallel admin-RPC-only system instead of being wired into the existing repair loop. This has been **fixed** (`identify_mcp_repairs` at `repair_service.rs:615` now called from the main loop at line 856). This audit searched for other instances of the same anti-pattern.
 
-**REFUTED.** The routing function `check_fee_payer_unlocked_admission` at `core/src/banking_stage/consumer.rs:598-613` is called from **3 production scheduler paths**:
+### Areas That EXTEND Existing Systems (Good)
 
-| Caller | File:Line |
-|--------|-----------|
-| `receive_and_buffer` (legacy path) | `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:330` |
-| `receive_and_buffer` (view path) | `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:561` |
-| `scheduler_controller` | `core/src/banking_stage/transaction_scheduler/scheduler_controller.rs:210` |
+| Area | How It Extends |
+|------|----------------|
+| Retransmit/turbine | MCP shreds flow through existing turbine fanout tree via `get_mcp_shred_id()` |
+| Gossip/cluster info | No MCP-specific gossip; proposer/relay schedules derived from on-chain stake |
+| Banking stage/scheduler | `McpFeePayerTracker` threaded through existing scheduler paths |
+| Leader schedule | New `cached_mcp_proposer_schedules`/`cached_mcp_relay_schedules` in existing `LeaderScheduleCache` |
+| Vote processing | `mcp_vote_gate` is an additional predicate in existing ReplayStage vote flow |
+| Transaction forwarding | `ForwardAddressGetter` extended for MCP proposer fanout |
+| Metrics | Standard `inc_new_counter_error!` and `datapoint_info!` macros throughout |
+| Blockstore | New column families for genuinely new data types (MCP shreds, attestations, execution output) |
+| Repair | **FIXED** — `identify_mcp_repairs` wired into main repair loop (200ms scan interval, 64-slot lookback) |
+| Fee calculation | `apply_mcp_fee_component_values` adds MCP fees on top of existing `FeeDetails` |
+| Block production | Bank initialized normally via `set_bank(tpu_bank)` at `block_creation_loop.rs:728`; scheduler ingests transactions normally |
 
-The router checks two conditions (`consumer.rs:604-608`):
-```
-let mcp_feature_active = bank.feature_set
-    .activated_slot(&mcp_protocol_v1::id())
-    .is_some_and(|activated_slot| bank.slot() >= activated_slot);
-if mcp_feature_active && transaction.mcp_fee_components().is_some() {
-    Self::check_fee_payer_unlocked_mcp(...)  // MCP path
-} else {
-    Self::check_fee_payer_unlocked(...)       // legacy path
-}
-```
+### Dismissed: MCP Sigverify Bypass
 
-The `TransactionView` path at `runtime-transaction/src/runtime_transaction/transaction_view.rs:68-88` correctly extracts `mcp_fee_components` from MCP wire bytes, so the MCP branch IS taken for MCP-format transactions when the feature is active.
+**Files:** `turbine/src/sigverify_shreds.rs:182-327`
 
-`check_fee_payer_unlocked_mcp` (`consumer.rs:541-596`) performs:
-- `calculate_fee` → `checked_mul(MCP_NUM_PROPOSERS)` → 16x scaled fee reservation
-- `fee_tracker.try_reserve()` → cumulative per-payer tracking
-- `validate_fee_payer_for_mcp()` → per-proposer fee validation
+MCP shreds bypass GPU-batched sigverify and use CPU verification in window_service. **Dismissed** — the GPU sigverify path is being deprecated; CPUs are fast enough. MCP's CPU-based per-shred verification is the forward-looking approach.
 
-**All reachable in production.**
+### Dismissed: PoH `record_bankless` Path
 
-### Claim 2: "validate_fee_payer_for_mcp is effectively dead"
+**Files:** `poh/src/poh_recorder.rs:441-537`, `core/src/block_creation_loop.rs:443-465`
 
-**REFUTED.** Called at `consumer.rs:588` from `check_fee_payer_unlocked_mcp`, which is reachable per Claim 1 above. Also called from `svm/src/account_loader.rs:390` during transaction loading.
+MCP introduces `record_bankless` as a fallback for records arriving after bank completion. **Dismissed** — MCP only activates after Alpenglow, so the legacy PoH path is not relevant. `record_bankless` is the Alpenglow-native recording path.
 
-### Claim 3: "Per-proposer admission/dedup semantics not implemented"
+### Anti-Pattern: MCP Control-Message Channel
 
-**REFUTED.** The dispatch state structure at `turbine/src/broadcast_stage/standard_broadcast_run.rs:91-102`:
+**Files:** `core/src/shred_fetch_stage.rs:448-489`, `core/src/window_service.rs:889-1060`, `core/src/mcp_relay_submit.rs:26-336`
 
-```rust
-struct McpSlotDispatchState {
-    proposer_states: HashMap<u32, McpProposerDispatchState>,  // PER-PROPOSER
-    ...
-}
+MCP introduces a custom control-message framing protocol on the QUIC TVU endpoint. Incoming datagrams are inspected for MCP control-message type bytes (`0x01` relay attestation, `0x02` consensus block) and routed via a dedicated `mcp_control_message_sender` channel.
 
-struct McpProposerDispatchState {
-    payload_transactions: Vec<McpPayloadTransaction>,
-    payer_fee_reservations: HashMap<Pubkey, u64>,   // PER-PROPOSER fee tracking
-    seen_signatures: HashSet<[u8; 64]>,             // PER-PROPOSER dedup
-    ...
-}
-```
+**Why it exists:** Relay attestations and consensus blocks are structurally incompatible with the shred pipeline — different sizes (consensus blocks can exceed `PACKET_DATA_SIZE`), different signature schemes, different storage.
 
-Transaction routing at `standard_broadcast_run.rs:854-870`:
-- Transactions WITH `target_proposer`: pushed to ONLY that proposer's state (line 857)
-- Transactions WITHOUT `target_proposer`: cloned to ALL owned proposer indices (line 864-870), each independently deduped and fee-checked
+**Risk:** Separate framing, dispatch, and retry logic (`try_send_mcp_control_frame`, `try_send_dispatch_frame_with_retry`). Three message delivery systems now coexist: gossip, turbine shreds, MCP control messages.
 
-Each proposer's `try_push_transaction` (`standard_broadcast_run.rs:146-188`) independently:
-1. Checks per-proposer `seen_signatures` (dedup, line 147)
-2. Computes `base_fee * NUM_PROPOSERS` reservation (line 153)
-3. Tracks per-proposer `payer_fee_reservations` (line 162-165)
-4. Enforces per-proposer payload size limit (line 177)
-
-At dispatch time (`standard_broadcast_run.rs:941-954`), each proposer's payload is independently ordered via `order_mcp_payload_transactions` which applies the B2 policy.
-
-**Per-proposer dedup, fee reservation, payload accumulation, and ordering are all implemented.**
-
-### Claim 4: "B1 ordering-fee fallback not honored"
-
-**REFUTED.** The method `ordering_fee_with_fallback()` at `transaction-view/src/mcp_transaction.rs:243-251`:
-
-```rust
-pub fn ordering_fee_with_fallback(&self) -> u64 {
-    self.ordering_fee().map_or_else(
-        || {
-            self.compute_budget_instruction_details()
-                .map_or(0, |details| details.requested_compute_unit_price())
-        },
-        u64::from,
-    )
-}
-```
-
-When ordering_fee field is absent, falls back to `compute_unit_price`. Only defaults to 0 when BOTH ordering_fee and compute budget instructions are absent (correct — no fee info means 0 priority).
-
-This method is used in **all 4 ordering paths**:
-
-| Path | File:Line |
-|------|-----------|
-| TPU ingest (TransactionView) | `runtime-transaction/src/runtime_transaction/transaction_view.rs:76` |
-| Broadcast dispatch | `turbine/src/broadcast_stage/standard_broadcast_run.rs:227` |
-| Replay ordering metadata | `core/src/mcp_replay.rs:336` |
-| Replay wire conversion | `ledger/src/blockstore_processor.rs:1781` |
-
-The addendum's claim that these paths use `unwrap_or_default()` is **outdated** — all now use `ordering_fee_with_fallback()`.
-
-### Claim 5: "Replay conversion drops MCP fee-component semantics"
-
-**REFUTED.** The replay conversion at `ledger/src/blockstore_processor.rs:1762-1787` extracts fee components:
-
-```rust
-fn versioned_transaction_from_mcp_wire_bytes(...) -> ... {
-    ...
-    let mcp_fee_components = Some((
-        u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
-        mcp_transaction.ordering_fee_with_fallback(),
-    ));
-    Ok((mcp_transaction_to_versioned_transaction(mcp_transaction), mcp_fee_components))
-}
-```
-
-At line 1823-1831, the extracted fee components are restored AFTER `bank.verify_transaction()`:
-
-```rust
-let (versioned_tx, mcp_fee_components) =
-    versioned_transaction_from_mcp_wire_bytes(slot, tx_index, tx_wire_bytes)?;
-let mut transaction = bank.verify_transaction(versioned_tx, verification_mode)...;
-transaction.set_mcp_fee_components(mcp_fee_components);  // RESTORES fee metadata
-```
-
-Yes, `sdk_transactions.rs:69` sets `mcp_fee_components: None` during `verify_transaction`. But `set_mcp_fee_components` at line 1831 **overwrites** that None with the actual values extracted from MCP wire bytes.
-
-These components then flow through to `runtime/src/bank/check_transactions.rs:113-124`:
-
-```rust
-let fee_details = if self.feature_set.is_active(&mcp_protocol_v1::id()) {
-    tx.borrow().mcp_fee_components().map_or(
-        fee_details,
-        |(inclusion_fee, ordering_fee)| {
-            apply_mcp_fee_component_values(fee_details, inclusion_fee, ordering_fee)
-        },
-    )
-} ...
-```
-
-**MCP fee components ARE preserved and applied during replay.**
-
-### plan.md Staleness
-
-The following plan.md notes describe gaps that are **now closed in code** and should be updated:
-
-| plan.md Line | Claim | Current Code Status |
-|-------------|-------|-------------------|
-| 31 | "MCP-specific BankingStage admission helper wiring is still incomplete" | CLOSED — `check_fee_payer_unlocked_admission` routes to MCP path from 3 scheduler callers |
-| 32 | "payload construction is currently slot-shared across owned proposer indices" | CLOSED — per-proposer state via `HashMap<u32, McpProposerDispatchState>` |
-| 37 | "MCP-wire fee component semantics are not fully preserved" | CLOSED — `set_mcp_fee_components` restores them post-verify |
-| 83 | "ordering-fee fallback to compute_unit_price is not yet fully wired" | CLOSED — `ordering_fee_with_fallback()` in all 4 paths |
+**Recommendation:** Acceptable given structural differences. Consider deduplicating the `MCP_CONTROL_MSG_CONSENSUS_BLOCK` constant (duplicated at `shred_fetch_stage.rs:47` and `window_service.rs:68`).
 
 ---
 
-## 2. Full Production Reachability Trace
+## 2. Critical Semantic Bug: Relay Attestation Signature Invalidation — FIXED
 
-### MCP Shred Ingestion — LIVE
+**Severity: CRITICAL → FIXED**
+**Files:** `core/src/window_service.rs` (ingestion + consensus block building)
 
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| UDP/QUIC receive | `core/src/shred_fetch_stage.rs` → `handle_packets` | Feature-gated MCP dispatch |
-| Sigverify | `turbine/src/sigverify_shreds.rs` → MCP signature verification | Parallel path for MCP format |
-| Window insert | `core/src/window_service.rs` → `insert_shred` | MCP shred storage in blockstore |
-| Blockstore storage | `ledger/src/blockstore.rs` → `put_mcp_shred_data` | Column family: `MCP_SHRED_DATA_CF` |
+### The Bug (Prior State)
 
-### Relay Attestation — LIVE
+When a validator ingested a relay attestation, `valid_entries()` at line 946 filtered out entries where the proposer pubkey was unknown or the proposer signature didn't verify. The filtered entries **replaced** the original entries, but the attestation was stored with the **original** `relay_signature` (computed over unfiltered entries). Downstream `verify_relay_signature` would fail because signing bytes computed from filtered entries didn't match.
 
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| Shred processing | `core/src/mcp_relay.rs` → `process_shred` | Merkle+signature verification before storage |
-| Reconstruction check | `core/src/mcp_relay.rs` → threshold check (2/3 shreds) | Triggers attestation when threshold met |
-| Attestation signing | `core/src/mcp_relay_submit.rs` → `submit_relay_attestation` | Signs and dispatches via QUIC/UDP |
-| Attestation receive | `core/src/window_service.rs` → attestation ingestion path | Feature-gated MCP dispatch |
-| Aggregate filtering | `ledger/src/mcp_aggregate_attestation.rs` → canonical attestation merge | 25,600 cache bound, sig-verified |
+### The Fix (Current Working Tree)
 
-### Consensus Block — LIVE
+**Ingestion path (line 942-948):** No longer calls `valid_entries()`. Stores the raw `payload` bytes directly via `blockstore.put_mcp_relay_attestation(slot, relay_index, payload)`. The relay signature was already verified against the relay's pubkey at line 938. Proposer-level validation is correctly deferred.
 
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| Block construction | `ledger/src/mcp_consensus_block.rs` → `build_consensus_block` | Leader path in broadcast stage |
-| Block signing | `ledger/src/mcp_consensus_block.rs` → `sign_consensus_block` | Leader keypair signing |
-| Block verification | `ledger/src/mcp_consensus_block.rs` → `verify_leader_signature` | Called BEFORE storage |
-| Block storage | `core/src/window_service.rs` → consensus block ingestion | Blockstore column family storage |
+**Consensus block building (lines 248-267):** `valid_entries()` is now used ONLY as an `is_empty()` skip check. If at least one entry is valid, ALL `attestation.entries` are iterated into `AggregateRelayEntry` (not just the filtered ones). The original `relay_signature` is stored alongside the full entry list, preserving signature validity.
 
-### Vote Gate — LIVE
+### Verification
 
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| Input refresh | `core/src/mcp_replay.rs:231` → `refresh_vote_gate_input` | Called from 3 replay_stage paths |
-| 7-check evaluation | `core/src/mcp_vote_gate.rs` → `evaluate` | All checks are hard rejections |
-| Replay integration | `core/src/replay_stage.rs` → B3 deferral guard (lines 4030-4039) | 3-condition guard verified |
-
-### Reconstruction + Replay — LIVE
-
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| Reconstruction trigger | `core/src/mcp_replay.rs` → `maybe_persist_reconstructed_execution_output` | Called from 3 replay_stage paths |
-| Reed-Solomon decode | `ledger/src/mcp_erasure.rs` → 40+160=200 erasure coding | Threshold reconstruction |
-| Payload decode | `transaction-view/src/mcp_payload.rs` → framed transaction extraction | Length-prefixed wire format |
-| Wire → VersionedTx | `ledger/src/blockstore_processor.rs:1762-1787` | MCP+bincode dual-format support |
-| Fee component preservation | `ledger/src/blockstore_processor.rs:1831` | `set_mcp_fee_components` call |
-| Two-pass fee execution | `ledger/src/blockstore_processor.rs:234-267` | Phase A (fee withdrawal) + Phase B (skip-fee execution) |
-
-### TPU Admission — LIVE
-
-| Stage | Entry Point | Verified At |
-|-------|-------------|-------------|
-| MCP fee extraction | `runtime-transaction/src/runtime_transaction/transaction_view.rs:68-88` | Extracts inclusion_fee + ordering_fee from MCP wire |
-| Admission routing | `core/src/banking_stage/consumer.rs:598-613` | Routes to MCP or legacy based on feature + fee components |
-| 16x fee reservation | `core/src/banking_stage/consumer.rs:577-586` | `base_fee.checked_mul(NUM_PROPOSERS)` + `try_reserve` |
-| Per-proposer dispatch | `turbine/src/broadcast_stage/standard_broadcast_run.rs:132-188` | Independent dedup/fee/payload per proposer |
-
-### Repair — PARTIALLY WIRED
-
-| Stage | Entry Point | Status |
-|-------|-------------|--------|
-| Serve side | `core/src/repair/serve_repair.rs` → `run_mcp_window_request` | **LIVE** — responds to MCP window repair requests |
-| Request side (admin) | `validator/src/admin_rpc_service.rs:624` → `request_repair_for_mcp_shred_from_peer` | **LIVE** — admin-RPC triggered only |
-| Automatic trigger | Main repair loop in `core/src/repair/repair_service.rs` | **MISSING** — no MCP shred awareness in automatic repair |
-
-**This is the ONLY genuine structural gap.** The automatic repair loop does not detect or request missing MCP shreds. Repair can only be triggered via admin RPC. In a production network, MCP shred loss that exceeds the Reed-Solomon erasure threshold (>160 of 200 shreds lost) cannot be automatically recovered.
+Two new unit tests added:
+- `test_ingest_mcp_relay_attestation_preserves_signed_entry_list` — verifies stored attestation has all entries and relay signature still verifies
+- `test_maybe_finalize_consensus_block_keeps_original_relay_signed_entries` — verifies consensus block building preserves full entry list
 
 ---
 
-## 3. Integration Test — PASS
+## 3. Medium-Severity Semantic Issues
+
+### 3a. Admission vs Execution Fee Formula Mismatch — FIXED
+
+**Severity: MEDIUM → FIXED**
+**Files:** `core/src/banking_stage/consumer.rs`, `runtime/src/bank/check_transactions.rs`
+
+Admission now reserves and validates against `effective_fee = base_fee + inclusion_fee + ordering_fee` before multiplying by `NUM_PROPOSERS`. This matches execution-side fee composition.
+
+### 3b. Silent Transaction Drops in Dispatch — FIXED
+
+**Severity: MEDIUM → FIXED**
+**File:** `turbine/src/broadcast_stage/standard_broadcast_run.rs`
+
+Fee-related non-insert outcomes now emit explicit counters:
+- `mcp-proposer-dispatch-fee-reservation-overflow`
+- `mcp-proposer-dispatch-insufficient-funds`
+
+### 3c. Dispatch Abort on `build_shred_messages` Error — FIXED
+
+**Severity: MEDIUM → FIXED**
+**File:** `turbine/src/broadcast_stage/standard_broadcast_run.rs:1052`
+
+Changed `return` to `continue`. Error in one proposer's shred message build no longer aborts dispatch for remaining proposer indices.
+
+### 3d. TOCTOU Race in Replay Per-Component Blockstore Query — FIXED
+
+**Severity: MEDIUM → FIXED**
+**File:** `ledger/src/blockstore_processor.rs`
+
+`confirm_slot()` now snapshots `McpExecutionOutput` once per slot-replay invocation and passes the snapshot through all component confirms. Entry batches within the same slot no longer observe mixed transaction sources.
+
+### 3e. Malformed `consensus_meta` Indefinite Deferral — DISMISSED (non-repro on ingress)
+
+**Severity: MEDIUM → DISMISSED**
+**Files:** `core/src/window_service.rs`, `core/src/replay_stage.rs`
+
+Production ingress drops consensus blocks whose `consensus_meta.len() != 32` before cache insertion. Local finalization produces 32-byte sidecar bytes. The previously described malformed-sidecar deferral path is not reachable through normal ingest/finalize call paths.
+
+---
+
+## 4. Expanded Dead Code Inventory
+
+### Dead File
+
+| File | Status |
+|------|--------|
+| `ledger/src/mcp_shredder.rs` | **ALL functions dead.** Thin facade over `mcp_erasure` + `mcp_merkle`. Zero production callers. Production code imports `mcp_erasure` directly. Should be deleted. |
+
+### Dead Public Functions (27+)
+
+| Function | File | Notes |
+|----------|------|-------|
+| `order_batches_by_fee_desc` | `mcp_ordering.rs:23` | Test-only; production uses `order_batches_mcp_policy` |
+| `McpRelayProcessor::stored_count` | `mcp_relay.rs:45` | Test-only |
+| `calculate_fee_details_with_mcp` | `fee/src/lib.rs:71` | Dead convenience wrapper; production calls components separately |
+| `apply_mcp_fee_components` | `fee/src/lib.rs:89` | Dead wrapper; divergent semantics from production path |
+| `McpReconstructionState` (5 methods) | `mcp_reconstruction.rs:56-134` | Entire struct is test-only; production uses `reconstruct_payload` directly |
+| `McpShred::verify` | `mcp_shred.rs:220` | Test-only; production calls `verify_signature` + `verify_witness` separately |
+| `is_mcp_shred_packet` / `is_mcp_shred_packet_ref` | `mcp_shred.rs:96,100` | Zero non-test callers |
+| `RelayAttestationV1::new_unsigned` | `mcp_relay_attestation.rs:54` | Test-only; production builds struct directly |
+| `RelayAttestationV1::sign_relay` | `mcp_relay_attestation.rs:168` | Test-only; production signs via `signer.sign_message()` |
+| `RelayAttestationV1::verify_proposer_signatures` | `mcp_relay_attestation.rs:182` | Test-only |
+| `AggregateAttestation::filtered_valid_entries` | `mcp_aggregate_attestation.rs:248` | Internal only; called by `canonical_filtered` |
+| `AggregateRelayEntry::sign` / `verify_relay_signature` | `mcp_aggregate_attestation.rs:345,356` | Test-only |
+| `McpTransaction::from_bytes` | `mcp_transaction.rs:73` | Test-only; production uses `from_bytes_compat` |
+| `witness_for_leaf` | `mcp_merkle.rs:73` | Test-only |
+| `decode_payload` / `recover_data_shards` / `commitment_root` | `mcp_erasure.rs:113,57,130` | Only called from dead `mcp_shredder.rs` or tests |
+| `concat_batches_by_proposer_index` | `mcp_ordering.rs:9` | Internal helper, no external callers |
+| `encode_relay_attestation_frame` / `build_relay_attestation_dispatch` | `mcp_relay_submit.rs:224,256` | Internal only, no external callers |
+
+### Dead Code Risk
+
+`apply_mcp_fee_components` (fee/src/lib.rs:89) uses `ordering_fee().unwrap_or_default()` (defaults to 0) while the production path uses `ordering_fee_with_fallback()` (falls back to CU price). If anyone ever uses this dead function, fees will be silently different.
+
+---
+
+## 5. Feature Gate Coverage
+
+All production MCP paths are properly gated on `mcp_protocol_v1`. Three low-severity defense-in-depth gaps:
+
+| Location | Issue | Severity |
+|----------|-------|----------|
+| `shred_fetch_stage.rs:412` | MCP shred repair nonce bypass accepted without feature gate check | LOW |
+| `shred_fetch_stage.rs:465-488` | MCP control messages forwarded without feature gate (downstream checks exist) | LOW |
+| `retransmit_stage.rs:468` | MCP shred retransmit parsing without feature gate (upstream sigverify gates) | INFO |
+
+---
+
+## 6. Production Reachability — All Subsystems LIVE
+
+Unchanged from prior audit. All major MCP production paths verified reachable:
+- MCP shred ingestion → relay attestation → consensus block → vote gate → reconstruction → replay
+- TPU admission → per-proposer dispatch → shredding → transmission
+- Repair: serve side + automatic trigger in main repair loop
+
+---
+
+## 7. Integration Test — PASS
 
 ```
 cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture
 ```
 
-**Result: PASS** (80.49s, exit code 0)
-
-Verified:
-- Root advances past MCP activation (no stall)
-- Zero `ReadSizeLimit(2)` errors
-- MCP shred + relay attestation + execution artifacts at slot 64
-- Non-leader execution output at slot 66
-- Consensus block at slot 73 with matching delayed bankhash for slot 72
-- 12 transactions decoded, submitted transfer signature found
-- Cross-node equality (5 validators, all root at slot 63+)
+**Result: PASS** (59.82s, exit code 0). Verified in a 5-node cluster with equal stake: artifacts at slot 64, non-leader output at slot 67, consensus block at slot 76, decoded non-empty execution output (100 txs in this run), submitted signature found.
 
 ---
 
-## 4. Prior Fixes — Still Intact
+## 8. Prior Fixes — Still Intact
 
-### B3 Deferral (replay_stage.rs:4030-4039)
-
-Three-condition guard verified:
-1. MCP feature active for slot
-2. `has_mcp_consensus_block_for_slot` (restored precondition)
-3. `mcp_authoritative_block_id_for_slot` returns `None`
-
-4 unit tests cover all branches. No regressions.
-
-### BlockComponent Decode (block_component.rs:567-574)
-
-Buffer-length disambiguation verified:
-- Exactly 8 bytes with `entry_count == 0` → `EntryBatch(vec![])`
-- More bytes with `entry_count == 0` → `BlockMarker`
-
-Round-trip test exists. No regressions.
-
-### infer_is_entry_batch Fix (block_component.rs:509-512)
-
-`entry_count != 0 || data.len() == Self::ENTRY_COUNT_SIZE` — correctly classifies 8-zero-byte payloads as empty entry batch. Matches SchemaRead logic.
+- B3 deferral 3-condition guard (replay_stage.rs:4030-4039): PASS
+- BlockComponent decode disambiguation (block_component.rs:567-574): PASS
+- `infer_is_entry_batch` fix (block_component.rs:509-512): PASS
+- All 5 addendum claims: remain REFUTED
 
 ---
 
-## 5. Dead Code Inventory
+## 9. Applied Changes Audit
 
-| Item | Location | Status |
-|------|----------|--------|
-| `order_batches_by_fee_desc` | `ledger/src/mcp_ordering.rs:23` | Test-only (0 production callers, only called from `#[cfg(test)]` blocks) |
-| `McpRelayProcessor::stored_count()` | `core/src/mcp_relay.rs:45` | Test-only (only called from `#[cfg(test)]` blocks) |
-| `RELAY_ATTESTATION_VERSION_V1` | `core/src/mcp_relay_submit.rs:27` | Re-export constant — used at lines 166, 424 in same file |
+Key MCP hardening changes verified in this audit pass:
 
-All major MCP functions have verified production callers. No dead production code found.
+| File | Change | Verdict |
+|------|--------|---------|
+| `window_service.rs` | Attestation ingestion: store raw payload, no entry filtering | **CORRECT** — fixes critical bug |
+| `window_service.rs` | Consensus block: `valid_entries()` as skip gate only, iterate all entries | **CORRECT** — preserves relay signature |
+| `window_service.rs` | 2 new unit tests for attestation preservation | **CORRECT** — cover both paths |
+| `consumer.rs` | MCP admission reservation uses effective fee (base + inclusion + ordering) | **CORRECT** — aligns admission with execution fee model |
+| `standard_broadcast_run.rs` | Counters for reservation overflow / insufficient funds drops | **CORRECT** — removes silent fee-drop observability gap |
+| `repair_service.rs` | `identify_mcp_repairs` wired into main loop at line 856 | **CORRECT** — automatic MCP repair |
+| `standard_broadcast_run.rs` | `return` → `continue` on `build_shred_messages` error | **CORRECT** — fixes dispatch abort |
+| `blockstore_processor.rs` | One-shot slot execution-output snapshot reused per component replay | **CORRECT** — removes replay TOCTOU source race |
+| `replay_stage.rs` | Formatting changes only | **NO REGRESSION** |
+| `block_component.rs` | Disambiguation hardening | **NO REGRESSION** |
+| `blockstore.rs` | New `get_mcp_relay_attestations_for_slot`, `latest_mcp_relay_attestation_slots` | **CORRECT** — support repair scanning |
+| `mcp_merkle.rs` | Domain-separation hardening | **NO REGRESSION** |
+| `local_cluster.rs` | Expanded integration test assertions | **CORRECT** |
 
----
+### Note on Repair Implementation
 
-## 6. Security — No Critical/High Vulnerabilities
-
-| Area | Status | Notes |
-|------|--------|-------|
-| MCP shred ingestion | DEFENDED | Sigverify before blockstore insertion |
-| Relay attestation | DEFENDED | Merkle root + proposer signature verification before storage |
-| Consensus block | DEFENDED | `verify_leader_signature` before storage |
-| Vote gate | DEFENDED | 7 hard-rejection checks, all exercised in tests |
-| Two-pass fee system | DEFENDED | 16x multiplier with `checked_mul`; rent minimum enforced |
-| Fee reservation | DEFENDED | Per-proposer cumulative tracking prevents double-spend across proposers |
-| Relay channel flooding | PARTIALLY DEFENDED | Cache bounded (25,600), sig verified, relies on transport-layer SWQoS |
-| Repair protocol | PARTIALLY DEFENDED | Nonce-less (mitigated by downstream Merkle+signature verification) |
-
-Prior security findings (MEDIUM, unchanged):
-- Nonce-less MCP repair allows structurally valid injection (mitigated by downstream crypto)
-- Relay channel flooding lacks per-identity rate limiting (relies on transport-layer SWQoS)
-
----
-
-## 7. Code Quality — All 18 Files PASS
-
-| # | File | Tests | Verdict |
-|---|------|-------|---------|
-| 1 | `ledger/src/mcp.rs` | 7 | PASS |
-| 2 | `ledger/src/mcp_merkle.rs` | 8 | PASS |
-| 3 | `ledger/src/mcp_erasure.rs` | 8 | PASS |
-| 4 | `ledger/src/mcp_reconstruction.rs` | 12 | PASS |
-| 5 | `ledger/src/mcp_ordering.rs` | 9 | PASS |
-| 6 | `ledger/src/mcp_relay_attestation.rs` | 9 | PASS |
-| 7 | `ledger/src/mcp_aggregate_attestation.rs` | 18 | PASS |
-| 8 | `ledger/src/mcp_consensus_block.rs` | 14 | PASS |
-| 9 | `ledger/src/shred/mcp_shred.rs` | 10 | PASS |
-| 10 | `ledger/src/mcp_shredder.rs` | 1 | PASS (thin facade) |
-| 11 | `core/src/mcp_replay.rs` | 4 | PASS |
-| 12 | `core/src/mcp_vote_gate.rs` | 10 | PASS |
-| 13 | `core/src/mcp_relay.rs` | 10 | PASS |
-| 14 | `core/src/mcp_relay_submit.rs` | 14 | PASS |
-| 15 | `core/src/mcp_constant_consistency.rs` | 3 | PASS |
-| 16 | `turbine/src/mcp_proposer.rs` | 2 | PASS |
-| 17 | `transaction-view/src/mcp_payload.rs` | 6 | PASS |
-| 18 | `transaction-view/src/mcp_transaction.rs` | 10 | PASS |
-
-Zero stubs, zero TODOs, zero `unimplemented!()`, zero `#[ignore]`. **193 tests total.**
-
----
-
-## 8. Test Coverage Gaps
-
-| Gap | Severity | Notes |
-|-----|----------|-------|
-| Repair negative paths untested | MEDIUM | No test for wrong-slot/wrong-proposer/empty-blockstore repair requests |
-| `mcp_replay.rs` thin coverage | MEDIUM | 4 tests for ~430 lines; missing full reconstruction pipeline with real transactions |
-| `mcp_merkle.rs` edge cases | MEDIUM | No tests for `EmptyShredSet` error, `TooManyShreds` error |
-| Automatic repair trigger missing | HIGH | No production path triggers MCP shred repair automatically |
-| `infer_is_entry_batch` edge cases | LOW | No test for too-short (<8 byte) payloads |
-
----
-
-## 9. Residual Items
-
-| Item | Severity | Status |
-|------|----------|--------|
-| `finish_prev_slot` uses legacy `make_merkle_shreds_from_entries` | INFO | Works with decode fix; fragile bincode/wincode coupling |
-| `consensus-metrics` thread panic on shutdown | INFO | Non-fatal, not MCP-specific |
-| Blockstore slot meta consistency errors during shutdown | INFO | Non-fatal, occurs after test assertions pass |
-| Snapshot catch-up story | DEFERRED | Separate effort per user decision |
-| plan.md gap notes at lines 30-37, 83 are stale | INFO | Code has closed these gaps; plan.md should be updated |
+`identify_mcp_repairs` at line 689 uses `mcp::NUM_RELAYS` as the expected shred count per proposer per relay. This coupling is coincidentally correct today (each relay stores exactly `NUM_RELAYS` shreds) but is fragile — if the shred-per-relay count ever diverges from the relay count constant, repair will request wrong shred indices.
 
 ---
 
 ## Current Verdict
 
-- Addendum wiring gaps: **ALL 5 REFUTED** (code is live and reachable)
-- MCP local-cluster integration: **PASS**
-- Implementation completeness vs plan.md: **PASS** (plan.md gap notes are stale)
-- Production reachability: **PASS** (all subsystems live except automatic repair trigger)
-- Security posture: **ACCEPTABLE** (no critical/high vulnerabilities)
-- Test coverage: **GOOD** (193 tests, medium-depth gaps remain)
-- One structural gap: **MCP repair has no automatic trigger** (admin-RPC only)
+- Critical bugs: **0** (relay attestation signature invalidation **FIXED** + tested)
+- Medium semantic issues: **0 OPEN** (fee mismatch, silent drops, TOCTOU fixed; malformed-sidecar deferral dismissed as non-repro on ingress)
+- Parallel-system anti-patterns: **1** (control messaging); 2 dismissed (GPU deprecated, legacy PoH N/A)
+- Dead code: **1 dead file** (`mcp_shredder.rs`), **27+ dead pub fns**
+- Feature gate: **PASS** (3 low defense-in-depth gaps)
+- Integration test: **PASS**
+- Production reachability: **PASS**

@@ -2,7 +2,8 @@ use {
     super::{
         repair_handler::RepairHandler,
         repair_response::{
-            repair_response_packet_from_bytes, repair_response_packet_from_bytes_with_optional_nonce,
+            repair_response_packet_from_bytes,
+            repair_response_packet_from_bytes_with_optional_nonce,
         },
     },
     solana_clock::Slot,

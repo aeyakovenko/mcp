@@ -1566,6 +1566,17 @@ pub fn confirm_slot(
         }
         load_result
     }?;
+    // Snapshot the execution output once per slot-replay call to avoid
+    // per-component source changes within the same slot.
+    let mcp_execution_output = if bank
+        .feature_set
+        .activated_slot(&feature_set::mcp_protocol_v1::id())
+        .is_some_and(|activated_slot| slot >= activated_slot)
+    {
+        blockstore.get_mcp_execution_output(slot)?
+    } else {
+        None
+    };
 
     // Process block components for Alpenglow slots. Note that we don't need to run migration checks
     // for BlockMarkers here, despite BlockMarkers only being active post-Alpenglow. Here's why:
@@ -1612,7 +1623,7 @@ pub fn confirm_slot(
 
                 confirm_slot_entries(
                     bank,
-                    Some(blockstore),
+                    mcp_execution_output.as_deref(),
                     replay_tx_thread_pool,
                     (entries, num_shreds as u64, slot_full),
                     timing,
@@ -1790,7 +1801,7 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
     slot: Slot,
     bank: &BankWithScheduler,
     skip_verification: bool,
-    blockstore: Option<&Blockstore>,
+    mcp_execution_output: Option<&[u8]>,
     replay_entries: Vec<ReplayEntry>,
     default_num_txs: usize,
 ) -> result::Result<(Vec<ReplayEntry>, usize), BlockstoreProcessorError> {
@@ -1802,10 +1813,7 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         return Ok((replay_entries, default_num_txs));
     }
 
-    let Some(blockstore) = blockstore else {
-        return Ok((replay_entries, default_num_txs));
-    };
-    let Some(encoded_output) = blockstore.get_mcp_execution_output(slot)? else {
+    let Some(encoded_output) = mcp_execution_output else {
         return Ok((replay_entries, default_num_txs));
     };
 
@@ -1912,7 +1920,7 @@ fn override_replay_entries_with_transactions(
 #[allow(clippy::too_many_arguments)]
 fn confirm_slot_entries(
     bank: &BankWithScheduler,
-    mcp_execution_output_blockstore: Option<&Blockstore>,
+    mcp_execution_output: Option<&[u8]>,
     replay_tx_thread_pool: &ThreadPool,
     slot_entries_load_result: (Vec<Entry>, u64, bool),
     timing: &mut ConfirmationTiming,
@@ -2075,7 +2083,7 @@ fn confirm_slot_entries(
         slot,
         bank,
         skip_verification,
-        mcp_execution_output_blockstore,
+        mcp_execution_output,
         replay_entries,
         num_txs,
     )?;
@@ -6025,7 +6033,7 @@ pub mod tests {
                 slot,
                 &bank,
                 false,
-                Some(&blockstore),
+                Some(encoded.as_slice()),
                 replay_entries,
                 1,
             )

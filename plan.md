@@ -210,12 +210,12 @@ Non-reusable for MCP wire correctness:
 
 ### 1.5 Reed-Solomon and shredding
 
-- Add `ledger/src/mcp_shredder.rs` mirroring `ledger/src/shredder.rs` for MCP:
+- Use `ledger/src/mcp_erasure.rs` as the single RS entrypoint (no extra wrapper module):
   - RS encode: payload bytes → 40 data shards + 160 coding shards
   - RS decode/reconstruct: recover payload from any 40 shards
   - Merkle tree construction and witness generation (using `mcp_merkle.rs`)
   - Build complete `McpShred` structs with signatures
-- Follow the same pattern as `shredder.rs`: wrap RS encoding/decoding so `core` uses the wrapper, not the RS library directly.
+- Minimal-diff invariant: avoid introducing an MCP-specific `shredder` facade when `mcp_erasure` already provides the needed encode/decode surface.
 
 ### 1.6 Tests
 
@@ -687,7 +687,6 @@ New files:
 - `ledger/src/mcp_relay_attestation.rs`
 - `ledger/src/mcp_aggregate_attestation.rs`
 - `ledger/src/mcp_consensus_block.rs`
-- `ledger/src/mcp_shredder.rs`
 - `transaction-view/src/mcp_payload.rs`
 - `transaction-view/src/mcp_transaction.rs`
 - `ledger/src/shred/mcp_shred.rs`

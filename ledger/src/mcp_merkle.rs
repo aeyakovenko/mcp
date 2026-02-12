@@ -364,17 +364,15 @@ mod tests {
         let (root, witness) = witness_for_leaf(5, 1, &shreds, leaf_index).unwrap();
         let mut tampered = shreds[leaf_index];
         tampered[0] ^= 1;
-        assert!(
-            !verify_witness(
-                5,
-                1,
-                leaf_index as u32,
-                &tampered,
-                &witness,
-                &root,
-                shreds.len(),
-            )
-            .unwrap()
-        );
+        assert!(!verify_witness(
+            5,
+            1,
+            leaf_index as u32,
+            &tampered,
+            &witness,
+            &root,
+            shreds.len(),
+        )
+        .unwrap());
     }
 }

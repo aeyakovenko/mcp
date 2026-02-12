@@ -557,6 +557,11 @@ impl Consumer {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(bank.feature_set.as_ref()),
         );
+        let mcp_fee_components = transaction.mcp_fee_components().unwrap_or_default();
+        let effective_fee = base_fee
+            .checked_add(mcp_fee_components.0)
+            .and_then(|fee| fee.checked_add(mcp_fee_components.1))
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
 
         let (mut fee_payer_account, _slot) = bank
             .rc
@@ -574,7 +579,7 @@ impl Consumer {
                 .rent
                 .minimum_balance(solana_nonce::state::State::size()),
         };
-        let scaled_fee = base_fee
+        let scaled_fee = effective_fee
             .checked_mul(MCP_NUM_PROPOSERS as u64)
             .ok_or(TransactionError::InsufficientFundsForFee)?;
         fee_tracker.try_reserve(
@@ -591,7 +596,7 @@ impl Consumer {
             0,
             error_counters,
             &bank.rent_collector().rent,
-            base_fee,
+            effective_fee,
         )
     }
 
