@@ -33,7 +33,6 @@ use {
 };
 
 pub(crate) type McpConsensusBlockStore = Arc<RwLock<HashMap<Slot, Vec<u8>>>>;
-const MCP_CONSENSUS_BLOCK_RETENTION_SLOTS: Slot = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReconstructedTransaction {
@@ -316,7 +315,7 @@ pub(crate) fn refresh_vote_gate_input(
 
     match mcp_vote_gate_inputs.write() {
         Ok(mut inputs) => {
-            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+            let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
             inputs.retain(|tracked_slot, _| *tracked_slot >= min_slot);
             inputs.insert(slot, vote_gate_input);
         }
@@ -331,7 +330,7 @@ pub(crate) fn refresh_vote_gate_input(
 
     match mcp_consensus_blocks.write() {
         Ok(mut consensus_blocks) => {
-            let min_slot = root_slot.saturating_sub(MCP_CONSENSUS_BLOCK_RETENTION_SLOTS);
+            let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
             consensus_blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
         }
         Err(err) => {
@@ -514,16 +513,33 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
                 let (execution_class, ordering_fee, signature) =
                     match ordering_metadata_for_payload_transaction(&tx) {
                         Ok(metadata) => metadata,
-                        Err(_) => {
-                            inc_new_counter_error!(
-                                "mcp-reconstruction-transaction-metadata-drop",
-                                1
-                            );
+                        Err(err) => {
+                            inc_new_counter_error!("mcp-reconstruction-transaction-metadata-drop", 1);
+                            match err {
+                                OrderingMetadataError::MissingSignature => inc_new_counter_error!(
+                                    "mcp-reconstruction-transaction-metadata-drop-missing-signature",
+                                    1
+                                ),
+                                OrderingMetadataError::InvalidLegacyView => inc_new_counter_error!(
+                                    "mcp-reconstruction-transaction-metadata-drop-invalid-legacy-view",
+                                    1
+                                ),
+                                OrderingMetadataError::InvalidLegacyRuntimeTransaction => {
+                                    inc_new_counter_error!(
+                                        "mcp-reconstruction-transaction-metadata-drop-invalid-legacy-runtime-transaction",
+                                        1
+                                    )
+                                }
+                            }
                             return None;
                         }
                     };
                 if !seen_signatures.insert(signature) {
                     // Dedup only within a single proposer's payload.
+                    inc_new_counter_error!(
+                        "mcp-reconstruction-transaction-duplicate-signature-drop",
+                        1
+                    );
                     return None;
                 }
                 Some(ReconstructedTransaction {
