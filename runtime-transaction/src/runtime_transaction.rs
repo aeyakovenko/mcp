@@ -39,6 +39,10 @@ impl<T> RuntimeTransaction<T> {
     pub fn into_inner_transaction(self) -> T {
         self.transaction
     }
+
+    pub fn set_mcp_fee_components(&mut self, mcp_fee_components: Option<(u64, u64)>) {
+        self.meta.mcp_fee_components = mcp_fee_components;
+    }
 }
 
 impl<T> StaticMeta for RuntimeTransaction<T> {

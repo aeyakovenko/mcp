@@ -1,9 +1,9 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
+    crate::cluster_tests::start_quic_streamer_to_listen_for_votes_and_certs,
     agave_transaction_view::{
         mcp_transaction::McpTransaction, transaction_view::SanitizedTransactionView,
     },
-    crate::cluster_tests::start_quic_streamer_to_listen_for_votes_and_certs,
     assert_matches::assert_matches,
     crossbeam_channel::{unbounded, Receiver},
     gag::BufferRedirect,
@@ -7172,10 +7172,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     fn first_signature_from_wire_transaction(tx_wire_bytes: &[u8]) -> Option<String> {
         if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(tx_wire_bytes) {
-            return mcp_transaction
-                .signatures
-                .first()
-                .map(ToString::to_string);
+            return mcp_transaction.signatures.first().map(ToString::to_string);
         }
 
         SanitizedTransactionView::try_new_sanitized(tx_wire_bytes)
@@ -7482,12 +7479,15 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         })
     };
     let consensus_block_for_slot = |slot: Slot| -> Option<(Pubkey, ConsensusBlock)> {
-        cluster.validators.iter().find_map(|(pubkey, validator_info)| {
-            let validator = validator_info.validator.as_ref()?;
-            let bytes = validator.mcp_consensus_block_bytes(slot)?;
-            let consensus_block = ConsensusBlock::from_wire_bytes(&bytes).ok()?;
-            Some((*pubkey, consensus_block))
-        })
+        cluster
+            .validators
+            .iter()
+            .find_map(|(pubkey, validator_info)| {
+                let validator = validator_info.validator.as_ref()?;
+                let bytes = validator.mcp_consensus_block_bytes(slot)?;
+                let consensus_block = ConsensusBlock::from_wire_bytes(&bytes).ok()?;
+                Some((*pubkey, consensus_block))
+            })
     };
 
     let post_activation_deadline = Instant::now() + Duration::from_secs(60);
@@ -7800,9 +7800,8 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .expect("artifact slot should contain at least one parseable relay attestation");
     let relay_pubkey = relay_pubkey_for(observed_slot, relay_index)
         .expect("relay schedule should contain observed attestation relay index");
-    let valid_relay_entries = relay_attestation.valid_entries(|proposer_index| {
-        proposer_pubkey_for(observed_slot, proposer_index)
-    });
+    let valid_relay_entries = relay_attestation
+        .valid_entries(|proposer_index| proposer_pubkey_for(observed_slot, proposer_index));
     assert!(
         relay_attestation.verify_relay_signature(&relay_pubkey)
             && !relay_attestation.entries.is_empty()
@@ -7828,28 +7827,31 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .max()
             .unwrap_or_default();
         let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
-        decodable_execution_output = (scan_lower_slot..=max_scan_slot)
-            .rev()
-            .take(512)
-            .find_map(|slot| {
-                blockstores.iter().find_map(|(pubkey, blockstore)| {
-                    let Some(encoded_output) = blockstore.get_mcp_execution_output(slot).unwrap()
-                    else {
-                        return None;
-                    };
-                    let transactions = decode_execution_output_wire_transactions(&encoded_output)?;
-                    if transactions.is_empty() {
-                        return None;
-                    }
-                    let matched_signature = transactions
-                        .iter()
-                        .filter_map(|tx_wire_bytes| {
-                            first_signature_from_wire_transaction(tx_wire_bytes)
-                        })
-                        .find(|signature| submitted_signatures.contains(signature))?;
-                    Some((*pubkey, slot, transactions.len(), matched_signature))
-                })
-            });
+        decodable_execution_output =
+            (scan_lower_slot..=max_scan_slot)
+                .rev()
+                .take(512)
+                .find_map(|slot| {
+                    blockstores.iter().find_map(|(pubkey, blockstore)| {
+                        let Some(encoded_output) =
+                            blockstore.get_mcp_execution_output(slot).unwrap()
+                        else {
+                            return None;
+                        };
+                        let transactions =
+                            decode_execution_output_wire_transactions(&encoded_output)?;
+                        if transactions.is_empty() {
+                            return None;
+                        }
+                        let matched_signature = transactions
+                            .iter()
+                            .filter_map(|tx_wire_bytes| {
+                                first_signature_from_wire_transaction(tx_wire_bytes)
+                            })
+                            .find(|signature| submitted_signatures.contains(signature))?;
+                        Some((*pubkey, slot, transactions.len(), matched_signature))
+                    })
+                });
         if decodable_execution_output.is_some() {
             break;
         }

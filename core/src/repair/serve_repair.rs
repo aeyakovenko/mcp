@@ -1137,7 +1137,11 @@ impl ServeRepair {
             ),
             ("pong", stats.pong, i64),
             ("window_index_misses", stats.window_index_misses, i64),
-            ("mcp_window_index_misses", stats.mcp_window_index_misses, i64),
+            (
+                "mcp_window_index_misses",
+                stats.mcp_window_index_misses,
+                i64
+            ),
             ("parent_misses", stats.parent_misses, i64),
             ("fec_set_root_misses", stats.fec_set_root_misses, i64),
             (
@@ -1747,8 +1751,9 @@ mod tests {
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path_auto_delete,
             shred::{
+                max_ticks_per_n_shreds,
                 mcp_shred::{McpShred, MCP_SHRED_DATA_BYTES, MCP_WITNESS_LEN},
-                max_ticks_per_n_shreds, ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+                ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
             },
         },
         solana_perf::packet::{deserialize_from_with_limit, Packet, PacketFlags, PacketRef},

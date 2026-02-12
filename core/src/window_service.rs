@@ -245,18 +245,21 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
             continue;
         }
 
-        let entries: Vec<AggregateProposerEntry> = attestation
+        if attestation
             .valid_entries(|proposer_index| proposer_schedule.get(proposer_index as usize).copied())
-            .into_iter()
+            .is_empty()
+        {
+            continue;
+        }
+        let entries: Vec<AggregateProposerEntry> = attestation
+            .entries
+            .iter()
             .map(|entry| AggregateProposerEntry {
                 proposer_index: entry.proposer_index,
                 commitment: Hash::new_from_array(entry.commitment),
                 proposer_signature: entry.proposer_signature,
             })
             .collect();
-        if entries.is_empty() {
-            continue;
-        }
         relay_entries.push(AggregateRelayEntry {
             relay_index: relay_index_u32,
             entries,
@@ -904,7 +907,7 @@ fn ingest_mcp_control_message(
             let Ok(payload) = decode_relay_attestation_frame(frame) else {
                 return None;
             };
-            let Ok(mut attestation) = RelayAttestationV1::from_bytes(payload) else {
+            let Ok(attestation) = RelayAttestationV1::from_bytes(payload) else {
                 return None;
             };
 
@@ -939,25 +942,10 @@ fn ingest_mcp_control_message(
                 return None;
             }
 
-            let proposer_pubkeys = leader_schedule_cache
-                .proposers_at_slot(attestation.slot, Some(&root_bank))
-                .or_else(|| leader_schedule_cache.proposers_at_slot(attestation.slot, None))
-                .unwrap_or_default();
-            let filtered_entries = attestation.valid_entries(|proposer_index| {
-                proposer_pubkeys.get(proposer_index as usize).copied()
-            });
-            if filtered_entries.is_empty() {
-                return None;
-            }
-            attestation.entries = filtered_entries;
-            let Ok(attestation_bytes) = attestation.to_bytes() else {
-                return None;
-            };
-
             match blockstore.put_mcp_relay_attestation(
                 attestation.slot,
                 attestation.relay_index,
-                &attestation_bytes,
+                payload,
             ) {
                 Ok(McpPutStatus::Conflict(marker)) => {
                     warn!(
@@ -1634,6 +1622,92 @@ mod test {
     }
 
     #[test]
+    fn test_ingest_mcp_relay_attestation_preserves_signed_entry_list() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let relay_index = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .and_then(|relays| {
+                relays
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in MCP relay schedule");
+        let valid_proposer_index = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .and_then(|proposers| {
+                proposers
+                    .iter()
+                    .position(|pubkey| *pubkey == leader.pubkey())
+                    .and_then(|index| u32::try_from(index).ok())
+            })
+            .expect("leader should appear in MCP proposer schedule");
+        let invalid_proposer_index = if valid_proposer_index == 0 { 1 } else { 0 };
+        let valid_commitment = [41u8; 32];
+        let invalid_commitment = [99u8; 32];
+        let mut entries = vec![
+            RelayAttestationEntry {
+                proposer_index: valid_proposer_index,
+                commitment: valid_commitment,
+                proposer_signature: leader.sign_message(&valid_commitment),
+            },
+            RelayAttestationEntry {
+                proposer_index: invalid_proposer_index,
+                commitment: invalid_commitment,
+                proposer_signature: Signature::default(),
+            },
+        ];
+        entries.sort_unstable_by_key(|entry| entry.proposer_index);
+        let mut attestation = RelayAttestationV1 {
+            slot,
+            relay_index,
+            entries,
+            relay_signature: Signature::default(),
+        };
+        let signing_bytes = attestation.signing_bytes().unwrap();
+        attestation.relay_signature = leader.sign_message(&signing_bytes);
+        let payload = attestation.to_bytes().unwrap();
+        let mut frame = Vec::with_capacity(1 + payload.len());
+        frame.push(MCP_CONTROL_MSG_RELAY_ATTESTATION);
+        frame.extend_from_slice(&payload);
+
+        assert_eq!(
+            ingest_mcp_control_message(
+                leader.pubkey(),
+                SocketAddr::from(([127, 0, 0, 1], 1234)),
+                &frame,
+                &blockstore,
+                &bank_forks,
+                &leader_schedule_cache,
+                None,
+            ),
+            Some(slot),
+        );
+
+        let stored = blockstore
+            .get_mcp_relay_attestation(slot, relay_index)
+            .unwrap()
+            .expect("stored attestation missing");
+        assert_eq!(stored, payload);
+        let stored_attestation = RelayAttestationV1::from_bytes(&stored).unwrap();
+        assert_eq!(stored_attestation.entries.len(), 2);
+        assert!(stored_attestation.verify_relay_signature(&leader.pubkey()));
+    }
+
+    #[test]
     fn test_maybe_finalize_consensus_block_from_relay_attestations() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
@@ -1736,6 +1810,131 @@ mod test {
         assert_eq!(block.slot, slot);
         assert_eq!(block.delayed_bankhash, delayed_bankhash);
         assert!(block.verify_leader_signature(&leader.pubkey()));
+    }
+
+    #[test]
+    fn test_maybe_finalize_consensus_block_keeps_original_relay_signed_entries() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Arc::new(Keypair::new());
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+
+        let delayed_bank = Bank::new_from_parent(
+            root_bank.clone(),
+            &Pubkey::new_unique(),
+            slot.saturating_sub(1),
+        );
+        let delayed_bankhash = delayed_bank.hash();
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        slot_bank.set_block_id(Some(Hash::new_unique()));
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            bank_forks.insert(delayed_bank);
+            bank_forks.insert(slot_bank);
+        }
+
+        let proposer_schedule = leader_schedule_cache
+            .proposers_at_slot(slot, Some(&root_bank))
+            .expect("MCP proposer schedule missing");
+        let valid_proposer_index = proposer_schedule
+            .iter()
+            .position(|pubkey| *pubkey == leader.pubkey())
+            .and_then(|index| u32::try_from(index).ok())
+            .expect("leader should appear in MCP proposer schedule");
+        let invalid_proposer_index = if valid_proposer_index == 0 { 1 } else { 0 };
+        let relay_schedule = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .expect("MCP relay schedule missing");
+
+        let valid_commitment = [7u8; 32];
+        let invalid_commitment = [8u8; 32];
+        let valid_signature = leader.sign_message(&valid_commitment);
+        let relay_indices: Vec<u32> = relay_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(relay_index, pubkey)| {
+                if *pubkey == leader.pubkey() {
+                    u32::try_from(relay_index).ok()
+                } else {
+                    None
+                }
+            })
+            .take(mcp::REQUIRED_ATTESTATIONS)
+            .collect();
+        assert_eq!(relay_indices.len(), mcp::REQUIRED_ATTESTATIONS);
+
+        for relay_index in relay_indices {
+            let mut entries = vec![
+                RelayAttestationEntry {
+                    proposer_index: valid_proposer_index,
+                    commitment: valid_commitment,
+                    proposer_signature: valid_signature,
+                },
+                RelayAttestationEntry {
+                    proposer_index: invalid_proposer_index,
+                    commitment: invalid_commitment,
+                    proposer_signature: Signature::default(),
+                },
+            ];
+            entries.sort_unstable_by_key(|entry| entry.proposer_index);
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries,
+                relay_signature: Signature::default(),
+            };
+            let signing_bytes = attestation.signing_bytes().unwrap();
+            attestation.relay_signature = leader.sign_message(&signing_bytes);
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation.to_bytes().unwrap())
+                .unwrap();
+        }
+
+        let contact_info = ContactInfo::new_localhost(&leader.pubkey(), timestamp());
+        let cluster_info =
+            ClusterInfo::new(contact_info, leader.clone(), SocketAddrSpace::Unspecified);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
+            slot,
+            &leader.pubkey(),
+            &cluster_info,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            None,
+        );
+        assert!(!should_retry);
+
+        let block_bytes = consensus_blocks
+            .read()
+            .unwrap()
+            .get(&slot)
+            .cloned()
+            .expect("consensus block should be finalized");
+        let block = ConsensusBlock::from_wire_bytes(&block_bytes).unwrap();
+        assert_eq!(block.slot, slot);
+        assert_eq!(block.delayed_bankhash, delayed_bankhash);
+        let aggregate = AggregateAttestation::from_wire_bytes(&block.aggregate_bytes).unwrap();
+        assert_eq!(aggregate.relay_entries.len(), mcp::REQUIRED_ATTESTATIONS);
+        for relay_entry in &aggregate.relay_entries {
+            assert_eq!(relay_entry.entries.len(), 2);
+            let relay_pubkey = relay_schedule
+                .get(relay_entry.relay_index as usize)
+                .copied()
+                .expect("relay index should map to schedule");
+            assert!(relay_entry.verify_relay_signature(aggregate.version, slot, &relay_pubkey));
+        }
     }
 
     #[test]
