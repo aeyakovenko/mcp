@@ -566,6 +566,14 @@ impl<'de> SchemaRead<'de> for BlockComponent {
         let entry_count = u64::from_le_bytes(*count_bytes);
 
         if entry_count == 0 {
+            // bincode-encoded empty Vec<Entry> is exactly 8 zero bytes.
+            // Disambiguate it from BlockMarker by checking if any marker payload exists.
+            let data = reader.fill_buf(usize::MAX)?;
+            if data.len() == Self::ENTRY_COUNT_SIZE {
+                reader.consume(Self::ENTRY_COUNT_SIZE)?;
+                dst.write(Self::EntryBatch(Vec::new()));
+                return Ok(());
+            }
             // This is a BlockMarker - consume the count bytes and read the marker
             reader.consume(8)?;
             dst.write(Self::BlockMarker(VersionedBlockMarker::get(reader)?));
@@ -662,6 +670,11 @@ mod tests {
         assert_eq!(comp, deser);
 
         let comp = BlockComponent::new_block_marker(marker);
+        let bytes = wincode::serialize(&comp).unwrap();
+        let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
+        assert_eq!(comp, deser);
+
+        let comp = BlockComponent::EntryBatch(vec![]);
         let bytes = wincode::serialize(&comp).unwrap();
         let deser: BlockComponent = wincode::deserialize(&bytes).unwrap();
         assert_eq!(comp, deser);
