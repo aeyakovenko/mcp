@@ -408,7 +408,15 @@ Non-reusable for MCP wire correctness:
 - Relay retransmits verified MCP shreds to validators over existing TVU fetch UDP sockets.
 - Extend retransmit addressing to derive slot/shred-id from MCP wire format when Agave shred-id parsing fails.
 
-### 4.5 Tests
+### 4.5 MCP repair path
+
+- Extend repair request/response indexing for MCP to `(slot, proposer_index, shred_index)`.
+- MCP repair response framing constraint:
+  - MCP shred wire payload is already `PACKET_DATA_SIZE`, so MCP repair responses omit trailing nonce bytes.
+  - repair nonce verification remains strict for legacy shreds; nonce-less repair acceptance is MCP-only and matched against outstanding MCP requests by payload key.
+- Expose admin RPC helper for explicit MCP repair requests (`repairMcpShredFromPeer`).
+
+### 4.6 Tests
 
 - Window-service partition before Agave shred deserialize.
 - Duplicate relay-index behavior (one attestation per relay index).
@@ -621,11 +629,9 @@ Reconstruction-to-execution bridge:
   - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)`, and retries finalization until available.
   - ingestion drops consensus blocks with non-hash-sized `consensus_meta`.
   - replay reads consensus-sidecar `block_id`, sets `bank.block_id`, and defers bank completion if a cached consensus block lacks an authoritative sidecar.
-- Compatibility behavior in v1:
-  - local `block_id` derivation fallback remains only for slots where no consensus block has yet been observed.
+- Current v1 strictness:
+  - for every MCP-active replay slot, missing/invalid authoritative sidecar defers completion; no local `block_id` derivation fallback is used.
   - vote wire format remains unchanged; tower vote path consumes `bank.block_id()` and is gated by consensus/vote-gate checks.
-- Strict-authority follow-up:
-  - remove pre-consensus fallback once consensus-block presence is guaranteed before replay execution for every MCP-active slot.
 
 ### 7.5 Empty result
 
