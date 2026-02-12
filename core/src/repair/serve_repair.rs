@@ -2264,6 +2264,55 @@ mod tests {
         assert_eq!(rv[0].slot(), slot);
     }
 
+    #[test]
+    fn test_run_mcp_window_request() {
+        let slot = 7;
+        let proposer_index = 2;
+        let shred_index = 5;
+        let nonce = 11;
+        let recycler = PacketBatchRecycler::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let handler = StandardRepairHandler::new(blockstore.clone());
+
+        let mcp_shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+            commitment: [1u8; 32],
+            shred_data: [2u8; MCP_SHRED_DATA_BYTES],
+            witness: [[3u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        let payload = mcp_shred.to_bytes();
+        blockstore
+            .put_mcp_shred_data(slot, proposer_index, shred_index, &payload)
+            .unwrap();
+
+        let mut rv = handler
+            .run_mcp_window_request(
+                &recycler,
+                &socketaddr_any!(),
+                slot,
+                proposer_index,
+                shred_index,
+                nonce,
+            )
+            .expect("packets");
+        let request = ShredRepairType::McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        verify_responses(&request, rv.iter());
+        let mut packet = rv.get_mut(0).unwrap();
+        packet.meta_mut().flags |= PacketFlags::REPAIR;
+        let (shred, repair_nonce) =
+            shred::layout::get_shred_and_repair_nonce(packet.as_ref()).unwrap();
+        assert_eq!(repair_nonce, None);
+        assert_eq!(shred, payload.as_ref());
+    }
+
     fn new_test_cluster_info() -> ClusterInfo {
         let keypair = Arc::new(Keypair::new());
         let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), timestamp());
