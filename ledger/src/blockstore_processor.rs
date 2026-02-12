@@ -1775,26 +1775,25 @@ fn versioned_transaction_from_mcp_wire_bytes(
     tx_index: usize,
     tx_wire_bytes: &[u8],
 ) -> result::Result<(VersionedTransaction, Option<(u64, u64)>), BlockstoreProcessorError> {
+    if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(tx_wire_bytes) {
+        let mcp_fee_components = Some((
+            u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
+            mcp_transaction.ordering_fee_with_fallback(),
+        ));
+        return Ok((
+            mcp_transaction_to_versioned_transaction(mcp_transaction),
+            mcp_fee_components,
+        ));
+    }
+
     if let Ok(versioned_tx) = bincode::deserialize::<VersionedTransaction>(tx_wire_bytes) {
         return Ok((versioned_tx, None));
     }
 
-    let mcp_transaction = McpTransaction::from_bytes_compat(tx_wire_bytes).map_err(|err| {
-        BlockstoreProcessorError::InvalidMcpExecutionOutput {
-            slot,
-            reason: format!(
-                "tx[{tx_index}] is neither bincode VersionedTransaction nor MCP format: {err:?}"
-            ),
-        }
-    })?;
-    let mcp_fee_components = Some((
-        u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
-        mcp_transaction.ordering_fee_with_fallback(),
-    ));
-    Ok((
-        mcp_transaction_to_versioned_transaction(mcp_transaction),
-        mcp_fee_components,
-    ))
+    Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+        slot,
+        reason: format!("tx[{tx_index}] is neither MCP format nor bincode VersionedTransaction"),
+    })
 }
 
 fn maybe_override_replay_entries_with_mcp_execution_output(
@@ -5984,6 +5983,28 @@ pub mod tests {
         let (_versioned, mcp_fee_components) =
             versioned_transaction_from_mcp_wire_bytes(12, 0, &legacy_wire).unwrap();
         assert_eq!(mcp_fee_components, Some((17, 33)));
+    }
+
+    #[test]
+    fn test_versioned_transaction_from_mcp_wire_bytes_accepts_bincode_versioned_transaction() {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(60_000, &dummy_leader_pubkey, 100);
+        let tx = system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            genesis_config.hash(),
+        );
+        let encoded = bincode::serialize(&tx).unwrap();
+
+        let (versioned, mcp_fee_components) =
+            versioned_transaction_from_mcp_wire_bytes(13, 0, &encoded).unwrap();
+        assert!(mcp_fee_components.is_none());
+        assert_eq!(versioned.signatures, tx.signatures);
     }
 
     #[test]

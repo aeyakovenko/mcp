@@ -172,12 +172,15 @@ impl McpProposerDispatchState {
         let Some(tx_wire_len) =
             MCP_PAYLOAD_LEN_PREFIX_BYTES.checked_add(transaction.wire_bytes.len())
         else {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-reservation-overflow", 1, 1);
             return false;
         };
         let Some(next_payload_len) = self.payload_len_bytes.checked_add(tx_wire_len) else {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-reservation-overflow", 1, 1);
             return false;
         };
         if next_payload_len > mcp_proposer::MCP_MAX_PAYLOAD_SIZE {
+            inc_new_counter_error!("mcp-proposer-dispatch-payload-full", 1, 1);
             return false;
         }
 
@@ -856,26 +859,22 @@ impl StandardBroadcastRun {
                     continue;
                 };
                 if let Some(target_proposer) = payload_transaction.target_proposer {
-                    if proposer_indices.contains(&target_proposer)
-                        && !slot_state.try_push_transaction(
+                    if proposer_indices.contains(&target_proposer) {
+                        let _ = slot_state.try_push_transaction(
                             target_proposer,
                             bank,
                             payload_transaction,
-                        )
-                    {
-                        return;
+                        );
                     }
                     continue;
                 }
 
-                if proposer_indices.iter().copied().any(|proposer_index| {
-                    !slot_state.try_push_transaction(
+                for proposer_index in proposer_indices.iter().copied() {
+                    let _ = slot_state.try_push_transaction(
                         proposer_index,
                         bank,
                         payload_transaction.clone(),
-                    )
-                }) {
-                    return;
+                    );
                 }
             }
         }
