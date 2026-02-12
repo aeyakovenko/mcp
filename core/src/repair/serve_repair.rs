@@ -18,6 +18,7 @@ use {
             result::{Error, RepairVerifyError, Result},
         },
     },
+    agave_feature_set as feature_set,
     bincode::{serialize, Options},
     bytes::Bytes,
     crossbeam_channel::{Receiver, RecvTimeoutError},
@@ -686,15 +687,31 @@ impl ServeRepair {
                     shred_index,
                 } => {
                     stats.mcp_window_index += 1;
-                    let batch = self.repair_handler.run_mcp_window_request(
-                        recycler,
-                        from_addr,
-                        *slot,
-                        *proposer_index,
-                        *shred_index,
-                        *nonce,
-                    );
+                    let feature_active = self
+                        .sharable_banks
+                        .root()
+                        .feature_set
+                        .activated_slot(&feature_set::mcp_protocol_v1::id())
+                        .is_some_and(|activated_slot| *slot >= activated_slot);
+                    let batch = if feature_active {
+                        self.repair_handler.run_mcp_window_request(
+                            recycler,
+                            from_addr,
+                            *slot,
+                            *proposer_index,
+                            *shred_index,
+                            *nonce,
+                        )
+                    } else {
+                        None
+                    };
                     if batch.is_none() {
+                        if !feature_active {
+                            inc_new_counter_error!(
+                                "serve_repair-mcp_window_index-before-feature",
+                                1
+                            );
+                        }
                         stats.mcp_window_index_misses += 1;
                     }
                     (batch, "McpWindowIndexWithNonce")
@@ -1741,6 +1758,7 @@ mod tests {
     use {
         super::*,
         crate::repair::repair_response,
+        agave_feature_set as feature_set,
         agave_feature_set::FeatureSet,
         solana_gossip::{contact_info::ContactInfo, socketaddr, socketaddr_any},
         solana_hash::Hash,
@@ -2316,6 +2334,109 @@ mod tests {
             shred::layout::get_shred_and_repair_nonce(packet.as_ref()).unwrap();
         assert_eq!(repair_nonce, None);
         assert_eq!(shred, payload.as_ref());
+    }
+
+    #[test]
+    fn test_handle_repair_mcp_window_request_requires_feature_activation() {
+        let slot = 11;
+        let proposer_index = 3;
+        let shred_index = 9;
+        let nonce = 17;
+        let recycler = PacketBatchRecycler::default();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let mcp_shred = McpShred {
+            slot,
+            proposer_index,
+            shred_index,
+            commitment: [1u8; 32],
+            shred_data: [2u8; MCP_SHRED_DATA_BYTES],
+            witness: [[3u8; 32]; MCP_WITNESS_LEN],
+            proposer_signature: Signature::default(),
+        };
+        blockstore
+            .put_mcp_shred_data(slot, proposer_index, shred_index, &mcp_shred.to_bytes())
+            .unwrap();
+
+        let cluster_info = Arc::new(new_test_cluster_info());
+        let whitelist = Arc::new(RwLock::new(HashSet::default()));
+        let handler: Box<dyn RepairHandler + Send + Sync> =
+            Box::new(StandardRepairHandler::new(blockstore.clone()));
+        let request = RepairProtocol::McpWindowIndex {
+            header: RepairRequestHeader {
+                signature: Signature::default(),
+                sender: cluster_info.id(),
+                recipient: cluster_info.id(),
+                timestamp: timestamp(),
+                nonce,
+            },
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let request_active = RepairProtocol::McpWindowIndex {
+            header: RepairRequestHeader {
+                signature: Signature::default(),
+                sender: cluster_info.id(),
+                recipient: cluster_info.id(),
+                timestamp: timestamp(),
+                nonce,
+            },
+            slot,
+            proposer_index,
+            shred_index,
+        };
+        let mut ping_cache = PingCache::new(
+            &mut rand::thread_rng(),
+            Instant::now(),
+            REPAIR_PING_CACHE_TTL,
+            REPAIR_PING_CACHE_RATE_LIMIT_DELAY,
+            REPAIR_PING_CACHE_CAPACITY,
+        );
+
+        let mut pre_feature_bank =
+            Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        pre_feature_bank.deactivate_feature(&feature_set::mcp_protocol_v1::id());
+        let pre_feature_bank_forks = BankForks::new_rw_arc(pre_feature_bank);
+        let pre_feature_serve_repair = ServeRepair::new(
+            cluster_info.clone(),
+            pre_feature_bank_forks.read().unwrap().sharable_banks(),
+            whitelist.clone(),
+            handler,
+            Arc::new(MigrationStatus::default()),
+        );
+        let mut stats = ServeRepairStats::default();
+        let response = pre_feature_serve_repair.handle_repair(
+            &recycler,
+            &socketaddr_any!(),
+            request,
+            &mut stats,
+            &mut ping_cache,
+        );
+        assert!(response.is_none());
+        assert_eq!(stats.mcp_window_index, 1);
+        assert_eq!(stats.mcp_window_index_misses, 1);
+
+        let mut active_bank = Bank::new_for_tests(&create_genesis_config(10_000).genesis_config);
+        active_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let active_bank_forks = BankForks::new_rw_arc(active_bank);
+        let active_serve_repair = ServeRepair::new(
+            cluster_info,
+            active_bank_forks.read().unwrap().sharable_banks(),
+            whitelist,
+            Box::new(StandardRepairHandler::new(blockstore)),
+            Arc::new(MigrationStatus::default()),
+        );
+        let mut active_stats = ServeRepairStats::default();
+        let response = active_serve_repair.handle_repair(
+            &recycler,
+            &socketaddr_any!(),
+            request_active,
+            &mut active_stats,
+            &mut ping_cache,
+        );
+        assert!(response.is_some());
+        assert_eq!(active_stats.mcp_window_index, 1);
     }
 
     fn new_test_cluster_info() -> ClusterInfo {

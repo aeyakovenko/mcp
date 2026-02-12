@@ -1702,6 +1702,17 @@ fn decode_mcp_execution_output_wire_transactions(
             slot,
             reason: "tx_count does not fit usize".to_string(),
         })?;
+    let remaining = encoded_output.len().saturating_sub(offset);
+    let max_count = remaining / std::mem::size_of::<u32>();
+    if tx_count > max_count {
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: format!(
+                "tx_count {tx_count} exceeds max possible {max_count} for payload length {}",
+                encoded_output.len()
+            ),
+        });
+    }
 
     let mut transactions = Vec::with_capacity(tx_count);
     for tx_index in 0..tx_count {
@@ -5907,6 +5918,17 @@ pub mod tests {
         let encoded = encode_mcp_execution_output_for_tests(&[tx_a.clone(), tx_b.clone()]);
         let decoded = decode_mcp_execution_output_wire_transactions(42, &encoded).unwrap();
         assert_eq!(decoded, vec![tx_a, tx_b]);
+    }
+
+    #[test]
+    fn test_decode_mcp_execution_output_wire_transactions_rejects_unbounded_tx_count() {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(u32::MAX).to_le_bytes());
+        let err = decode_mcp_execution_output_wire_transactions(99, &encoded).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockstoreProcessorError::InvalidMcpExecutionOutput { .. }
+        ));
     }
 
     #[test]
