@@ -4027,6 +4027,16 @@ impl ReplayStage {
         Ok(())
     }
 
+    fn should_defer_for_missing_mcp_authoritative_block_id(
+        bank: &Bank,
+        mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,
+    ) -> bool {
+        bank.feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
+            && Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks).is_none()
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_replay_results(
         blockstore: &Blockstore,
@@ -4134,16 +4144,6 @@ impl ReplayStage {
                 }
 
                 let is_leader_block = bank.collector_id() == my_pubkey;
-                let consensus_block_seen = bank
-                    .feature_set
-                    .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-                    .is_some_and(|activated_slot| {
-                        bank.slot() >= activated_slot
-                            && Self::has_mcp_consensus_block_for_slot(
-                                bank.slot(),
-                                mcp_consensus_blocks,
-                            )
-                    });
                 let authoritative_mcp_block_id = bank
                     .feature_set
                     .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
@@ -4151,9 +4151,12 @@ impl ReplayStage {
                     .and_then(|_| {
                         Self::mcp_authoritative_block_id_for_slot(bank.slot(), mcp_consensus_blocks)
                     });
-                if consensus_block_seen && authoritative_mcp_block_id.is_none() {
+                if Self::should_defer_for_missing_mcp_authoritative_block_id(
+                    bank.as_ref(),
+                    mcp_consensus_blocks,
+                ) {
                     debug!(
-                        "deferring completion for slot {}: consensus block missing authoritative block_id sidecar",
+                        "deferring completion for slot {}: missing authoritative MCP block_id sidecar",
                         bank.slot()
                     );
                     continue;
@@ -5604,6 +5607,81 @@ pub(crate) mod tests {
             ReplayStage::mcp_authoritative_block_id_for_slot(slot, &store),
             None
         );
+    }
+
+    #[test]
+    fn test_should_defer_for_missing_mcp_authoritative_block_id_for_active_mcp_slot() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let _blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        assert!(ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+            replay_bank.as_ref(),
+            &mcp_consensus_blocks,
+        ));
+
+        let block_id = Hash::new_unique();
+        let aggregate_bytes = AggregateAttestation::new_canonical(1, 0, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let mut consensus_block = ConsensusBlock::new_unsigned(
+            1,
+            0,
+            aggregate_bytes,
+            block_id.to_bytes().to_vec(),
+            Hash::new_unique(),
+        )
+        .unwrap();
+        consensus_block.sign_leader(&leader).unwrap();
+        mcp_consensus_blocks
+            .write()
+            .unwrap()
+            .insert(1, consensus_block.to_wire_bytes().unwrap());
+
+        assert!(!ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+            replay_bank.as_ref(),
+            &mcp_consensus_blocks,
+        ));
+    }
+
+    #[test]
+    fn test_should_not_defer_for_missing_mcp_authoritative_block_id_before_feature_activation() {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let replay_bank = bank_forks
+            .write()
+            .unwrap()
+            .insert(Bank::new_from_parent(root_bank, &leader.pubkey(), 1))
+            .clone_without_scheduler();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        assert!(!ReplayStage::should_defer_for_missing_mcp_authoritative_block_id(
+            replay_bank.as_ref(),
+            &mcp_consensus_blocks,
+        ));
     }
 
     #[test]

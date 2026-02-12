@@ -2,54 +2,54 @@
 
 Date: 2026-02-12
 Branch: `master`
-Scope: confirm current audit concerns, land fixes on `master`, and re-validate with targeted tests.
+Scope: close remaining audit blockers and re-validate implementation deltas against `plan.md`.
 
 ## Verdict
 
-- MCP implementation remains feature-complete vs `plan.md`.
-- Confirmed audit gaps addressed in this pass: 4.
-- Remaining open implementation concerns: 2 (unchanged, intentionally tracked).
+- Previously open blockers are now implemented on `master`.
+- `B3` strictness and MCP repair indexing are both closed in code.
+- Remaining risk is integration breadth, not known correctness bugs in these two areas.
 
-## Confirmed Concerns and Status
+## Closed Blockers
 
-1. Relay attestation proposer-entry signature validation in local-cluster integration test.
+1. MCP shred repair extension for `(slot, proposer_index, shred_index)`.
 - Status: `RESOLVED`.
-- Evidence: `local-cluster/tests/local_cluster.rs` now requires all attestation entries to pass `valid_entries(...)` against proposer schedule.
+- Evidence:
+  - request/response protocol and mapping: `core/src/repair/serve_repair.rs`
+    - `ShredRepairType::McpShred`
+    - `RepairProtocol::McpWindowIndex`
+    - request mapping, verification, stats paths
+  - handler support: `core/src/repair/repair_handler.rs`, `core/src/repair/standard_repair_handler.rs`, `core/src/repair/malicious_repair_handler.rs`
+  - request API + admin RPC: `core/src/repair/repair_service.rs`, `validator/src/admin_rpc_service.rs`
+  - response framing fix for max-size MCP shred payload:
+    - MCP responses omit nonce when payload is full-size (`PACKET_DATA_SIZE`)
+    - implemented in `core/src/repair/repair_response.rs`
+  - nonce verification path updated:
+    - legacy repair responses still require nonce
+    - nonce-less repair acceptance is MCP-only and matched via outstanding MCP request payload
+    - `core/src/shred_fetch_stage.rs`, `core/src/repair/outstanding_requests.rs`
+  - wire extraction supports MCP repair payloads: `ledger/src/shred/wire.rs`
 
-2. Vote-gate inclusion boundary coverage (`REQUIRED_INCLUSIONS` 79 vs 80).
+2. B3 strictness deviation (fallback block-id path for MCP-active replay slots).
 - Status: `RESOLVED`.
-- Evidence: new unit test in `core/src/mcp_vote_gate.rs` (`test_inclusion_threshold_boundary_requires_at_least_80_relays`).
+- Evidence:
+  - replay now defers completion for any MCP-active slot missing authoritative sidecar hash:
+    - `core/src/replay_stage.rs` (`should_defer_for_missing_mcp_authoritative_block_id`)
+  - completion path no longer relies on local fallback for MCP-active slots.
 
-3. Explicit Merkle domain-separation test coverage.
-- Status: `RESOLVED`.
-- Evidence: new unit test in `ledger/src/mcp_merkle.rs` (`test_domain_separation_formulas_for_leaf_and_internal_node_hashes`).
+## Validation Runs (This Pass)
 
-4. Data-shards-only erasure recovery coverage.
-- Status: `RESOLVED`.
-- Evidence: new unit test in `ledger/src/mcp_erasure.rs` (`test_reconstruction_from_data_shards_only`).
+- `cargo check -p solana-core -p solana-ledger -p agave-validator`
+- `cargo test -p solana-core repair::serve_repair::tests -- --nocapture`
+- `cargo test -p solana-core repair::outstanding_requests::tests -- --nocapture`
+- `cargo test -p solana-core shred_fetch_stage::tests -- --nocapture`
+- `cargo test -p solana-core test_should_defer_for_missing_mcp_authoritative_block_id_for_active_mcp_slot -- --nocapture`
+- `cargo test -p solana-core test_should_not_defer_for_missing_mcp_authoritative_block_id_before_feature_activation -- --nocapture`
+- `cargo test -p solana-core test_sigverify_shred_cpu_repair -- --nocapture`
+- `cargo test -p solana-core test_repair_response_packet_from_bytes_without_nonce_allows_full_payload -- --nocapture`
+- `cargo test -p solana-ledger test_get_shred_and_repair_nonce_for_mcp_shred_payload_without_nonce -- --nocapture`
 
-## Remaining Open Concerns
+## Residual Risk / UNVERIFIED
 
-1. MCP shred repair protocol extension for `(slot, proposer_index, shred_index)` indexing.
-- Status: `OPEN`.
-- Notes: existing repair protocol remains slot+shred-index based.
-
-2. B3 strictness deviation: block-id fallback path still exists for some missing-sidecar conditions.
-- Status: `OPEN`.
-- Notes: still treated as acknowledged v1 deviation.
-
-## Validation Runs
-
-Passed in this pass:
-
-- `cargo test -p solana-core mcp_vote_gate -- --nocapture`
-- `cargo test -p solana-ledger mcp_merkle -- --nocapture`
-- `cargo test -p solana-ledger mcp_erasure -- --nocapture`
-- `cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture`
-
-## Files Updated This Pass
-
-- `core/src/mcp_vote_gate.rs`
-- `ledger/src/mcp_merkle.rs`
-- `ledger/src/mcp_erasure.rs`
-- `audit.md`
+- `UNVERIFIED`: full multi-node local-cluster e2e coverage specifically exercising MCP repair request/response under network fault conditions in this pass.
+  - Follow-up validation target: run issue-20 local-cluster flow with induced MCP shred loss and explicit `repairMcpShredFromPeer` triggers.
