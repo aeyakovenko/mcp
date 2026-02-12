@@ -1763,9 +1763,9 @@ fn versioned_transaction_from_mcp_wire_bytes(
     slot: Slot,
     tx_index: usize,
     tx_wire_bytes: &[u8],
-) -> result::Result<VersionedTransaction, BlockstoreProcessorError> {
+) -> result::Result<(VersionedTransaction, Option<(u64, u64)>), BlockstoreProcessorError> {
     if let Ok(versioned_tx) = bincode::deserialize::<VersionedTransaction>(tx_wire_bytes) {
-        return Ok(versioned_tx);
+        return Ok((versioned_tx, None));
     }
 
     let mcp_transaction = McpTransaction::from_bytes_compat(tx_wire_bytes).map_err(|err| {
@@ -1776,7 +1776,14 @@ fn versioned_transaction_from_mcp_wire_bytes(
             ),
         }
     })?;
-    Ok(mcp_transaction_to_versioned_transaction(mcp_transaction))
+    let mcp_fee_components = Some((
+        u64::from(mcp_transaction.inclusion_fee().unwrap_or_default()),
+        mcp_transaction.ordering_fee_with_fallback(),
+    ));
+    Ok((
+        mcp_transaction_to_versioned_transaction(mcp_transaction),
+        mcp_fee_components,
+    ))
 }
 
 fn maybe_override_replay_entries_with_mcp_execution_output(
@@ -1813,15 +1820,18 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         .iter()
         .enumerate()
         .map(|(tx_index, tx_wire_bytes)| {
-            let versioned_tx =
+            let (versioned_tx, mcp_fee_components) =
                 versioned_transaction_from_mcp_wire_bytes(slot, tx_index, tx_wire_bytes)?;
-            bank.verify_transaction(versioned_tx, verification_mode)
+            let mut transaction = bank
+                .verify_transaction(versioned_tx, verification_mode)
                 .map_err(|err| BlockstoreProcessorError::InvalidMcpExecutionOutput {
                     slot,
                     reason: format!("tx[{tx_index}] failed bank.verify_transaction: {err:?}"),
-                })
+                })?;
+            transaction.set_mcp_fee_components(mcp_fee_components);
+            Ok(transaction)
         })
-        .collect::<result::Result<Vec<_>, _>>()?;
+        .collect::<result::Result<Vec<_>, BlockstoreProcessorError>>()?;
 
     if bank.vote_only_bank()
         && transactions
@@ -5919,7 +5929,9 @@ pub mod tests {
         };
         let legacy_wire = mcp_transaction.to_bytes()[1..].to_vec();
 
-        let versioned = versioned_transaction_from_mcp_wire_bytes(11, 0, &legacy_wire).unwrap();
+        let (versioned, mcp_fee_components) =
+            versioned_transaction_from_mcp_wire_bytes(11, 0, &legacy_wire).unwrap();
+        assert_eq!(mcp_fee_components, Some((0, 0)));
         let VersionedMessage::Legacy(message) = versioned.message else {
             panic!("expected legacy message for MCP legacy wire format");
         };
@@ -5930,6 +5942,40 @@ pub mod tests {
         assert_eq!(message.header.num_required_signatures, 1);
         assert_eq!(message.account_keys.len(), 1);
         assert_eq!(versioned.signatures.len(), 1);
+    }
+
+    #[test]
+    fn test_versioned_transaction_from_mcp_wire_bytes_keeps_mcp_fee_components() {
+        let lifetime_specifier = [9u8; 32];
+        let mcp_transaction = McpTransaction {
+            version: MCP_TX_LATEST_VERSION,
+            legacy_header: McpLegacyHeader {
+                num_required_signatures: 1,
+                num_readonly_signed: 0,
+                num_readonly_unsigned: 0,
+            },
+            transaction_config_mask: (1u32
+                << agave_transaction_view::mcp_transaction::MCP_TX_CONFIG_BIT_INCLUSION_FEE)
+                | (1u32 << agave_transaction_view::mcp_transaction::MCP_TX_CONFIG_BIT_ORDERING_FEE),
+            lifetime_specifier,
+            addresses: vec![Pubkey::new_unique()],
+            config_values: vec![17, 33],
+            instruction_headers: vec![McpInstructionHeader {
+                program_account_index: 0,
+                num_instruction_accounts: 0,
+                num_instruction_data_bytes: 0,
+            }],
+            instruction_payloads: vec![McpInstructionPayload {
+                account_indexes: vec![],
+                instruction_data: vec![],
+            }],
+            signatures: vec![Signature::default()],
+        };
+        let legacy_wire = mcp_transaction.to_bytes()[1..].to_vec();
+
+        let (_versioned, mcp_fee_components) =
+            versioned_transaction_from_mcp_wire_bytes(12, 0, &legacy_wire).unwrap();
+        assert_eq!(mcp_fee_components, Some((17, 33)));
     }
 
     #[test]

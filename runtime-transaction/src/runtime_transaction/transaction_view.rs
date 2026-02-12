@@ -73,10 +73,7 @@ impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
                         // Latest MCP format may omit fee fields; missing values default to v0
                         // behavior so sanitization remains backward-compatible.
                         let inclusion_fee = u64::from(mcp_tx.inclusion_fee().unwrap_or_default());
-                        let ordering_fee =
-                            mcp_tx.ordering_fee().map(u64::from).unwrap_or_else(|| {
-                                compute_budget_instruction_details.requested_compute_unit_price()
-                            });
+                        let ordering_fee = mcp_tx.ordering_fee_with_fallback();
                         Some((inclusion_fee, ordering_fee))
                     } else {
                         // Legacy MCP layout has no ordering_fee field; use CU price.

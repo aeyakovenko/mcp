@@ -1,4 +1,8 @@
-use {solana_pubkey::Pubkey, solana_signature::Signature};
+use {
+    solana_compute_budget_instruction::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
+    solana_pubkey::Pubkey, solana_signature::Signature,
+    solana_svm_transaction::instruction::SVMInstruction,
+};
 
 pub const MCP_TX_LATEST_VERSION: u8 = 1;
 pub const MCP_TX_CONFIG_BIT_INCLUSION_FEE: u8 = 0;
@@ -235,8 +239,38 @@ impl McpTransaction {
         self.config_value(MCP_TX_CONFIG_BIT_ORDERING_FEE)
     }
 
+    pub fn ordering_fee_with_fallback(&self) -> u64 {
+        self.ordering_fee().map_or_else(
+            || {
+                self.compute_budget_instruction_details()
+                    .map_or(0, |details| details.requested_compute_unit_price())
+            },
+            u64::from,
+        )
+    }
+
     pub fn target_proposer(&self) -> Option<u32> {
         self.config_value(MCP_TX_CONFIG_BIT_TARGET_PROPOSER)
+    }
+
+    fn compute_budget_instruction_details(&self) -> Option<ComputeBudgetInstructionDetails> {
+        let addresses = self.addresses.as_slice();
+        let instructions = self
+            .instruction_headers
+            .iter()
+            .zip(self.instruction_payloads.iter())
+            .filter_map(move |(header, payload)| {
+                let program_id = addresses.get(header.program_account_index as usize)?;
+                Some((
+                    program_id,
+                    SVMInstruction {
+                        program_id_index: header.program_account_index,
+                        accounts: payload.account_indexes.as_slice(),
+                        data: payload.instruction_data.as_slice(),
+                    },
+                ))
+            });
+        ComputeBudgetInstructionDetails::try_from(instructions).ok()
     }
 }
 
@@ -353,7 +387,31 @@ mod tests {
         assert_eq!(parsed, tx);
         assert_eq!(parsed.inclusion_fee(), Some(7));
         assert_eq!(parsed.ordering_fee(), Some(11));
+        assert_eq!(parsed.ordering_fee_with_fallback(), 11);
         assert_eq!(parsed.target_proposer(), Some(42));
+    }
+
+    #[test]
+    fn test_ordering_fee_with_fallback_uses_compute_unit_price_when_field_absent() {
+        let mut tx = sample_transaction();
+        tx.transaction_config_mask =
+            (1u32 << MCP_TX_CONFIG_BIT_INCLUSION_FEE) | (1u32 << MCP_TX_CONFIG_BIT_TARGET_PROPOSER);
+        tx.config_values = vec![7, 42];
+        tx.addresses = vec![solana_sdk_ids::compute_budget::id()];
+        tx.instruction_headers = vec![InstructionHeader {
+            program_account_index: 0,
+            num_instruction_accounts: 0,
+            num_instruction_data_bytes: 9,
+        }];
+        let mut instruction_data = vec![3u8];
+        instruction_data.extend_from_slice(&55u64.to_le_bytes());
+        tx.instruction_payloads = vec![InstructionPayload {
+            account_indexes: vec![],
+            instruction_data,
+        }];
+
+        assert_eq!(tx.ordering_fee(), None);
+        assert_eq!(tx.ordering_fee_with_fallback(), 55);
     }
 
     #[test]
