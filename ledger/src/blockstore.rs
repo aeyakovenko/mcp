@@ -3236,6 +3236,37 @@ impl Blockstore {
         self.mcp_relay_attestation_cf.get_bytes((slot, relay_index))
     }
 
+    pub fn get_mcp_relay_attestations_for_slot(&self, slot: Slot) -> Result<Vec<(u32, Vec<u8>)>> {
+        let slot_iterator = self
+            .mcp_relay_attestation_cf
+            .iter(IteratorMode::From((slot, 0), IteratorDirection::Forward))?;
+        Ok(slot_iterator
+            .take_while(move |((attestation_slot, _), _)| *attestation_slot == slot)
+            .map(|((_, relay_index), payload)| (relay_index, payload.into_vec()))
+            .collect())
+    }
+
+    pub fn latest_mcp_relay_attestation_slots(&self, max_slots: usize) -> Result<Vec<Slot>> {
+        if max_slots == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut slots = Vec::with_capacity(max_slots);
+        let mut last_slot = None;
+        let iterator = self.mcp_relay_attestation_cf.iter(IteratorMode::End)?;
+        for ((slot, _), _) in iterator {
+            if Some(slot) == last_slot {
+                continue;
+            }
+            slots.push(slot);
+            last_slot = Some(slot);
+            if slots.len() >= max_slots {
+                break;
+            }
+        }
+        Ok(slots)
+    }
+
     pub fn put_mcp_relay_attestation(
         &self,
         slot: Slot,
@@ -6740,6 +6771,57 @@ pub mod tests {
                 .get_mcp_relay_attestation(slot, relay_index)
                 .unwrap(),
             Some(attestation)
+        );
+    }
+
+    #[test]
+    fn test_get_mcp_relay_attestations_for_slot() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        blockstore
+            .put_mcp_relay_attestation(11, 3, &[3u8, 3, 3])
+            .unwrap();
+        blockstore
+            .put_mcp_relay_attestation(11, 1, &[1u8, 1, 1])
+            .unwrap();
+        blockstore
+            .put_mcp_relay_attestation(12, 0, &[9u8, 9, 9])
+            .unwrap();
+
+        assert_eq!(
+            blockstore.get_mcp_relay_attestations_for_slot(11).unwrap(),
+            vec![(1u32, vec![1u8, 1, 1]), (3u32, vec![3u8, 3, 3])]
+        );
+        assert_eq!(
+            blockstore.get_mcp_relay_attestations_for_slot(12).unwrap(),
+            vec![(0u32, vec![9u8, 9, 9])]
+        );
+    }
+
+    #[test]
+    fn test_latest_mcp_relay_attestation_slots() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        blockstore.put_mcp_relay_attestation(9, 0, &[9u8]).unwrap();
+        blockstore
+            .put_mcp_relay_attestation(10, 0, &[10u8])
+            .unwrap();
+        blockstore
+            .put_mcp_relay_attestation(10, 1, &[11u8])
+            .unwrap();
+        blockstore
+            .put_mcp_relay_attestation(12, 0, &[12u8])
+            .unwrap();
+
+        assert_eq!(
+            blockstore.latest_mcp_relay_attestation_slots(2).unwrap(),
+            vec![12, 10]
+        );
+        assert_eq!(
+            blockstore.latest_mcp_relay_attestation_slots(10).unwrap(),
+            vec![12, 10, 9]
         );
     }
 

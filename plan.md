@@ -28,16 +28,21 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - consensus-block ingestion rejects non-hash-sized `consensus_meta`.
   - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and defers bank completion if a cached consensus block lacks a usable sidecar.
 - Proposer admission + payload policy wiring: `RESOLVED`
-  - proposer-side admission enforces `NUM_PROPOSERS * base_fee` payer reservation before payload acceptance.
-  - payload dedup is signature-based within proposer payload construction.
+  - MCP-specific BankingStage admission helper wiring is active in scheduler receive-buffer and pre-graph validation paths.
+  - payload construction state is isolated per owned proposer index; signature dedup and fee reservation are enforced per proposer payload.
   - proposer output applies `B2` ordering before MCP payload encoding.
 - Reconstruction-to-execution bridge reader: `RESOLVED`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
+  - MCP-wire fee component semantics are preserved across conversion and carried into replay verification outputs.
   - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots.
   - if a consensus block is cached for the slot, replay defers while vote-gate is unsatisfied or while `McpExecutionOutput` is missing.
   - if no consensus block is cached yet, replay stores an empty `McpExecutionOutput` placeholder and replays without legacy entry-transaction fallback.
   - reconstruction can upgrade an empty placeholder to a non-empty MCP execution output once vote-gate and reconstruction data are available.
+- MCP automatic shred repair trigger: `RESOLVED`
+  - `RepairService` loop now automatically enqueues `ShredRepairType::McpShred` for MCP relay-attested slots that are pending execution output and have missing local MCP shards.
+  - trigger is bounded (recent-slot scan + interval) and reuses existing repair batching, peer selection, and outstanding-request dedup paths.
+  - no new repair worker/stage; integrated in existing `repair_service` iteration.
 
 ## Audit Follow-Ups (from `audit.md`)
 
@@ -205,12 +210,12 @@ Non-reusable for MCP wire correctness:
 
 ### 1.5 Reed-Solomon and shredding
 
-- Add `ledger/src/mcp_shredder.rs` mirroring `ledger/src/shredder.rs` for MCP:
+- Use `ledger/src/mcp_erasure.rs` as the single RS entrypoint (no extra wrapper module):
   - RS encode: payload bytes → 40 data shards + 160 coding shards
   - RS decode/reconstruct: recover payload from any 40 shards
   - Merkle tree construction and witness generation (using `mcp_merkle.rs`)
   - Build complete `McpShred` structs with signatures
-- Follow the same pattern as `shredder.rs`: wrap RS encoding/decoding so `core` uses the wrapper, not the RS library directly.
+- Minimal-diff invariant: avoid introducing an MCP-specific `shredder` facade when `mcp_erasure` already provides the needed encode/decode surface.
 
 ### 1.6 Tests
 
@@ -415,6 +420,11 @@ Non-reusable for MCP wire correctness:
   - MCP shred wire payload is already `PACKET_DATA_SIZE`, so MCP repair responses omit trailing nonce bytes.
   - repair nonce verification remains strict for legacy shreds; nonce-less repair acceptance is MCP-only and matched against outstanding MCP requests by payload key.
 - Expose admin RPC helper for explicit MCP repair requests (`repairMcpShredFromPeer`).
+- Add automatic MCP repair trigger in `RepairService`:
+  - scan recent MCP relay-attested slots with missing/non-final `McpExecutionOutput`.
+  - derive candidate proposer indices from stored relay-attestation entries for each slot.
+  - enqueue bounded missing-shred requests (`McpShred`) via existing `request_repair_if_needed` path (one missing shred per proposer per scan cycle).
+  - preserve existing repair protocol and transport behavior (`McpWindowIndex` over UDP/QUIC).
 
 ### 4.6 Tests
 
@@ -491,12 +501,12 @@ Non-reusable for MCP wire correctness:
   - classify MCP control frames (`0x01` relay attestation, `0x02` consensus block) and forward to TVU control channel.
 - `core/src/window_service.rs`:
   - ingest and validate control frames with slot-effective feature gating.
-  - store validated relay attestations in MCP CF.
+  - store validated relay attestations in MCP CF exactly as signed (no ingestion-time entry filtering or entry-list reserialization after relay-signature verification).
   - store validated consensus blocks in shared in-memory slot map for replay consumption.
 
 Validation rules:
 - invalid relay signature => drop relay message
-- invalid proposer signature inside relay entry => drop that entry, keep other valid entries
+- invalid proposer signature inside relay entry => drop that entry during aggregation/canonical filtering (not during relay-attestation storage), keep other valid entries
 - canonical aggregate ordering by `relay_index`
 - enforce aggregate and consensus wire-size upper bounds before decode (including QUIC control payload cap)
 - threshold counting rule => count distinct `relay_index` entries that pass relay-signature/index validation and retain at least one valid proposer entry after proposer filtering
@@ -505,9 +515,9 @@ Validation rules:
 ### 6.2 Leader finalization
 
 When this node is leader for slot `s` and attestation quorum is present:
-1. filter invalid entries as above
+1. verify relay signatures on stored attestation bytes and determine relay-threshold eligibility from proposer-signature filtering
 2. if valid relay entries < `REQUIRED_ATTESTATIONS` -> do not finalize/broadcast a consensus block
-3. build `AggregateAttestation`
+3. build `AggregateAttestation` using each eligible relay's original signed entry list (relay-signature-bound bytes preserved)
 4. construct/sign `ConsensusBlock` with:
    - `consensus_meta` and authoritative `block_id` from Alpenglow consensus (`B3`)
    - `delayed_bankhash` for the consensus-defined delayed slot
@@ -677,7 +687,6 @@ New files:
 - `ledger/src/mcp_relay_attestation.rs`
 - `ledger/src/mcp_aggregate_attestation.rs`
 - `ledger/src/mcp_consensus_block.rs`
-- `ledger/src/mcp_shredder.rs`
 - `transaction-view/src/mcp_payload.rs`
 - `transaction-view/src/mcp_transaction.rs`
 - `ledger/src/shred/mcp_shred.rs`

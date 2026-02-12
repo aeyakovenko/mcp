@@ -24,7 +24,9 @@ use {
         bank::{Bank, LoadAndExecuteTransactionsOutput},
         transaction_batch::TransactionBatch,
     },
-    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_runtime_transaction::{
+        transaction_meta::StaticMeta, transaction_with_meta::TransactionWithMeta,
+    },
     solana_svm::{
         account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
         transaction_error_metrics::TransactionErrorMetrics,
@@ -555,6 +557,11 @@ impl Consumer {
             fee_budget_limits.prioritization_fee,
             FeeFeatures::from(bank.feature_set.as_ref()),
         );
+        let mcp_fee_components = transaction.mcp_fee_components().unwrap_or_default();
+        let effective_fee = base_fee
+            .checked_add(mcp_fee_components.0)
+            .and_then(|fee| fee.checked_add(mcp_fee_components.1))
+            .ok_or(TransactionError::InsufficientFundsForFee)?;
 
         let (mut fee_payer_account, _slot) = bank
             .rc
@@ -572,7 +579,7 @@ impl Consumer {
                 .rent
                 .minimum_balance(solana_nonce::state::State::size()),
         };
-        let scaled_fee = base_fee
+        let scaled_fee = effective_fee
             .checked_mul(MCP_NUM_PROPOSERS as u64)
             .ok_or(TransactionError::InsufficientFundsForFee)?;
         fee_tracker.try_reserve(
@@ -589,8 +596,25 @@ impl Consumer {
             0,
             error_counters,
             &bank.rent_collector().rent,
-            base_fee,
+            effective_fee,
         )
+    }
+
+    pub fn check_fee_payer_unlocked_admission(
+        bank: &Bank,
+        transaction: &(impl TransactionWithMeta + StaticMeta),
+        fee_tracker: &mut McpFeePayerTracker,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Result<(), TransactionError> {
+        let mcp_feature_active = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if mcp_feature_active && transaction.mcp_fee_components().is_some() {
+            Self::check_fee_payer_unlocked_mcp(bank, transaction, fee_tracker, error_counters)
+        } else {
+            Self::check_fee_payer_unlocked(bank, transaction, error_counters)
+        }
     }
 }
 
