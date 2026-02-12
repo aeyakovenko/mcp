@@ -28,12 +28,13 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - consensus-block ingestion rejects non-hash-sized `consensus_meta`.
   - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and defers bank completion if a cached consensus block lacks a usable sidecar.
 - Proposer admission + payload policy wiring: `RESOLVED`
-  - proposer-side admission enforces `NUM_PROPOSERS * base_fee` payer reservation before payload acceptance.
-  - payload dedup is signature-based within proposer payload construction.
+  - MCP-specific BankingStage admission helper wiring is active in scheduler receive-buffer and pre-graph validation paths.
+  - payload construction state is isolated per owned proposer index; signature dedup and fee reservation are enforced per proposer payload.
   - proposer output applies `B2` ordering before MCP payload encoding.
 - Reconstruction-to-execution bridge reader: `RESOLVED`
   - `blockstore_processor` now has a production reader for `McpExecutionOutput` and strict decode/verification of framed transaction bytes.
   - Reader accepts both bincode `VersionedTransaction` bytes and MCP latest/legacy wire bytes (converted to `VersionedTransaction`) before bank verification.
+  - MCP-wire fee component semantics are preserved across conversion and carried into replay verification outputs.
   - replay now refreshes vote-gate input and attempts reconstruction persistence before replaying non-leader MCP slots.
   - if a consensus block is cached for the slot, replay defers while vote-gate is unsatisfied or while `McpExecutionOutput` is missing.
   - if no consensus block is cached yet, replay stores an empty `McpExecutionOutput` placeholder and replays without legacy entry-transaction fallback.

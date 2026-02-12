@@ -333,7 +333,7 @@ fn ordering_metadata_for_payload_transaction(
     if let Some(mcp_transaction) = transaction.mcp_transaction.as_ref() {
         let mut signature = [0u8; 64];
         signature.copy_from_slice(mcp_transaction.signatures.first()?.as_ref());
-        let ordering_fee = u64::from(mcp_transaction.ordering_fee().unwrap_or_default());
+        let ordering_fee = mcp_transaction.ordering_fee_with_fallback();
         return Some((mcp_ordering::ExecutionClass::Mcp, ordering_fee, signature));
     }
 

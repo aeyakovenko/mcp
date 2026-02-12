@@ -10,9 +10,11 @@ use {
         },
     },
     crate::banking_stage::{
-        consumer::Consumer, decision_maker::BufferedPacketsDecision,
+        consumer::{Consumer, McpFeePayerTracker},
+        decision_maker::BufferedPacketsDecision,
         immutable_deserialized_packet::ImmutableDeserializedPacket,
-        packet_deserializer::PacketDeserializer, scheduler_messages::MaxAge,
+        packet_deserializer::PacketDeserializer,
+        scheduler_messages::MaxAge,
         TransactionStateContainer,
     },
     agave_banking_stage_ingress_types::{BankingPacketBatch, BankingPacketReceiver},
@@ -258,6 +260,7 @@ impl SanitizedTransactionReceiveAndBuffer {
         let mut num_buffered = 0;
 
         let mut error_counts = TransactionErrorMetrics::default();
+        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
         for chunk in packets.chunks(CHUNK_SIZE) {
             for packet in chunk {
                 let Some((tx, deactivation_slot)) = packet.build_sanitized_transaction(
@@ -326,9 +329,10 @@ impl SanitizedTransactionReceiveAndBuffer {
                     }
                 }
 
-                let fee_check_result = Consumer::check_fee_payer_unlocked(
+                let fee_check_result = Consumer::check_fee_payer_unlocked_admission(
                     &working_bank,
                     &transaction,
+                    &mut mcp_fee_payer_tracker,
                     &mut error_counts,
                 );
                 if fee_check_result.is_err() {
@@ -513,6 +517,7 @@ impl TransactionViewReceiveAndBuffer {
         let mut num_dropped_on_fee_payer = 0;
         let mut num_dropped_on_capacity = 0;
         let mut num_buffered = 0;
+        let mut mcp_fee_payer_tracker = McpFeePayerTracker::default();
 
         let mut check_and_push_to_queue =
             |container: &mut TransactionViewStateContainer,
@@ -555,9 +560,10 @@ impl TransactionViewReceiveAndBuffer {
                     let transaction = container
                         .get_transaction(priority_id.id)
                         .expect("transaction must exist");
-                    let fee_check_result = Consumer::check_fee_payer_unlocked(
+                    let fee_check_result = Consumer::check_fee_payer_unlocked_admission(
                         working_bank,
                         transaction,
+                        &mut mcp_fee_payer_tracker,
                         &mut error_counters,
                     );
                     if let Err(err) = fee_check_result {

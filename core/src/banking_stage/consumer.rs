@@ -24,7 +24,9 @@ use {
         bank::{Bank, LoadAndExecuteTransactionsOutput},
         transaction_batch::TransactionBatch,
     },
-    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
+    solana_runtime_transaction::{
+        transaction_meta::StaticMeta, transaction_with_meta::TransactionWithMeta,
+    },
     solana_svm::{
         account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
         transaction_error_metrics::TransactionErrorMetrics,
@@ -591,6 +593,23 @@ impl Consumer {
             &bank.rent_collector().rent,
             base_fee,
         )
+    }
+
+    pub fn check_fee_payer_unlocked_admission(
+        bank: &Bank,
+        transaction: &(impl TransactionWithMeta + StaticMeta),
+        fee_tracker: &mut McpFeePayerTracker,
+        error_counters: &mut TransactionErrorMetrics,
+    ) -> Result<(), TransactionError> {
+        let mcp_feature_active = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if mcp_feature_active && transaction.mcp_fee_components().is_some() {
+            Self::check_fee_payer_unlocked_mcp(bank, transaction, fee_tracker, error_counters)
+        } else {
+            Self::check_fee_payer_unlocked(bank, transaction, error_counters)
+        }
     }
 }
 
