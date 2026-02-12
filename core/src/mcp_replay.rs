@@ -19,6 +19,7 @@ use {
         },
         shred::mcp_shred::McpShred,
     },
+    solana_metrics::inc_new_counter_error,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
     solana_runtime_transaction::{
@@ -40,6 +41,13 @@ struct ReconstructedTransaction {
     ordering_fee: u64,
     signature: [u8; 64],
     wire_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrderingMetadataError {
+    MissingSignature,
+    InvalidLegacyView,
+    InvalidLegacyRuntimeTransaction,
 }
 
 fn load_proposer_schedule(
@@ -170,28 +178,36 @@ fn build_vote_gate_input(
         return None;
     }
 
-    let filtered = aggregate_attestation
-        .canonical_filtered(
-            |relay_index| relays.get(relay_index as usize).copied(),
-            |proposer_index| proposers.get(proposer_index as usize).copied(),
-        )
-        .ok()?;
-
-    let aggregate: Vec<RelayAttestationObservation> = filtered
+    let aggregate_version = aggregate_attestation.version;
+    let aggregate: Vec<RelayAttestationObservation> = aggregate_attestation
         .relay_entries
         .into_iter()
-        .map(|relay_entry| RelayAttestationObservation {
-            relay_index: relay_entry.relay_index,
-            relay_signature_valid: true,
-            entries: relay_entry
-                .entries
-                .into_iter()
-                .map(|entry| RelayProposerEntry {
-                    proposer_index: entry.proposer_index,
-                    commitment: entry.commitment.to_bytes(),
-                    proposer_signature_valid: true,
-                })
-                .collect(),
+        .map(|relay_entry| {
+            let relay_signature_valid =
+                relays
+                    .get(relay_entry.relay_index as usize)
+                    .is_some_and(|relay_pubkey| {
+                        relay_entry.verify_relay_signature(aggregate_version, slot, relay_pubkey)
+                    });
+            RelayAttestationObservation {
+                relay_index: relay_entry.relay_index,
+                relay_signature_valid,
+                entries: relay_entry
+                    .entries
+                    .into_iter()
+                    .map(|entry| RelayProposerEntry {
+                        proposer_index: entry.proposer_index,
+                        commitment: entry.commitment.to_bytes(),
+                        proposer_signature_valid: proposers
+                            .get(entry.proposer_index as usize)
+                            .is_some_and(|proposer_pubkey| {
+                                entry
+                                    .proposer_signature
+                                    .verify(proposer_pubkey.as_ref(), entry.commitment.as_ref())
+                            }),
+                    })
+                    .collect(),
+            }
         })
         .collect();
 
@@ -329,28 +345,39 @@ pub(crate) fn refresh_vote_gate_input(
 
 fn ordering_metadata_for_payload_transaction(
     transaction: &McpPayloadTransaction,
-) -> Option<(mcp_ordering::ExecutionClass, u64, [u8; 64])> {
+) -> Result<(mcp_ordering::ExecutionClass, u64, [u8; 64]), OrderingMetadataError> {
     if let Some(mcp_transaction) = transaction.mcp_transaction.as_ref() {
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(mcp_transaction.signatures.first()?.as_ref());
+        signature.copy_from_slice(
+            mcp_transaction
+                .signatures
+                .first()
+                .ok_or(OrderingMetadataError::MissingSignature)?
+                .as_ref(),
+        );
         let ordering_fee = mcp_transaction.ordering_fee_with_fallback();
-        return Some((mcp_ordering::ExecutionClass::Mcp, ordering_fee, signature));
+        return Ok((mcp_ordering::ExecutionClass::Mcp, ordering_fee, signature));
     }
 
-    let view =
-        SanitizedTransactionView::try_new_sanitized(transaction.wire_bytes.as_slice()).ok()?;
+    let view = SanitizedTransactionView::try_new_sanitized(transaction.wire_bytes.as_slice())
+        .map_err(|_| OrderingMetadataError::InvalidLegacyView)?;
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(view.signatures().first()?.as_ref());
+    signature.copy_from_slice(
+        view.signatures()
+            .first()
+            .ok_or(OrderingMetadataError::MissingSignature)?
+            .as_ref(),
+    );
     let runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_from(
         view,
         MessageHash::Compute,
         None,
     )
-    .ok()?;
+    .map_err(|_| OrderingMetadataError::InvalidLegacyRuntimeTransaction)?;
     let ordering_fee = runtime_tx
         .compute_budget_instruction_details()
         .requested_compute_unit_price();
-    Some((
+    Ok((
         mcp_ordering::ExecutionClass::Legacy,
         ordering_fee,
         signature,
@@ -409,7 +436,16 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
         included_proposers.len()
     );
 
-    let root_bank = bank_forks.read().unwrap().root_bank();
+    let root_bank = match bank_forks.read() {
+        Ok(bank_forks) => bank_forks.root_bank(),
+        Err(err) => {
+            warn!(
+                "failed to read bank forks for MCP reconstruction at slot {} due to poisoned lock: {}",
+                slot, err
+            );
+            return;
+        }
+    };
     let proposers = load_proposer_schedule(slot, bank, &root_bank, leader_schedule_cache);
     if proposers.is_empty() {
         return;
@@ -476,7 +512,16 @@ pub(crate) fn maybe_persist_reconstructed_execution_output(
             .into_iter()
             .filter_map(|tx| {
                 let (execution_class, ordering_fee, signature) =
-                    ordering_metadata_for_payload_transaction(&tx)?;
+                    match ordering_metadata_for_payload_transaction(&tx) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            inc_new_counter_error!(
+                                "mcp-reconstruction-transaction-metadata-drop",
+                                1
+                            );
+                            return None;
+                        }
+                    };
                 if !seen_signatures.insert(signature) {
                     // Dedup only within a single proposer's payload.
                     return None;

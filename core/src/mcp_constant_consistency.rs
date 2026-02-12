@@ -37,3 +37,19 @@ fn test_mcp_erasure_constants_match_ledger_protocol_constants() {
         solana_ledger::mcp::MAX_PROPOSER_PAYLOAD
     );
 }
+
+#[test]
+fn test_mcp_reconstruction_constants_match_ledger_protocol_constants() {
+    assert_eq!(
+        solana_ledger::mcp_reconstruction::MCP_RECON_NUM_SHREDS,
+        solana_ledger::mcp::NUM_RELAYS
+    );
+    assert_eq!(
+        solana_ledger::mcp_reconstruction::MCP_RECON_SHRED_BYTES,
+        solana_ledger::mcp::SHRED_DATA_BYTES
+    );
+    assert_eq!(
+        solana_ledger::mcp_reconstruction::MCP_RECON_MAX_PAYLOAD_BYTES,
+        solana_ledger::mcp::MAX_PROPOSER_PAYLOAD
+    );
+}
