@@ -1452,6 +1452,58 @@ mod test {
     }
 
     #[test]
+    pub fn test_request_repair_for_mcp_shred_from_address() {
+        let cluster_info = Arc::new(new_test_cluster_info());
+        let pubkey = cluster_info.id();
+        let slot = 101;
+        let proposer_index = 3;
+        let shred_index = 7;
+        let reader = bind_to_localhost_unique().expect("should bind");
+        let address = reader.local_addr().unwrap();
+        let sender = bind_to_localhost_unique().expect("should bind");
+        let outstanding_repair_requests = Arc::new(RwLock::new(OutstandingShredRepairs::default()));
+
+        RepairService::request_repair_for_mcp_shred_from_address(
+            cluster_info.clone(),
+            pubkey,
+            address,
+            slot,
+            proposer_index,
+            shred_index,
+            &sender,
+            outstanding_repair_requests,
+        );
+
+        let mut packets = vec![solana_packet::Packet::default(); 1];
+        let _recv_count = solana_streamer::recvmmsg::recv_mmsg(&reader, &mut packets[..]).unwrap();
+        let packet = &packets[0];
+        let Some(bytes) = packet.data(..).map(Vec::from) else {
+            panic!("packet data not found");
+        };
+        let remote_request = RemoteRequest {
+            remote_pubkey: None,
+            remote_address: packet.meta().socket_addr(),
+            bytes: Bytes::from(bytes),
+        };
+
+        let deserialized =
+            serve_repair::deserialize_request::<RepairProtocol>(&remote_request).unwrap();
+        match deserialized {
+            RepairProtocol::McpWindowIndex {
+                slot: deserialized_slot,
+                proposer_index: deserialized_proposer_index,
+                shred_index: deserialized_shred_index,
+                ..
+            } => {
+                assert_eq!(deserialized_slot, slot);
+                assert_eq!(deserialized_proposer_index, proposer_index);
+                assert_eq!(deserialized_shred_index, shred_index);
+            }
+            _ => panic!("unexpected repair protocol"),
+        }
+    }
+
+    #[test]
     pub fn test_repair_orphan() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
