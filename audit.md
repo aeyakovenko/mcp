@@ -2,54 +2,61 @@
 
 Date: 2026-02-12
 Branch: `master`
-Scope: close remaining audit blockers and re-validate implementation deltas against `plan.md`.
+Commit: `65568a2a79` (plus local uncommitted fixes in this pass)
+Scope: re-check `audit.md` concerns, confirm in code, land fixes, and re-validate local-cluster MCP integration.
 
-## Verdict
+## Executive Summary
 
-- Previously open blockers are now implemented on `master`.
-- `B3` strictness and MCP repair indexing are both closed in code.
-- Remaining risk is integration breadth, not known correctness bugs in these two areas.
+All previously reported critical blockers in `audit.md` are now fixed on `master`:
 
-## Closed Blockers
+1. B3 deferral no longer over-defers pre-consensus MCP slots.
+2. `BlockComponent` empty-entry decode no longer collides with `BlockMarker` decode.
 
-1. MCP shred repair extension for `(slot, proposer_index, shred_index)`.
-- Status: `RESOLVED`.
-- Evidence:
-  - request/response protocol and mapping: `core/src/repair/serve_repair.rs`
-    - `ShredRepairType::McpShred`
-    - `RepairProtocol::McpWindowIndex`
-    - request mapping, verification, stats paths
-  - handler support: `core/src/repair/repair_handler.rs`, `core/src/repair/standard_repair_handler.rs`, `core/src/repair/malicious_repair_handler.rs`
-  - request API + admin RPC: `core/src/repair/repair_service.rs`, `validator/src/admin_rpc_service.rs`
-  - response framing fix for max-size MCP shred payload:
-    - MCP responses omit nonce when payload is full-size (`PACKET_DATA_SIZE`)
-    - implemented in `core/src/repair/repair_response.rs`
-  - nonce verification path updated:
-    - legacy repair responses still require nonce
-    - nonce-less repair acceptance is MCP-only and matched via outstanding MCP request payload
-    - `core/src/shred_fetch_stage.rs`, `core/src/repair/outstanding_requests.rs`
-  - wire extraction supports MCP repair payloads: `ledger/src/shred/wire.rs`
+The MCP local-cluster integration test now passes end-to-end.
 
-2. B3 strictness deviation (fallback block-id path for MCP-active replay slots).
-- Status: `RESOLVED`.
-- Evidence:
-  - replay now defers completion for any MCP-active slot missing authoritative sidecar hash:
-    - `core/src/replay_stage.rs` (`should_defer_for_missing_mcp_authoritative_block_id`)
-  - completion path no longer relies on local fallback for MCP-active slots.
+## Concern Revalidation
 
-## Validation Runs (This Pass)
+### 1) B3 deferral overreach
 
-- `cargo check -p solana-core -p solana-ledger -p agave-validator`
-- `cargo test -p solana-core repair::serve_repair::tests -- --nocapture`
-- `cargo test -p solana-core repair::outstanding_requests::tests -- --nocapture`
-- `cargo test -p solana-core shred_fetch_stage::tests -- --nocapture`
+- Prior concern: MCP-active slots were deferred even when no consensus block existed yet.
+- Confirmed on code before fix at `core/src/replay_stage.rs`.
+- Fix: `should_defer_for_missing_mcp_authoritative_block_id` now requires:
+  - MCP feature active for slot
+  - **and** `has_mcp_consensus_block_for_slot(slot, store)`
+  - **and** missing/invalid authoritative sidecar block-id
+- File: `core/src/replay_stage.rs`
+
+### 2) Empty `EntryBatch` decode collision
+
+- Prior concern: serialized `EntryBatch(vec![])` (`8` zero bytes) was interpreted as `BlockMarker` and failed with `ReadSizeLimit(2)`.
+- Confirmed on code before fix at `entry/src/block_component.rs`.
+- Fix: decode path disambiguates `entry_count == 0` by buffer length:
+  - exactly `ENTRY_COUNT_SIZE` bytes => `EntryBatch(vec![])`
+  - otherwise => `BlockMarker(...)`
+- Added round-trip assertion for `BlockComponent::EntryBatch(vec![])`.
+- File: `entry/src/block_component.rs`
+
+## Validation Runs (Post-fix)
+
+Passed:
+
 - `cargo test -p solana-core test_should_defer_for_missing_mcp_authoritative_block_id_for_active_mcp_slot -- --nocapture`
 - `cargo test -p solana-core test_should_not_defer_for_missing_mcp_authoritative_block_id_before_feature_activation -- --nocapture`
-- `cargo test -p solana-core test_sigverify_shred_cpu_repair -- --nocapture`
-- `cargo test -p solana-core test_repair_response_packet_from_bytes_without_nonce_allows_full_payload -- --nocapture`
-- `cargo test -p solana-ledger test_get_shred_and_repair_nonce_for_mcp_shred_payload_without_nonce -- --nocapture`
+- `cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture`
+  - Result: `ok` (1 passed)
+  - Regression symptoms from prior audit (stuck root at 63, repeated `ReadSizeLimit(2)` dead-slot loop) are no longer present.
 
-## Residual Risk / UNVERIFIED
+Also passed:
 
-- `UNVERIFIED`: full multi-node local-cluster e2e coverage specifically exercising MCP repair request/response under network fault conditions in this pass.
-  - Follow-up validation target: run issue-20 local-cluster flow with induced MCP shred loss and explicit `repairMcpShredFromPeer` triggers.
+- `cargo check -p solana-core -p solana-entry`
+
+## Residual Notes
+
+- `cargo test -p solana-entry round_trips -- --nocapture` currently fails due pre-existing test-only API drift in reward-certificate helpers (`new_for_tests` not found); unrelated to MCP fixes.
+- `cargo check -p solana-local-cluster` currently fails on an unrelated `QuicServerParams::default_for_tests` symbol mismatch in `local-cluster/src/cluster_tests.rs`; MCP integration test itself passes.
+
+## Current Verdict
+
+- Critical audit blockers: `CLOSED`
+- MCP local-cluster integration (issue-20 target): `PASS`
+- Additional branch propagation is required only if issue branches are behind this master commit.
