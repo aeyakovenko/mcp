@@ -338,4 +338,52 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_inclusion_threshold_boundary_requires_at_least_80_relays() {
+        let target_commitment = [5u8; 32];
+        let filler_commitment = [6u8; 32];
+
+        let mut input_79 = base_input(
+            (0..REQUIRED_ATTESTATIONS)
+                .map(|i| {
+                    let mut entries = vec![(1, filler_commitment, true)];
+                    if i < REQUIRED_INCLUSIONS - 1 {
+                        entries.push((0, target_commitment, true));
+                    }
+                    relay(i as u32, true, entries)
+                })
+                .collect(),
+        );
+        input_79.proposer_indices = vec![0];
+        input_79
+            .local_valid_shreds
+            .insert(0, REQUIRED_RECONSTRUCTION);
+        assert_eq!(
+            evaluate_vote_gate(&input_79),
+            VoteGateDecision::Reject(VoteGateRejection::NoIncludedProposers)
+        );
+
+        let mut input_80 = base_input(
+            (0..REQUIRED_ATTESTATIONS)
+                .map(|i| {
+                    let mut entries = vec![(1, filler_commitment, true)];
+                    if i < REQUIRED_INCLUSIONS {
+                        entries.push((0, target_commitment, true));
+                    }
+                    relay(i as u32, true, entries)
+                })
+                .collect(),
+        );
+        input_80.proposer_indices = vec![0];
+        input_80
+            .local_valid_shreds
+            .insert(0, REQUIRED_RECONSTRUCTION);
+        assert_eq!(
+            evaluate_vote_gate(&input_80),
+            VoteGateDecision::Vote {
+                included_proposers: BTreeMap::from([(0, target_commitment)]),
+            }
+        );
+    }
 }
