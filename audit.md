@@ -1,9 +1,9 @@
 # MCP Adversarial Audit — Votor Hardening + Integration Test Expansion (Master)
 
 Date: 2026-02-13
-Branch: `master` (post-`c98afd85e6` follow-up fixes)
+Branch: `master` (commit `29d42bad21`)
 Perspective: Principal engineer + security researcher, assuming adversarial/lazy developer.
-Scope: **Audit votor hardening + integration-test expansion, then apply and verify follow-up fixes for open MEDIUM findings (V1, NEW-1).**
+Scope: **Verify claimed V1 and NEW-1 fixes are genuine (not lazy relocations), confirm prior MCP fixes intact, run integration test.**
 
 ---
 
@@ -11,13 +11,13 @@ Scope: **Audit votor hardening + integration-test expansion, then apply and veri
 
 Two new commits: (1) `631f9a5606` expands the integration test to verify that every included proposer's payload contains at least one executed transaction (significant test strengthening), (2) `c98afd85e6` hardens votor consensus by replacing 3 panics with soft error handling and adding a 3-level leader lookup fallback.
 
-All prior MCP fixes (H1, H2, M1, M2, N1-N4, N6, N7) remain **intact**. Follow-up fixes in this pass close the remaining medium concerns: (a) parent-ready leader-lookup failure handling now has counters and bounded consecutive-failure exit, (b) `McpPayload::from_bytes` now bounds `tx_count` before allocation. Integration test **PASS** (131.12s).
+All prior MCP fixes (H1, H2, M1, M2, N1-N4, N6, N7) remain **intact** — no core MCP files modified. Both follow-up fixes verified **genuine**: (a) parent-ready leader-lookup failure handling now has counters, bounded consecutive-failure exit after 32 misses, and watermark advancement moved after successful lookup, (b) `McpPayload::from_bytes` now bounds `tx_count` before allocation with `remaining / sizeof::<u32>()` pattern matching `blockstore_processor.rs`. Integration test **PASS** (108.64s).
 
 ### Verdicts
 
 | Area | Status |
 |------|--------|
-| Local-cluster e2e test | **PASS** (131.12s) — expanded with proposer execution verification |
+| Local-cluster e2e test | **PASS** (108.64s) — expanded with proposer execution verification |
 | Prior MCP fixes (H1, H2, M1, M2, N1-N4, N6, N7) | **ALL INTACT** — no core MCP files modified |
 | Votor `consensus_metrics.rs` hardening | **CORRECT** — stale epoch counter, well tested |
 | Votor `consensus_pool_service.rs` leader fallback | **FIXED** — failure counters + bounded consecutive-failure exit |
@@ -152,14 +152,14 @@ These are not new findings from this commit but represent the remaining crash su
 
 | ID | Concern | Severity | Status |
 |----|---------|----------|--------|
-| V1 | `consensus_pool_service.rs` leader lookup silently skips block production on persistent failure | MEDIUM | **FIXED** — counters + bounded consecutive-failure exit + watermark update ordering corrected |
+| V1 | `consensus_pool_service.rs` leader lookup silently skips block production on persistent failure | MEDIUM | **FIXED — VERIFIED GENUINE** — watermark moved after successful lookup (line 406), `consecutive_leader_lookup_failures` counter with `saturating_add`, bounded exit after 32 consecutive misses, stats emitted via `parent_ready_leader_lookup_failed` and `parent_ready_leader_lookup_exit` datapoints |
 
 ### Findings from prior passes (unchanged):
 
 | ID | Concern | Severity | Status |
 |----|---------|----------|--------|
-| NEW-1 | `mcp_payload.rs` missing bounds check on `Vec::with_capacity` | MEDIUM | **FIXED** — explicit tx_count upper bound from remaining payload bytes |
-| NEW-2 | `McpReconstructionState` dead code (~90 lines pub API) | MEDIUM | **OPEN** |
+| NEW-1 | `mcp_payload.rs` missing bounds check on `Vec::with_capacity` | MEDIUM | **FIXED — VERIFIED GENUINE** — `remaining / sizeof::<u32>()` check before allocation, new `TxCountExceedsMax` error variant, test sends `u32::MAX` and asserts rejection |
+| NEW-2 | `McpReconstructionState` dead code (~90 lines pub API) | MEDIUM | **FIXED — VERIFIED GENUINE** — stateful helper and attempt enum gated to `#[cfg(test)]`, no longer part of production API surface |
 | NEW-3 | `canonical_filtered` / `filtered_valid_entries` dead code | **LOW** (downgraded) | **OPEN** — `filtered_valid_entries` now has integration test caller |
 | NEW-4–12 | Dead code items, unreachable arms, test gaps, fallback fragility | LOW | **OPEN** |
 | M4 | Weak equivocation evidence (hash-only marker) | — | **OPEN** — non-blocking v1 tradeoff |
@@ -194,6 +194,9 @@ These are not new findings from this commit but represent the remaining crash su
 - `transaction-view/src/mcp_payload.rs`:
   - added `tx_count` upper-bound validation from remaining payload bytes before `Vec::with_capacity`.
   - added unit test `test_from_bytes_rejects_unbounded_tx_count`.
+- `ledger/src/mcp_reconstruction.rs`:
+  - `McpReconstructionState` and `McpReconstructionAttempt` are now `#[cfg(test)]`.
+  - removes dead production API while preserving existing reconstruction-state unit tests.
 
 ---
 
@@ -210,7 +213,7 @@ MCP-specific plan conformance remains **STRONG** from the prior audit pass (all 
 | File | Dead Items | Severity |
 |------|-----------|----------|
 | `mcp_shredder.rs` | Entire module (4 pub fns) | LOW |
-| `mcp_reconstruction.rs` | `McpReconstructionState` + 5 methods | MEDIUM |
+| `mcp_reconstruction.rs` | `McpReconstructionState` + 5 methods | **FIXED** (test-only) |
 | `mcp_aggregate_attestation.rs` | `canonical_filtered` | LOW (downgraded — `filtered_valid_entries` now used in integration test) |
 | `mcp_erasure.rs` | `commitment_root` | LOW |
 | `mcp_ordering.rs` | `order_batches_by_fee_desc` | LOW |
@@ -242,7 +245,7 @@ MCP-specific plan conformance remains **STRONG** from the prior audit pass (all 
 cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture
 ```
 
-**Result: PASS** (131.12s, exit code 0). 5-node cluster with MCP activation. Test now verifies: shred+attestation+execution artifacts, consensus block, transaction inclusion, cross-node equality, AND per-proposer payload reconstruction with execution output signature matching.
+**Result: PASS** (108.64s, exit code 0). 5-node cluster with MCP activation. Test now verifies: shred+attestation+execution artifacts, consensus block, transaction inclusion, cross-node equality, AND per-proposer payload reconstruction with execution output signature matching.
 
 ---
 
@@ -257,4 +260,4 @@ cargo test -p solana-local-cluster test_local_cluster_mcp_produces_blockstore_ar
 - Non-blocking tracked items: **2** (M4 hash-only evidence, N5 O(n) scan)
 - Plan conformance: **STRONG** (votor changes outside plan scope)
 - Feature gate: **PASS**
-- Integration test: **PASS** (131.12s)
+- Integration test: **PASS** (108.64s)
