@@ -106,6 +106,8 @@ struct EpochMetrics {
 
     /// Counts number of times metrics recording failed.
     metrics_recording_failed: usize,
+    /// Counts stale epoch notifications (`reported_epoch < current_epoch`).
+    stale_epoch_events: usize,
 
     /// Tracks when individual slots began.
     ///
@@ -327,9 +329,11 @@ impl ConsensusMetrics {
                 epoch_metrics.metrics_recording_failed,
                 i64
             ),
+            ("stale_epoch_events", self.stale_epoch_events, i64),
         );
     }
 
+<<<<<<< HEAD
     /// Cleans up old epoch data to prevent unbounded memory growth.
     fn cleanup_old_epochs(&mut self, finalized_epoch: Epoch) {
         let cutoff_epoch = finalized_epoch.saturating_sub(EPOCHS_TO_RETAIN);
@@ -465,5 +469,51 @@ mod tests {
         metrics.record_block_hash_seen(leader, 42, Instant::now());
 
         assert_eq!(metrics.epoch_metrics[&0].leader_metrics[&leader].count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, crossbeam_channel::unbounded, solana_hash::Hash, std::time::Instant};
+
+    #[test]
+    fn test_maybe_new_epoch_ignores_stale_epoch() {
+        let (_sender, receiver) = unbounded();
+        let mut metrics = ConsensusMetrics::new(3, receiver);
+        metrics.record_start_of_slot(7, Instant::now());
+
+        metrics.maybe_new_epoch(2);
+
+        assert_eq!(metrics.current_epoch, 3);
+        assert_eq!(metrics.stale_epoch_events, 1);
+        assert_eq!(metrics.start_of_slot.len(), 1);
+    }
+
+    #[test]
+    fn test_maybe_new_epoch_rolls_forward_and_resets_state() {
+        let (_sender, receiver) = unbounded();
+        let mut metrics = ConsensusMetrics::new(3, receiver);
+        let now = Instant::now();
+        let id = Pubkey::new_unique();
+        let slot = 7;
+
+        metrics.record_start_of_slot(slot, now);
+        metrics.record_block_hash_seen(id, slot, now);
+        metrics.record_vote(
+            id,
+            &Vote::new_notarization_vote(slot, Hash::new_unique()),
+            now,
+        );
+        assert!(!metrics.start_of_slot.is_empty());
+        assert!(!metrics.node_metrics.is_empty());
+        assert!(!metrics.leader_metrics.is_empty());
+
+        metrics.maybe_new_epoch(4);
+
+        assert_eq!(metrics.current_epoch, 4);
+        assert_eq!(metrics.stale_epoch_events, 0);
+        assert!(metrics.start_of_slot.is_empty());
+        assert!(metrics.node_metrics.is_empty());
+        assert!(metrics.leader_metrics.is_empty());
     }
 }
