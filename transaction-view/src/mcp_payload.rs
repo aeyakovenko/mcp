@@ -26,6 +26,10 @@ pub struct McpPayload {
 pub enum McpPayloadParseError {
     UnexpectedEof,
     LengthOverflow(u32),
+    TxCountExceedsMax {
+        tx_count: u32,
+        max_count: usize,
+    },
     TransactionParse {
         tx_index: usize,
         error: McpTransactionParseError,
@@ -39,6 +43,15 @@ impl McpPayload {
         let tx_count_u32 = take_u32(bytes, &mut offset)?;
         let tx_count = usize::try_from(tx_count_u32)
             .map_err(|_| McpPayloadParseError::LengthOverflow(tx_count_u32))?;
+        // Each transaction must include at least a 4-byte length prefix.
+        let remaining = bytes.len().saturating_sub(offset);
+        let max_count = remaining / std::mem::size_of::<u32>();
+        if tx_count > max_count {
+            return Err(McpPayloadParseError::TxCountExceedsMax {
+                tx_count: tx_count_u32,
+                max_count,
+            });
+        }
 
         let mut transactions = Vec::with_capacity(tx_count);
         for tx_index in 0..tx_count {
@@ -240,6 +253,18 @@ mod tests {
             McpPayload::from_bytes(&[0, 0, 0, 0, 0, 0]),
             Ok(McpPayload {
                 transactions: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_from_bytes_rejects_unbounded_tx_count() {
+        let payload = u32::MAX.to_le_bytes();
+        assert_eq!(
+            McpPayload::from_bytes(&payload),
+            Err(McpPayloadParseError::TxCountExceedsMax {
+                tx_count: u32::MAX,
+                max_count: 0,
             })
         );
     }
