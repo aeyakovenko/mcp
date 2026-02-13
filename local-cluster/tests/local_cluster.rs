@@ -48,7 +48,12 @@ use {
         blockstore_processor::ProcessOptions,
         leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule},
         leader_schedule_utils::first_of_consecutive_leader_slots,
+        mcp_aggregate_attestation::AggregateAttestation,
         mcp_consensus_block::ConsensusBlock,
+        mcp_reconstruction::{
+            decode_reconstructed_payload, reconstruct_payload, MCP_RECON_MAX_PAYLOAD_BYTES,
+            MCP_RECON_NUM_SHREDS, MCP_RECON_SHRED_BYTES,
+        },
         shred::{mcp_shred::McpShred, ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
@@ -7182,6 +7187,21 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .map(|signature| signature.to_string())
     }
 
+    fn first_signature_bytes_from_wire_transaction(tx_wire_bytes: &[u8]) -> Option<[u8; 64]> {
+        if let Ok(mcp_transaction) = McpTransaction::from_bytes_compat(tx_wire_bytes) {
+            let signature = mcp_transaction.signatures.first()?;
+            let mut out = [0u8; 64];
+            out.copy_from_slice(signature.as_ref());
+            return Some(out);
+        }
+
+        let view = SanitizedTransactionView::try_new_sanitized(tx_wire_bytes).ok()?;
+        let signature = view.signatures().first()?.as_ref();
+        let mut out = [0u8; 64];
+        out.copy_from_slice(signature);
+        Some(out)
+    }
+
     fn first_relay_attestation(
         blockstore: &Blockstore,
         slot: Slot,
@@ -7254,6 +7274,22 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             }
         }
         sent
+    }
+
+    fn maybe_refresh_transfer_stream(
+        submitted_signatures: &mut HashSet<String>,
+        last_refresh: &mut Instant,
+        entry_client: &RpcClient,
+        funding_keypair: &Keypair,
+    ) {
+        // Keep steady load without overwhelming the cluster during long polling loops.
+        if last_refresh.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        submitted_signatures.extend(
+            send_best_effort_transfers(entry_client, funding_keypair, 2).into_iter(),
+        );
+        *last_refresh = Instant::now();
     }
 
     agave_logger::setup_with_default(RUST_LOG_FILTER);
@@ -7489,6 +7525,117 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 Some((*pubkey, consensus_block))
             })
     };
+    let included_commitments_for_consensus_block =
+        |slot: Slot, consensus_block: &ConsensusBlock| -> Option<HashMap<u32, [u8; HASH_BYTES]>> {
+            let aggregate =
+                AggregateAttestation::from_wire_bytes(&consensus_block.aggregate_bytes).ok()?;
+            if aggregate.slot != slot || aggregate.leader_index != consensus_block.leader_index {
+                return None;
+            }
+            let filtered_relays = aggregate.filtered_valid_entries(
+                |relay_index| relay_pubkey_for(slot, relay_index),
+                |proposer_index| proposer_pubkey_for(slot, proposer_index),
+            );
+            if filtered_relays.len() < solana_ledger::mcp::REQUIRED_ATTESTATIONS {
+                return None;
+            }
+
+            let mut by_proposer: HashMap<u32, HashMap<[u8; HASH_BYTES], BTreeSet<u32>>> =
+                HashMap::new();
+            for relay in filtered_relays {
+                for entry in relay.entries {
+                    by_proposer
+                        .entry(entry.proposer_index)
+                        .or_default()
+                        .entry(entry.commitment.to_bytes())
+                        .or_default()
+                        .insert(relay.relay_index);
+                }
+            }
+
+            let included = by_proposer
+                .into_iter()
+                .filter_map(|(proposer_index, commitments)| {
+                    if commitments.len() != 1 {
+                        return None;
+                    }
+                    let (commitment, relays) = commitments.into_iter().next()?;
+                    (relays.len() >= solana_ledger::mcp::REQUIRED_INCLUSIONS)
+                        .then_some((proposer_index, commitment))
+                })
+                .collect::<HashMap<_, _>>();
+            if included.is_empty() {
+                return None;
+            }
+            Some(included)
+        };
+    let proposer_payload_transactions_for_commitment = |blockstore: &Blockstore,
+                                                        slot: Slot,
+                                                        proposer_index: u32,
+                                                        commitment: [u8; HASH_BYTES]|
+     -> Option<Vec<Vec<u8>>> {
+        let proposer_pubkey = proposer_pubkey_for(slot, proposer_index)?;
+        let mut shards: Vec<Option<[u8; MCP_RECON_SHRED_BYTES]>> = vec![None; MCP_RECON_NUM_SHREDS];
+        for shred_index in 0..solana_ledger::mcp::NUM_RELAYS {
+            let shred_index = u32::try_from(shred_index).ok()?;
+            let Some(bytes) = blockstore
+                .get_mcp_shred_data(slot, proposer_index, shred_index)
+                .ok()
+                .flatten()
+            else {
+                continue;
+            };
+            let Ok(mcp_shred) = McpShred::from_bytes(&bytes) else {
+                continue;
+            };
+            if mcp_shred.slot != slot
+                || mcp_shred.proposer_index != proposer_index
+                || mcp_shred.commitment != commitment
+                || (mcp_shred.shred_index as usize) >= MCP_RECON_NUM_SHREDS
+            {
+                continue;
+            }
+            if !mcp_shred.verify_signature(&proposer_pubkey) || !mcp_shred.verify_witness() {
+                continue;
+            }
+            shards[mcp_shred.shred_index as usize] = Some(mcp_shred.shred_data);
+        }
+
+        let payload = reconstruct_payload(
+            slot,
+            proposer_index,
+            MCP_RECON_MAX_PAYLOAD_BYTES,
+            commitment,
+            &mut shards,
+        )
+        .ok()?;
+        let decoded_payload = decode_reconstructed_payload(&payload).ok()?;
+        Some(
+            decoded_payload
+                .transactions
+                .into_iter()
+                .map(|tx| tx.wire_bytes)
+                .collect(),
+        )
+    };
+    let assign_one_executed_tx_for_proposer = |proposer_payload_transactions: &[Vec<u8>],
+                                               executed_signature_counts: &mut HashMap<[u8; 64], usize>|
+     -> bool {
+        for tx_wire_bytes in proposer_payload_transactions {
+            let Some(signature) = first_signature_bytes_from_wire_transaction(tx_wire_bytes) else {
+                continue;
+            };
+            let Some(remaining) = executed_signature_counts.get_mut(&signature) else {
+                continue;
+            };
+            if *remaining == 0 {
+                continue;
+            }
+            *remaining -= 1;
+            return true;
+        }
+        false
+    };
 
     let post_activation_deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < post_activation_deadline {
@@ -7511,6 +7658,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         !submitted_signatures.is_empty(),
         "failed to submit any transfer transactions into local-cluster MCP test"
     );
+    let mut last_transfer_refresh = Instant::now();
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut observed_artifacts = None;
@@ -7520,11 +7668,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             log_cluster_runtime_state("artifact-scan");
             next_progress_log = Instant::now() + Duration::from_secs(10);
         }
-        submitted_signatures.extend(send_best_effort_transfers(
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
             &entry_client,
             &cluster.funding_keypair,
-            4,
-        ));
+        );
         for (validator_pubkey, blockstore) in &blockstores {
             let highest_slot = blockstore.highest_slot().unwrap().unwrap_or_default();
             let working_bank_slot = cluster
@@ -7675,11 +7824,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             log_cluster_runtime_state("non-leader-scan");
             next_non_leader_progress_log = Instant::now() + Duration::from_secs(10);
         }
-        submitted_signatures.extend(send_best_effort_transfers(
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
             &entry_client,
             &cluster.funding_keypair,
-            8,
-        ));
+        );
         let max_scan_slot = blockstores
             .iter()
             .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
@@ -7714,14 +7864,37 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     };
     let mut observed_consensus_block = None;
     let consensus_block_deadline = Instant::now() + Duration::from_secs(120);
+    let mut next_consensus_progress_log = Instant::now();
     while Instant::now() < consensus_block_deadline {
+        if Instant::now() >= next_consensus_progress_log {
+            log_cluster_runtime_state("consensus-block-scan");
+            next_consensus_progress_log = Instant::now() + Duration::from_secs(10);
+        }
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
+            &entry_client,
+            &cluster.funding_keypair,
+        );
         let max_scan_slot = blockstores
             .iter()
             .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
             .max()
             .unwrap_or_default();
         let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
-        for slot in (scan_lower_slot..=max_scan_slot).rev().take(256) {
+        let min_root_slot = cluster
+            .validators
+            .values()
+            .filter_map(|validator_info| {
+                validator_info
+                    .validator
+                    .as_ref()
+                    .map(|validator| validator.bank_forks.read().unwrap().root())
+            })
+            .min()
+            .unwrap_or(scan_lower_slot);
+        let coverage_scan_lower_slot = scan_lower_slot.max(min_root_slot.saturating_sub(4));
+        for slot in (coverage_scan_lower_slot..=max_scan_slot).rev().take(96) {
             if let Some((validator_pubkey, consensus_block)) = consensus_block_for_slot(slot) {
                 observed_consensus_block = Some((validator_pubkey, slot, consensus_block));
                 break;
@@ -7815,12 +7988,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     let mut decodable_execution_output = None;
     let inclusion_deadline = Instant::now() + Duration::from_secs(120);
+    let mut next_inclusion_progress_log = Instant::now();
     while Instant::now() < inclusion_deadline {
-        submitted_signatures.extend(send_best_effort_transfers(
+        if Instant::now() >= next_inclusion_progress_log {
+            log_cluster_runtime_state("inclusion-scan");
+            next_inclusion_progress_log = Instant::now() + Duration::from_secs(10);
+        }
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
             &entry_client,
             &cluster.funding_keypair,
-            8,
-        ));
+        );
         let max_scan_slot = blockstores
             .iter()
             .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
@@ -7830,7 +8009,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         decodable_execution_output =
             (scan_lower_slot..=max_scan_slot)
                 .rev()
-                .take(512)
+                .take(128)
                 .find_map(|slot| {
                     blockstores.iter().find_map(|(pubkey, blockstore)| {
                         let Some(encoded_output) =
@@ -7867,6 +8046,120 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
+    let included_commitments =
+        included_commitments_for_consensus_block(consensus_slot, &consensus_block);
+    let included_commitments = included_commitments.unwrap_or_else(|| {
+        panic!(
+            "failed to derive included proposer commitments from consensus block at slot {}",
+            consensus_slot
+        )
+    });
+    let included_commitments_len = included_commitments.len();
+    info!(
+        "MCP consensus slot {} included {} proposer commitments",
+        consensus_slot, included_commitments_len
+    );
+    let consensus_slot_execution_deadline = Instant::now() + Duration::from_secs(120);
+    let mut consensus_slot_execution_output = None;
+    let mut next_consensus_slot_progress_log = Instant::now();
+    while Instant::now() < consensus_slot_execution_deadline {
+        if Instant::now() >= next_consensus_slot_progress_log {
+            log_cluster_runtime_state("consensus-slot-exec-scan");
+            next_consensus_slot_progress_log = Instant::now() + Duration::from_secs(10);
+        }
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
+            &entry_client,
+            &cluster.funding_keypair,
+        );
+        consensus_slot_execution_output = blockstores.iter().find_map(|(pubkey, blockstore)| {
+            let encoded = blockstore
+                .get_mcp_execution_output(consensus_slot)
+                .unwrap()?;
+            let transactions = decode_execution_output_wire_transactions(&encoded)?;
+            (!transactions.is_empty()).then_some((*pubkey, transactions))
+        });
+        if consensus_slot_execution_output.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(500));
+    }
+    let Some((execution_output_pubkey, consensus_slot_transactions)) =
+        consensus_slot_execution_output
+    else {
+        panic!(
+            "timed out waiting for non-empty MCP execution output at consensus slot {}",
+            consensus_slot
+        );
+    };
+    let mut executed_signature_counts: HashMap<[u8; 64], usize> = HashMap::new();
+    for tx_wire_bytes in &consensus_slot_transactions {
+        if let Some(signature) = first_signature_bytes_from_wire_transaction(tx_wire_bytes) {
+            *executed_signature_counts.entry(signature).or_default() += 1;
+        }
+    }
+    assert!(
+        !executed_signature_counts.is_empty(),
+        "consensus slot {} execution output has no decodable transactions with signatures",
+        consensus_slot
+    );
+    let consensus_slot_blockstore = blockstores
+        .iter()
+        .find_map(|(pubkey, blockstore)| (*pubkey == execution_output_pubkey).then_some(blockstore))
+        .expect("execution-output validator must have blockstore handle");
+    let expected_proposer_pubkeys: HashSet<Pubkey> = included_commitments
+        .keys()
+        .filter_map(|proposer_index| proposer_pubkey_for(consensus_slot, *proposer_index))
+        .collect();
+    let mut covered_proposer_pubkeys: HashSet<Pubkey> = HashSet::new();
+    for (proposer_index, commitment) in included_commitments {
+        let proposer_payload_transactions = proposer_payload_transactions_for_commitment(
+            consensus_slot_blockstore,
+            consensus_slot,
+            proposer_index,
+            commitment,
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to reconstruct payload transactions at slot {} for proposer {}",
+                consensus_slot, proposer_index
+            )
+        });
+        assert!(
+            !proposer_payload_transactions.is_empty(),
+            "reconstructed proposer payload was empty at slot {} for proposer {}",
+            consensus_slot,
+            proposer_index
+        );
+        assert!(
+            assign_one_executed_tx_for_proposer(
+                &proposer_payload_transactions,
+                &mut executed_signature_counts,
+            ),
+            "no reconstructed proposer tx executed at slot {} for proposer {}",
+            consensus_slot,
+            proposer_index
+        );
+        if let Some(proposer_pubkey) = proposer_pubkey_for(consensus_slot, proposer_index) {
+            covered_proposer_pubkeys.insert(proposer_pubkey);
+        }
+    }
+
+    let missing_proposer_pubkeys: Vec<String> = expected_proposer_pubkeys
+        .iter()
+        .filter(|pubkey| !covered_proposer_pubkeys.contains(pubkey))
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        missing_proposer_pubkeys.is_empty(),
+        "consensus slot {} did not execute tx from every included proposer pubkey; covered={}, expected={}, missing={:?}",
+        consensus_slot,
+        covered_proposer_pubkeys.len(),
+        expected_proposer_pubkeys.len(),
+        missing_proposer_pubkeys
+    );
+
     let max_scan_slot = blockstores
         .iter()
         .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
