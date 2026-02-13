@@ -36,12 +36,14 @@ pub enum McpReconstructionError {
     InvalidPayload(McpPayloadParseError),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum McpReconstructionAttempt {
     Pending { present: usize, required: usize },
     Reconstructed(Vec<u8>),
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpReconstructionState {
     slot: u64,
@@ -52,6 +54,7 @@ pub struct McpReconstructionState {
     poisoned: bool,
 }
 
+#[cfg(test)]
 impl McpReconstructionState {
     pub fn new(
         slot: u64,
