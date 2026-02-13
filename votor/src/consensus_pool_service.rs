@@ -370,15 +370,24 @@ impl ConsensusPoolService {
         *highest_parent_ready = new_highest_parent_ready;
 
         let root_bank = ctx.sharable_banks.root();
+        let working_bank = ctx.sharable_banks.working();
         let Some(leader_pubkey) = ctx
             .leader_schedule_cache
-            .slot_leader_at(*highest_parent_ready, Some(&root_bank))
+            .slot_leader_at(*highest_parent_ready, Some(&working_bank))
+            .or_else(|| {
+                ctx.leader_schedule_cache
+                    .slot_leader_at(*highest_parent_ready, Some(&root_bank))
+            })
+            .or_else(|| {
+                ctx.leader_schedule_cache
+                    .slot_leader_at(*highest_parent_ready, None)
+            })
         else {
-            error!(
-                "Unable to compute the leader at slot {highest_parent_ready}. Something is wrong, \
-                 exiting"
+            warn!(
+                "unable to compute leader for parent-ready slot {}; skipping block production \
+                 decision for now",
+                *highest_parent_ready
             );
-            ctx.exit.store(true, Ordering::Relaxed);
             return;
         };
 
