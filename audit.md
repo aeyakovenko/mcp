@@ -1,9 +1,9 @@
 # MCP Adversarial Audit — Votor Hardening + Integration Test Expansion (Master)
 
 Date: 2026-02-13
-Branch: `master` (commit `29d42bad21`)
+Branch: `master` (commit `965da326b7`)
 Perspective: Principal engineer + security researcher, assuming adversarial/lazy developer.
-Scope: **Verify claimed V1 and NEW-1 fixes are genuine (not lazy relocations), confirm prior MCP fixes intact, run integration test.**
+Scope: **Verify claimed V1, NEW-1, and NEW-2 fixes are genuine (not lazy relocations), confirm prior MCP fixes intact, run integration test.**
 
 ---
 
