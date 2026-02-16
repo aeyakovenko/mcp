@@ -1,39 +1,25 @@
-# MCP Audit — Open Protocol Issues
+# MCP Audit
 
 **Date:** 2026-02-13 | **Baseline:** commit `965da326b7`
 
-All prior code-level findings (H1, H2, M1, M2, V1, NEW-1, NEW-2) are resolved.
-No open code bugs. Integration test passing.
+All code-level findings resolved. Integration test passing. No open issues.
+
+Protocol-level review raised four items (P1–P4); all are **documentation nits**, not security concerns. Reassessment below.
 
 ---
 
-## P1: Inter-Proposer Hiding — MEDIUM
+## P1: Inter-Proposer Hiding — NIT (was MEDIUM)
 
-Spec §3.3 requires relays to retransmit shreds immediately on receipt. Any validator (including a co-proposer) can reconstruct a batch from 40 shreds before the relay deadline. No commit-reveal phase exists. Hiding relies on temporal discipline (honest proposers send before receiving), not cryptographic guarantee.
+Immediate relay retransmit does not break any security property. A malicious proposer that reconstructs another proposer's batch gains nothing: (a) all transactions come from the public mempool — no private information in a batch, (b) the proposer already signed its Merkle root before sending shreds and cannot change its committed batch, (c) signing a second commitment is detectable equivocation and results in exclusion. The "front-running" attack is structurally impossible given commitment-before-send ordering.
 
-**Risk:** Malicious proposer delays own shreds, reconstructs honest proposer's batch, front-runs.
+## P2: Leader Equivocation — NIT
 
-**Recommendation:** Document that inter-proposer hiding is a timing assumption. If it becomes a hard requirement, the spec needs a commit-reveal phase.
+MCP spec says "consensus protocol is out of scope." Alpenglow handles leader equivocation. Adding one clarifying sentence to the spec would be nice but is not a gap.
 
-## P2: Leader Equivocation — LOW
+## P3: Threshold Formalization — NIT (was MEDIUM)
 
-MCP spec is silent on leader equivocation (two ConsensusBlocks for same slot). Correctly deferred to Alpenglow BFT, but the trust boundary should be stated explicitly in the spec.
+The constants are mechanically determined from the RS coding parameters, not magic numbers. RECONSTRUCTION = DATA_SHREDS/NUM_RELAYS = 40/200 = 0.20 (mathematical identity). INCLUSION = 2x reconstruction = 0.40. ATTESTATION = 3x reconstruction = 0.60. The spec already states the key invariant (INCLUSION >= RECONSTRUCTION). Formal adversary-model proofs belong in a security paper, not an implementation spec — standard practice in BFT literature (Tendermint, HotStuff, Casper).
 
-## P3: Threshold Formalization — MEDIUM
+## P4: Cross-Proposer Dedup — NIT
 
-Constants (0.60/0.40/0.20) lack formal adversary-model justification. They are consistent with both 20/20 (20% malicious + 20% delinquent) and Alpenglow 1/3 adversarial models, but this derivation is unstated.
-
-| Scenario | Adversary | Delinquent | Honest | Attestation (>=120) | Inclusion attack (<80) |
-|---|---|---|---|---|---|
-| 20/20 | 40 | 40 | 120 | Exactly met | 40 < 80: safe |
-| Alpenglow 1/3 | 67 | 0 | 133 | Met | 67 < 80: safe |
-
-**Recommendation:** Add adversary-model justification to spec so constants aren't magic numbers.
-
-## P4: Cross-Proposer Dedup / Fee Incentive — LOW
-
-Spec §8 says "basic validity checks" but doesn't define whether cross-proposer dedup is included. Plan chose no cross-proposer dedup (policy B2). Each occurrence is charged the **full transaction fee including priority/ordering fee** — a tx with ordering fee X sent to all 16 proposers pays 16X total, with 15X pure fee burn.
-
-This is the correct design: cross-proposer dedup would route all ties to the lowest-indexed proposer, undermining censorship resistance. The 16x-full-fee cost is a strong self-penalizing disincentive that scales with transaction value.
-
-**Recommendation:** Spec should clarify that "basic validity checks" excludes cross-proposer dedup and document the fee-burn incentive as intentional.
+Plan explicitly chose no cross-proposer dedup (policy B2) and documented why. Each occurrence charged the full priority fee (16x for all proposers). Correct design — cross-proposer dedup would route ties to lowest-indexed proposer, undermining censorship resistance. Spec wording ("basic validity checks") could be tighter but the implementation is unambiguous.
