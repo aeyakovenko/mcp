@@ -126,3 +126,133 @@ Plan B2 adds MCP-first classing and signature tiebreak. Spec requires flat fee o
 ### D5: Relay attestation timing heuristic (relates to Q3)
 
 Implementation fires attestation when all 16 proposers' shreds seen OR working bank advances past the slot (`window_service.rs:761-764`). No wall-clock timer. A slow proposer sending shreds late in the slot could systematically miss attestation coverage if relays emit before its shreds arrive. This directly affects whether the 0.40 inclusion threshold provides its intended coverage guarantee for honest-but-slow proposers.
+
+---
+
+## Addendum (2026-02-17): Annotation Audit (upstream/master -> master)
+
+Scope: exhaustive mapping of every changed file in `git diff upstream/master...master` to `plan.md` pass sections and spec anchors, plus validation against `human.md` feedback.
+
+- Delta size: `96` files changed relative to `upstream/master`.
+- Rust source traceability comment coverage (literal markers like `MCP spec §`, `Pass`, or `plan.md`): `6/85` files.
+- Commands used: `git diff --name-only upstream/master...master`, targeted test reruns, and direct line-level checks.
+
+### Human.md Consistency Check
+
+| Human Feedback Item | Status | Evidence |
+|---|---|---|
+| `leader_index` must be consensus-leader-schedule index, not proposer index | Resolved in implementation and integration test harness | `core/src/mcp_replay.rs`, `core/src/window_service.rs`, `ledger/src/mcp_consensus_block.rs`, `ledger/src/mcp_aggregate_attestation.rs`, `local-cluster/tests/local_cluster.rs` |
+| TVU control-frame byte-0 collision risk | Resolved | `core/src/shred_fetch_stage.rs` now routes only parseable MCP control frames (`RelayAttestation`/`ConsensusBlock`) |
+| `dispatch_relay_attestation_to_slot_leader` should skip self-send | Resolved | `core/src/mcp_relay_submit.rs` short-circuits when `dispatch.leader_pubkey == cluster_info.id()` |
+| Add comments quoting spec at validation points | Partially resolved (targeted locations), not exhaustive across all changed files | Spec comments present in `core/src/mcp_replay.rs`, `core/src/window_service.rs`, `core/src/shred_fetch_stage.rs`; global coverage remains incomplete |
+| Suggest using new `ShredVariant` for MCP types | Contradicts hard plan/constraint; intentionally not applied | Plan constraints: keep existing shred pipeline types unchanged |
+
+### Current Blockers / Unknowns
+
+1. **Resolved during this audit:** local-cluster MCP test leader-signature check now uses `Leader[s]` from leader schedule and the test passes.
+   - Fix: `local-cluster/tests/local_cluster.rs` now resolves consensus leader via `slot_leader_for(consensus_slot)` for `ConsensusBlock` signature verification.
+   - Verification: `cargo test -p solana-local-cluster --test local_cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --nocapture` (PASS).
+2. **Process blocker:** exhaustive in-source plan-section comment requirement is not yet met globally.
+   - Evidence: only a small subset of changed Rust files include explicit plan/spec marker comments.
+   - Impact: traceability requirement unmet; no runtime effect.
+
+### File-to-Plan / Spec Mapping (Exhaustive)
+
+| File | Plan Section(s) | Spec Anchor(s) |
+|---|---|---|
+| `Cargo.lock` | `cross` | dependency lock updates |
+| `audit.md` | `docs` | audit tracking |
+| `compute-budget-instruction/src/compute_budget_instruction_details.rs` | `7.3` | §7.1 ordering fee extraction |
+| `core/src/banking_stage/consumer.rs` | `5.3` | proposer admission policy |
+| `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs` | `5.3` | proposer admission policy |
+| `core/src/banking_stage/transaction_scheduler/scheduler_controller.rs` | `5.3` | proposer admission policy |
+| `core/src/block_creation_loop.rs` | `5.2` | bankless recording guardrails |
+| `core/src/forwarding_stage.rs` | `5.4` | §3.2 proposer forwarding |
+| `core/src/lib.rs` | `cross` | module wiring |
+| `core/src/mcp_constant_consistency.rs` | `1/2/7` | cross-crate invariant checks |
+| `core/src/mcp_relay.rs` | `4.2` | §3.3 relay attestation state |
+| `core/src/mcp_relay_submit.rs` | `4.3` | §3.3 relay->leader transport |
+| `core/src/mcp_replay.rs` | `6.4/7.1/7.2` | §3.5 + §3.6 vote-gate/reconstruct |
+| `core/src/mcp_vote_gate.rs` | `7.1` | §3.5 Consensus Voting Stage |
+| `core/src/repair/ancestor_hashes_service.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/malicious_repair_handler.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/outstanding_requests.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/repair_handler.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/repair_response.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/repair_service.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/serve_repair.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/repair/standard_repair_handler.rs` | `4.5` | repair path integration (impl extension) |
+| `core/src/replay_stage.rs` | `6.4/7` | §3.5 + §3.6 replay wiring |
+| `core/src/shred_fetch_stage.rs` | `4.3/6.1` | §7.3/§7.5 control-frame ingress |
+| `core/src/tpu.rs` | `5` | pipeline wiring |
+| `core/src/tvu.rs` | `4/6` | TVU MCP ingress wiring |
+| `core/src/validator.rs` | `cross` | validator wiring |
+| `core/src/window_service.rs` | `4.1/4.2/6.1/6.2` | §3.3-§3.5 + §7.3-§7.5 |
+| `cost-model/src/transaction_cost.rs` | `7.3` | §8 fee accounting interaction |
+| `entry/src/block_component.rs` | `7.3` | execution output component support |
+| `feature-set/src/lib.rs` | `1.1` | §4 + feature activation semantics |
+| `fee/Cargo.toml` | `7.3` | dependency wiring |
+| `fee/src/lib.rs` | `7.3` | §8 fee decomposition helpers |
+| `human.md` | `docs` | human review input |
+| `ledger/Cargo.toml` | `1/3/7` | dependency wiring |
+| `ledger/src/blockstore.rs` | `3.2` | §3.4/§3.6 MCP artifact storage APIs |
+| `ledger/src/blockstore/blockstore_purge.rs` | `3.1` | MCP CF retention/purge |
+| `ledger/src/blockstore/column.rs` | `3.1` | storage extension for MCP artifacts |
+| `ledger/src/blockstore/error.rs` | `3.2` | §3.4/§3.6 persistence error handling |
+| `ledger/src/blockstore_db.rs` | `3.1` | storage extension for MCP artifacts |
+| `ledger/src/blockstore_processor.rs` | `7.3` | §3.6 replay execution + §8 fees |
+| `ledger/src/leader_schedule.rs` | `2` | §5 Schedules and Indices |
+| `ledger/src/leader_schedule/vote_keyed.rs` | `2.2` | §5 schedule stake-key parity |
+| `ledger/src/leader_schedule_cache.rs` | `2` | §5 Schedules and Indices |
+| `ledger/src/leader_schedule_utils.rs` | `2` | §5 Schedules and Indices |
+| `ledger/src/lib.rs` | `cross` | module wiring |
+| `ledger/src/mcp.rs` | `1.2` | §4 Protocol Parameters |
+| `ledger/src/mcp_aggregate_attestation.rs` | `1.2/6.1` | §7.4 AggregateAttestation |
+| `ledger/src/mcp_consensus_block.rs` | `1.2/6.1` | §7.5 ConsensusBlock |
+| `ledger/src/mcp_erasure.rs` | `1.5` | §3.2 encoding + §4 erasure constants |
+| `ledger/src/mcp_merkle.rs` | `1.3` | §6 Commitments and Witnesses |
+| `ledger/src/mcp_ordering.rs` | `7.3` | §3.6 ordering + §8 fee policy (B2 override) |
+| `ledger/src/mcp_reconstruction.rs` | `7.2` | §3.6 Reconstruct and Replay |
+| `ledger/src/mcp_relay_attestation.rs` | `1.2/4.2` | §7.3 RelayAttestation |
+| `ledger/src/mcp_shredder.rs` | `1.5` | §3.2 + §6 encode/reconstruct utility |
+| `ledger/src/shred.rs` | `1.4/3.3` | MCP shred classifier integration |
+| `ledger/src/shred/mcp_shred.rs` | `1.4` | §7.2 Shred wire format |
+| `ledger/src/shred/wire.rs` | `1.4` | wire constants/types |
+| `ledger/src/shredder.rs` | `1.5` | MCP shredder bridge |
+| `local-cluster/Cargo.toml` | `7.6` | integration harness deps |
+| `local-cluster/tests/local_cluster.rs` | `7.6` | end-to-end MCP integration |
+| `net-utils/src/sockets.rs` | `7.6` | local-cluster bind retry robustness |
+| `plan.md` | `docs` | implementation plan |
+| `poh/src/poh_recorder.rs` | `5.2` | bankless recording API |
+| `runtime-transaction/src/runtime_transaction.rs` | `7.3` | §7.1/§8 tx meta carriage |
+| `runtime-transaction/src/runtime_transaction/sdk_transactions.rs` | `7.3` | §7.1 tx compatibility |
+| `runtime-transaction/src/runtime_transaction/transaction_view.rs` | `7.3` | §7.1 tx view bridging |
+| `runtime-transaction/src/transaction_meta.rs` | `7.3` | §8 fee components meta |
+| `runtime/src/bank.rs` | `7.3/7.4` | §8 two-pass debit + block_id handoff |
+| `runtime/src/bank/check_transactions.rs` | `7.3` | §8 payer checks |
+| `runtime/src/bank/fee_distribution.rs` | `7.3` | §8 fee accounting |
+| `runtime/src/bank/tests.rs` | `7.6` | §8 fee tests |
+| `svm/Cargo.toml` | `7.3` | dependency wiring |
+| `svm/src/account_loader.rs` | `7.3` | §8 fee collection mode support |
+| `svm/src/transaction_processor.rs` | `7.3` | §8 skip_fee_collection execution mode |
+| `transaction-view/Cargo.toml` | `1.2` | dependency wiring |
+| `transaction-view/src/lib.rs` | `1.2` | §7.1 module export |
+| `transaction-view/src/mcp_payload.rs` | `1.2/7.3` | §7.1 transaction payload framing |
+| `transaction-view/src/mcp_transaction.rs` | `1.2/7.3` | §7.1 transaction format compatibility |
+| `turbine/Cargo.toml` | `4/5` | dependency wiring |
+| `turbine/src/broadcast_stage.rs` | `5.1` | §3.2 broadcast wiring |
+| `turbine/src/broadcast_stage/standard_broadcast_run.rs` | `5.1/5.3` | §3.2 Proposal Stage |
+| `turbine/src/cluster_nodes.rs` | `5.4` | §3.2 feature-slot activation semantics |
+| `turbine/src/lib.rs` | `cross` | module wiring |
+| `turbine/src/mcp_proposer.rs` | `5.1/5.3` | §3.2 proposer payload + shred dispatch |
+| `turbine/src/quic_endpoint.rs` | `4.3` | MCP control QUIC transport |
+| `turbine/src/retransmit_stage.rs` | `4.4` | relay broadcast/retransmit plumbing |
+| `turbine/src/sigverify_shreds.rs` | `3.3` | §3.5 local shred validity precondition |
+| `validator/src/admin_rpc_service.rs` | `4.5` | admin-trigger MCP repair API |
+| `votor/Cargo.toml` | `7.4` | dependency wiring |
+| `votor/src/consensus_metrics.rs` | `7.4` | consensus vote/block_id observability |
+| `votor/src/consensus_pool/parent_ready_tracker.rs` | `7.4` | consensus parent readiness with MCP data |
+| `votor/src/consensus_pool_service.rs` | `7.4` | consensus integration |
+| `votor/src/consensus_pool_service/stats.rs` | `7.4` | consensus integration metrics |
+| `votor/src/event_handler.rs` | `7.4` | consensus event handling for MCP block_id |
+| `votor/src/voting_utils.rs` | `7.4` | vote payload + block_id |

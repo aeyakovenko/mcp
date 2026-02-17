@@ -7286,9 +7286,8 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         if last_refresh.elapsed() < Duration::from_secs(2) {
             return;
         }
-        submitted_signatures.extend(
-            send_best_effort_transfers(entry_client, funding_keypair, 2).into_iter(),
-        );
+        submitted_signatures
+            .extend(send_best_effort_transfers(entry_client, funding_keypair, 2).into_iter());
         *last_refresh = Instant::now();
     }
 
@@ -7618,24 +7617,26 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .collect(),
         )
     };
-    let assign_one_executed_tx_for_proposer = |proposer_payload_transactions: &[Vec<u8>],
-                                               executed_signature_counts: &mut HashMap<[u8; 64], usize>|
-     -> bool {
-        for tx_wire_bytes in proposer_payload_transactions {
-            let Some(signature) = first_signature_bytes_from_wire_transaction(tx_wire_bytes) else {
-                continue;
-            };
-            let Some(remaining) = executed_signature_counts.get_mut(&signature) else {
-                continue;
-            };
-            if *remaining == 0 {
-                continue;
+    let assign_one_executed_tx_for_proposer =
+        |proposer_payload_transactions: &[Vec<u8>],
+         executed_signature_counts: &mut HashMap<[u8; 64], usize>|
+         -> bool {
+            for tx_wire_bytes in proposer_payload_transactions {
+                let Some(signature) = first_signature_bytes_from_wire_transaction(tx_wire_bytes)
+                else {
+                    continue;
+                };
+                let Some(remaining) = executed_signature_counts.get_mut(&signature) else {
+                    continue;
+                };
+                if *remaining == 0 {
+                    continue;
+                }
+                *remaining -= 1;
+                return true;
             }
-            *remaining -= 1;
-            return true;
-        }
-        false
-    };
+            false
+        };
 
     let post_activation_deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < post_activation_deadline {
@@ -7915,8 +7916,10 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
-    let consensus_leader_pubkey = proposer_pubkey_for(consensus_slot, consensus_block.leader_index)
-        .expect("consensus block leader index must resolve to proposer pubkey");
+    // Plan 7.1 / MCP spec §3.5: leader signature is validated against Leader[s]
+    // from the consensus leader schedule, not proposer-schedule indices.
+    let consensus_leader_pubkey = slot_leader_for(consensus_slot)
+        .expect("consensus slot leader must resolve from leader schedule");
     assert!(
         consensus_block.verify_leader_signature(&consensus_leader_pubkey),
         "observed consensus block failed leader signature verification at slot {}",
