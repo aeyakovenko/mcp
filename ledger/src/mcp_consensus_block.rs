@@ -61,8 +61,6 @@ pub enum ConsensusBlockError {
     TrailingBytes,
     #[error("consensus block exceeds protocol maximum: {actual} > {max}")]
     WireBytesTooLarge { actual: usize, max: usize },
-    #[error("leader index out of range: {0}")]
-    LeaderIndexOutOfRange(u32),
 }
 
 impl ConsensusBlock {
@@ -73,7 +71,6 @@ impl ConsensusBlock {
         consensus_meta: Vec<u8>,
         delayed_bankhash: Hash,
     ) -> Result<Self, ConsensusBlockError> {
-        ensure_leader_index_in_range(leader_index)?;
         if aggregate_bytes.len() > u32::MAX as usize {
             return Err(ConsensusBlockError::AggregateLengthOverflow(
                 aggregate_bytes.len(),
@@ -109,7 +106,6 @@ impl ConsensusBlock {
     }
 
     fn wire_body_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
-        ensure_leader_index_in_range(self.leader_index)?;
         if self.aggregate_bytes.len() > u32::MAX as usize {
             return Err(ConsensusBlockError::AggregateLengthOverflow(
                 self.aggregate_bytes.len(),
@@ -182,7 +178,6 @@ impl ConsensusBlock {
 
         let slot = read_u64_le(bytes, &mut cursor)?;
         let leader_index = read_u32_le(bytes, &mut cursor)?;
-        ensure_leader_index_in_range(leader_index)?;
         let aggregate_len = read_u32_le(bytes, &mut cursor)? as usize;
         if aggregate_len > MAX_AGGREGATE_ATTESTATION_BYTES {
             return Err(ConsensusBlockError::AggregateLengthTooLarge {
@@ -230,13 +225,6 @@ impl ConsensusBlock {
         self.leader_signature
             .verify(leader_pubkey.as_ref(), &signing_bytes)
     }
-}
-
-fn ensure_leader_index_in_range(leader_index: u32) -> Result<(), ConsensusBlockError> {
-    if leader_index as usize >= mcp::NUM_PROPOSERS {
-        return Err(ConsensusBlockError::LeaderIndexOutOfRange(leader_index));
-    }
-    Ok(())
 }
 
 fn read_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, ConsensusBlockError> {
@@ -466,34 +454,16 @@ mod tests {
     }
 
     #[test]
-    fn test_new_unsigned_rejects_out_of_range_leader_index() {
-        assert_eq!(
-            ConsensusBlock::new_unsigned(
-                1,
-                mcp::NUM_PROPOSERS as u32,
-                Vec::new(),
-                Vec::new(),
-                Hash::new_unique(),
-            )
-            .unwrap_err(),
-            ConsensusBlockError::LeaderIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
-        );
-    }
+    fn test_roundtrip_accepts_large_leader_index() {
+        let leader = Keypair::new();
+        let leader_index = u32::MAX;
+        let mut block =
+            ConsensusBlock::new_unsigned(1, leader_index, vec![], vec![], Hash::new_unique())
+                .unwrap();
+        block.sign_leader(&leader).unwrap();
 
-    #[test]
-    fn test_from_wire_rejects_out_of_range_leader_index() {
-        let mut bytes = Vec::new();
-        bytes.push(CONSENSUS_BLOCK_V1);
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&(mcp::NUM_PROPOSERS as u32).to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // aggregate_len
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // consensus_meta_len
-        bytes.extend_from_slice(Hash::new_unique().as_ref());
-        bytes.extend_from_slice(Signature::default().as_ref());
-
-        assert_eq!(
-            ConsensusBlock::from_wire_bytes(&bytes).unwrap_err(),
-            ConsensusBlockError::LeaderIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
-        );
+        let bytes = block.to_wire_bytes().unwrap();
+        let decoded = ConsensusBlock::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(decoded.leader_index, leader_index);
     }
 }
