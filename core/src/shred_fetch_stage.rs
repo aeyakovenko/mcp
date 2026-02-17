@@ -2,7 +2,9 @@
 
 use {
     crate::{
-        mcp_relay_submit::MCP_CONTROL_MSG_RELAY_ATTESTATION,
+        mcp_relay_submit::{
+            decode_relay_attestation_frame, RelayAttestationV1, MCP_CONTROL_MSG_RELAY_ATTESTATION,
+        },
         repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
     },
     agave_feature_set::FeatureSet,
@@ -13,8 +15,9 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
-    solana_ledger::shred::{
-        self, mcp_shred::is_mcp_shred_bytes, should_discard_shred, ShredFetchStats,
+    solana_ledger::{
+        mcp_consensus_block::ConsensusBlock,
+        shred::{self, mcp_shred::is_mcp_shred_bytes, should_discard_shred, ShredFetchStats},
     },
     solana_metrics::inc_new_counter_error,
     solana_packet::{Meta, PACKET_DATA_SIZE},
@@ -440,6 +443,19 @@ fn is_active_mcp_shred_packet(
     )
 }
 
+fn is_valid_mcp_control_frame(bytes: &[u8]) -> bool {
+    match bytes.first().copied() {
+        Some(MCP_CONTROL_MSG_RELAY_ATTESTATION) => decode_relay_attestation_frame(bytes)
+            .ok()
+            .and_then(|payload| RelayAttestationV1::from_bytes(payload).ok())
+            .is_some(),
+        Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK) => bytes
+            .get(1..)
+            .is_some_and(|payload| ConsensusBlock::from_wire_bytes(payload).is_ok()),
+        _ => false,
+    }
+}
+
 pub(crate) fn receive_quic_datagrams(
     quic_datagrams_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
     flags: PacketFlags,
@@ -462,10 +478,9 @@ pub(crate) fn receive_quic_datagrams(
         );
         let packet_batch: BytesPacketBatch = entries
             .filter_map(|(pubkey, addr, bytes)| {
-                if matches!(
-                    bytes.first().copied(),
-                    Some(MCP_CONTROL_MSG_RELAY_ATTESTATION | MCP_CONTROL_MSG_CONSENSUS_BLOCK)
-                ) {
+                // Route only parseable MCP control frames.
+                // Do not dispatch by byte[0] alone because payload signatures can alias 0x01/0x02.
+                if is_valid_mcp_control_frame(bytes.as_ref()) {
                     if let Some(sender) = mcp_control_message_sender.as_ref() {
                         match sender.try_send((pubkey, addr, bytes)) {
                             Ok(()) => {}
@@ -527,10 +542,18 @@ fn check_feature_activation(
 mod tests {
     use {
         super::*,
-        crate::repair::serve_repair::ShredRepairType,
+        crate::{
+            mcp_relay_submit::{
+                encode_relay_attestation_frame, RelayAttestationEntry, RelayAttestationV1,
+            },
+            repair::serve_repair::ShredRepairType,
+        },
         crossbeam_channel::unbounded,
-        solana_ledger::shred::mcp_shred::{
-            McpShred, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+        solana_ledger::{
+            mcp,
+            shred::mcp_shred::{
+                McpShred, MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+            },
         },
         solana_packet::PacketFlags,
         solana_signature::Signature,
@@ -559,9 +582,27 @@ mod tests {
         let sender_pubkey = Pubkey::new_unique();
         let remote_addr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
-        // Oversized MCP control payload should bypass PACKET_DATA_SIZE filtering.
-        let mut oversized_control = vec![0u8; PACKET_DATA_SIZE + 128];
-        oversized_control[0] = MCP_CONTROL_MSG_CONSENSUS_BLOCK;
+        // Oversized, syntactically valid MCP control payload should bypass PACKET_DATA_SIZE filtering.
+        let oversized_entries = (0..mcp::NUM_PROPOSERS as u32)
+            .map(|proposer_index| RelayAttestationEntry {
+                proposer_index,
+                commitment: [proposer_index as u8; 32],
+                proposer_signature: Signature::default(),
+            })
+            .collect();
+        let oversized_attestation = RelayAttestationV1 {
+            slot: 42,
+            relay_index: 0,
+            entries: oversized_entries,
+            relay_signature: Signature::default(),
+        };
+        let oversized_control = encode_relay_attestation_frame(
+            &oversized_attestation
+                .to_bytes()
+                .expect("attestation should serialize"),
+        )
+        .expect("frame should encode");
+        assert!(oversized_control.len() > PACKET_DATA_SIZE);
         quic_sender
             .send((
                 sender_pubkey,
@@ -592,12 +633,52 @@ mod tests {
         assert_eq!(forwarded_control.len(), oversized_control.len());
         assert_eq!(
             forwarded_control.first().copied(),
-            Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK)
+            Some(MCP_CONTROL_MSG_RELAY_ATTESTATION)
         );
 
         let batch = packet_receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("expected packet batch for non-control datagrams");
+        assert_eq!(batch.len(), 1);
+
+        exit.store(true, Ordering::Relaxed);
+        drop(quic_sender);
+        receiver_thread.join().unwrap();
+    }
+
+    #[test]
+    fn test_receive_quic_datagrams_does_not_route_invalid_control_lookalikes() {
+        let (quic_sender, quic_receiver) = unbounded();
+        let (packet_sender, packet_receiver) = unbounded();
+        let (mcp_control_sender, mcp_control_receiver) = unbounded();
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_clone = exit.clone();
+
+        let receiver_thread = thread::spawn(move || {
+            receive_quic_datagrams(
+                quic_receiver,
+                PacketFlags::empty(),
+                packet_sender,
+                exit_clone,
+                Some(mcp_control_sender),
+            );
+        });
+
+        let sender_pubkey = Pubkey::new_unique();
+        let remote_addr = SocketAddr::from(([127, 0, 0, 1], 3001));
+
+        // First byte matches MCP control tag, but payload is not a valid RelayAttestation frame.
+        let lookalike_payload = vec![MCP_CONTROL_MSG_RELAY_ATTESTATION, 0x99, 0x88, 0x77];
+        quic_sender
+            .send((sender_pubkey, remote_addr, Bytes::from(lookalike_payload)))
+            .unwrap();
+
+        assert!(mcp_control_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .is_err());
+        let batch = packet_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("expected packet batch for non-MCP lookalike datagram");
         assert_eq!(batch.len(), 1);
 
         exit.store(true, Ordering::Relaxed);

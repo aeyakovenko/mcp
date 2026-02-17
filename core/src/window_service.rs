@@ -82,6 +82,11 @@ fn relay_indices_for_pubkey(relays: &[Pubkey], local_pubkey: &Pubkey) -> Vec<u32
         .collect()
 }
 
+fn consensus_leader_index_for_slot(slot: Slot, bank: &solana_runtime::bank::Bank) -> Option<u32> {
+    let (_, slot_index) = bank.get_epoch_and_slot_index(slot);
+    u32::try_from(slot_index).ok()
+}
+
 fn try_send_mcp_control_frame(
     quic_endpoint_sender: &AsyncSender<(SocketAddr, Bytes)>,
     remote_addr: SocketAddr,
@@ -208,21 +213,26 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         return true;
     }
 
-    let leader_indices: Vec<u32> = proposer_schedule
-        .iter()
-        .enumerate()
-        .filter_map(|(index, pubkey)| {
-            if pubkey == local_pubkey {
-                u32::try_from(index).ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    if leader_indices.is_empty() {
-        log_skip("local node is not a leader for slot");
+    let expected_leader = leader_schedule_cache
+        .slot_leader_at(slot, Some(&working_bank))
+        .or_else(|| leader_schedule_cache.slot_leader_at(slot, Some(&root_bank)))
+        .or_else(|| leader_schedule_cache.slot_leader_at(slot, None));
+    let Some(expected_leader) = expected_leader else {
+        log_skip("consensus leader unavailable");
+        return true;
+    };
+    if expected_leader != *local_pubkey {
+        log_skip("local node is not consensus leader for slot");
         return false;
     }
+
+    // MCP spec §3.5: leader_index must match Leader[s] from the consensus leader schedule.
+    let leader_index = consensus_leader_index_for_slot(slot, &working_bank)
+        .or_else(|| consensus_leader_index_for_slot(slot, &root_bank));
+    let Some(leader_index) = leader_index else {
+        log_skip("consensus leader index unavailable");
+        return true;
+    };
 
     let mut relay_entries = Vec::new();
     for (relay_index, relay_pubkey) in relay_schedule.iter().enumerate() {
@@ -272,112 +282,110 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     }
 
     let identity_keypair = cluster_info.keypair();
-    for leader_index in leader_indices {
-        let Ok(aggregate) =
-            AggregateAttestation::new_canonical(slot, leader_index, relay_entries.clone())
-        else {
-            trace!(
-                "MCP consensus finalize skipped for slot {} leader_index {}: aggregate canonicalization failed",
-                slot, leader_index
-            );
-            continue;
-        };
-        let Ok(aggregate_bytes) = aggregate.to_wire_bytes() else {
-            trace!(
-                "MCP consensus finalize skipped for slot {} leader_index {}: aggregate serialization failed",
-                slot, leader_index
-            );
-            continue;
-        };
-        let Ok(mut consensus_block) = ConsensusBlock::new_unsigned(
+    let Ok(aggregate) =
+        AggregateAttestation::new_canonical(slot, leader_index, relay_entries.clone())
+    else {
+        trace!(
+            "MCP consensus finalize skipped for slot {} leader_index {}: aggregate canonicalization failed",
+            slot, leader_index
+        );
+        return true;
+    };
+    let Ok(aggregate_bytes) = aggregate.to_wire_bytes() else {
+        trace!(
+            "MCP consensus finalize skipped for slot {} leader_index {}: aggregate serialization failed",
+            slot, leader_index
+        );
+        return true;
+    };
+    let Ok(mut consensus_block) = ConsensusBlock::new_unsigned(
+        slot,
+        leader_index,
+        aggregate_bytes,
+        consensus_meta.clone(),
+        delayed_bankhash,
+    ) else {
+        trace!(
+            "MCP consensus finalize skipped for slot {} leader_index {}: consensus block build failed",
+            slot, leader_index
+        );
+        return true;
+    };
+    if consensus_block
+        .sign_leader(identity_keypair.as_ref())
+        .is_err()
+    {
+        trace!(
+            "MCP consensus finalize skipped for slot {} leader_index {}: leader signature failed",
             slot,
-            leader_index,
-            aggregate_bytes,
-            consensus_meta.clone(),
-            delayed_bankhash,
-        ) else {
-            trace!(
-                "MCP consensus finalize skipped for slot {} leader_index {}: consensus block build failed",
-                slot, leader_index
-            );
-            continue;
-        };
-        if consensus_block
-            .sign_leader(identity_keypair.as_ref())
-            .is_err()
-        {
-            trace!(
-                "MCP consensus finalize skipped for slot {} leader_index {}: leader signature failed",
-                slot, leader_index
-            );
-            continue;
-        }
-        let Ok(consensus_bytes) = consensus_block.to_wire_bytes() else {
-            trace!(
-                "MCP consensus finalize skipped for slot {} leader_index {}: consensus serialization failed",
-                slot, leader_index
-            );
-            continue;
-        };
+            leader_index
+        );
+        return true;
+    }
+    let Ok(consensus_bytes) = consensus_block.to_wire_bytes() else {
+        trace!(
+            "MCP consensus finalize skipped for slot {} leader_index {}: consensus serialization failed",
+            slot, leader_index
+        );
+        return true;
+    };
 
-        let inserted = match consensus_blocks.write() {
-            Ok(mut blocks) => {
-                let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
-                blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
-                if let Some(existing) = blocks.get(&slot) {
-                    if existing != &consensus_bytes {
-                        warn!(
-                            "MCP consensus block conflict at slot {} (keeping first valid block)",
-                            slot
-                        );
-                    }
-                    false
-                } else {
-                    blocks.insert(slot, consensus_bytes.clone());
-                    true
+    let inserted = match consensus_blocks.write() {
+        Ok(mut blocks) => {
+            let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
+            blocks.retain(|tracked_slot, _| *tracked_slot >= min_slot);
+            if let Some(existing) = blocks.get(&slot) {
+                if existing != &consensus_bytes {
+                    warn!(
+                        "MCP consensus block conflict at slot {} (keeping first valid block)",
+                        slot
+                    );
                 }
-            }
-            Err(err) => {
-                warn!(
-                    "failed to cache locally finalized MCP consensus block for slot {}: {}",
-                    slot, err
-                );
                 false
-            }
-        };
-        if !inserted {
-            return false;
-        }
-        debug!(
-            "cached local MCP consensus block for slot {} with {} relay attestations",
-            slot,
-            relay_entries.len()
-        );
-        maybe_persist_execution_output_from_consensus(
-            slot,
-            &working_bank,
-            bank_forks,
-            blockstore,
-            leader_schedule_cache,
-            consensus_blocks,
-        );
-
-        if let Some(sender) = turbine_quic_endpoint_sender {
-            let mut frame = Vec::with_capacity(1 + consensus_bytes.len());
-            frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
-            frame.extend_from_slice(&consensus_bytes);
-            let frame = Bytes::from(frame);
-            for peer_addr in cluster_info
-                .tvu_peers(|node| node.tvu(Protocol::QUIC))
-                .into_iter()
-                .flatten()
-            {
-                if !try_send_mcp_control_frame(sender, peer_addr, frame.clone()) {
-                    inc_new_counter_error!("mcp-consensus-block-send-dropped", 1, 1);
-                }
+            } else {
+                blocks.insert(slot, consensus_bytes.clone());
+                true
             }
         }
+        Err(err) => {
+            warn!(
+                "failed to cache locally finalized MCP consensus block for slot {}: {}",
+                slot, err
+            );
+            false
+        }
+    };
+    if !inserted {
         return false;
+    }
+    debug!(
+        "cached local MCP consensus block for slot {} with {} relay attestations",
+        slot,
+        relay_entries.len()
+    );
+    maybe_persist_execution_output_from_consensus(
+        slot,
+        &working_bank,
+        bank_forks,
+        blockstore,
+        leader_schedule_cache,
+        consensus_blocks,
+    );
+
+    if let Some(sender) = turbine_quic_endpoint_sender {
+        let mut frame = Vec::with_capacity(1 + consensus_bytes.len());
+        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame.extend_from_slice(&consensus_bytes);
+        let frame = Bytes::from(frame);
+        for peer_addr in cluster_info
+            .tvu_peers(|node| node.tvu(Protocol::QUIC))
+            .into_iter()
+            .flatten()
+        {
+            if !try_send_mcp_control_frame(sender, peer_addr, frame.clone()) {
+                inc_new_counter_error!("mcp-consensus-block-send-dropped", 1, 1);
+            }
+        }
     }
     false
 }
@@ -982,16 +990,23 @@ fn ingest_mcp_control_message(
             }
 
             let leader_pubkey = leader_schedule_cache
-                .proposers_at_slot(consensus_block.slot, Some(&root_bank))
-                .or_else(|| leader_schedule_cache.proposers_at_slot(consensus_block.slot, None))
-                .and_then(|proposers| {
-                    proposers
-                        .get(consensus_block.leader_index as usize)
-                        .copied()
-                });
+                .slot_leader_at(consensus_block.slot, Some(&root_bank))
+                .or_else(|| leader_schedule_cache.slot_leader_at(consensus_block.slot, None));
             let Some(leader_pubkey) = leader_pubkey else {
                 return None;
             };
+            // MCP spec §3.5: leader_index MUST match Leader[s] from the consensus leader schedule.
+            if consensus_leader_index_for_slot(consensus_block.slot, &root_bank)
+                .is_some_and(|expected_index| expected_index != consensus_block.leader_index)
+            {
+                debug!(
+                    "dropping MCP ConsensusBlock for slot {} from {} due to leader_index mismatch (actual {}, expected schedule)",
+                    consensus_block.slot,
+                    remote_address,
+                    consensus_block.leader_index,
+                );
+                return None;
+            }
             if sender_pubkey != leader_pubkey {
                 debug!(
                     "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
@@ -1454,15 +1469,8 @@ mod test {
         let root_bank = bank_forks.read().unwrap().root_bank();
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
-        let leader_index = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .and_then(|proposers| {
-                proposers
-                    .iter()
-                    .position(|pubkey| *pubkey == leader.pubkey())
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .expect("leader should appear in MCP proposer schedule");
+        let leader_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
 
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
             .unwrap()
@@ -1517,15 +1525,8 @@ mod test {
         let root_bank = bank_forks.read().unwrap().root_bank();
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
-        let leader_index = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .and_then(|proposers| {
-                proposers
-                    .iter()
-                    .position(|pubkey| *pubkey == leader.pubkey())
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .expect("leader should appear in MCP proposer schedule");
+        let leader_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
 
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
             .unwrap()
@@ -1577,15 +1578,8 @@ mod test {
         let root_bank = bank_forks.read().unwrap().root_bank();
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
-        let leader_index = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .and_then(|proposers| {
-                proposers
-                    .iter()
-                    .position(|pubkey| *pubkey == leader.pubkey())
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .expect("leader should appear in MCP proposer schedule");
+        let leader_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
 
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
             .unwrap()
@@ -1645,15 +1639,8 @@ mod test {
                     .and_then(|index| u32::try_from(index).ok())
             })
             .expect("leader should appear in MCP relay schedule");
-        let valid_proposer_index = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .and_then(|proposers| {
-                proposers
-                    .iter()
-                    .position(|pubkey| *pubkey == leader.pubkey())
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .expect("leader should appear in MCP proposer schedule");
+        let valid_proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let invalid_proposer_index = if valid_proposer_index == 0 { 1 } else { 0 };
         let valid_commitment = [41u8; 32];
         let invalid_commitment = [99u8; 32];
@@ -1737,14 +1724,8 @@ mod test {
             bank_forks.insert(slot_bank);
         }
 
-        let proposer_schedule = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .expect("MCP proposer schedule missing");
-        let proposer_index = proposer_schedule
-            .iter()
-            .position(|pubkey| *pubkey == leader.pubkey())
-            .and_then(|index| u32::try_from(index).ok())
-            .expect("leader should appear in MCP proposer schedule");
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let relay_schedule = leader_schedule_cache
             .relays_at_slot(slot, Some(&root_bank))
             .expect("MCP relay schedule missing");
@@ -1842,14 +1823,8 @@ mod test {
             bank_forks.insert(slot_bank);
         }
 
-        let proposer_schedule = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .expect("MCP proposer schedule missing");
-        let valid_proposer_index = proposer_schedule
-            .iter()
-            .position(|pubkey| *pubkey == leader.pubkey())
-            .and_then(|index| u32::try_from(index).ok())
-            .expect("leader should appear in MCP proposer schedule");
+        let valid_proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let invalid_proposer_index = if valid_proposer_index == 0 { 1 } else { 0 };
         let relay_schedule = leader_schedule_cache
             .relays_at_slot(slot, Some(&root_bank))
@@ -1953,14 +1928,8 @@ mod test {
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
         let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
 
-        let proposer_schedule = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .expect("MCP proposer schedule missing");
-        let proposer_index = proposer_schedule
-            .iter()
-            .position(|pubkey| *pubkey == leader.pubkey())
-            .and_then(|index| u32::try_from(index).ok())
-            .expect("leader should appear in MCP proposer schedule");
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let relay_schedule = leader_schedule_cache
             .relays_at_slot(slot, Some(&root_bank))
             .expect("MCP relay schedule missing");
@@ -2041,14 +2010,8 @@ mod test {
         slot_bank.set_block_id(Some(Hash::new_unique()));
         bank_forks.write().unwrap().insert(slot_bank);
 
-        let proposer_schedule = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .expect("MCP proposer schedule missing");
-        let proposer_index = proposer_schedule
-            .iter()
-            .position(|pubkey| *pubkey == leader.pubkey())
-            .and_then(|index| u32::try_from(index).ok())
-            .expect("leader should appear in MCP proposer schedule");
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let relay_schedule = leader_schedule_cache
             .relays_at_slot(slot, Some(&root_bank))
             .expect("MCP relay schedule missing");
@@ -2143,14 +2106,8 @@ mod test {
             bank_forks.insert(slot_bank);
         }
 
-        let proposer_schedule = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&root_bank))
-            .expect("MCP proposer schedule missing");
-        let proposer_index = proposer_schedule
-            .iter()
-            .position(|pubkey| *pubkey == leader.pubkey())
-            .and_then(|index| u32::try_from(index).ok())
-            .expect("leader should appear in MCP proposer schedule");
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
         let relay_schedule = leader_schedule_cache
             .relays_at_slot(slot, Some(&root_bank))
             .expect("MCP relay schedule missing");

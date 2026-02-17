@@ -292,6 +292,10 @@ pub fn dispatch_relay_attestation_to_slot_leader(
             .or_else(|| leader_schedule_cache.slot_leader_at(slot, None))
     })?;
 
+    if dispatch.leader_pubkey == cluster_info.id() {
+        return Ok(dispatch);
+    }
+
     let leader_addr = cluster_info
         .lookup_contact_info(&dispatch.leader_pubkey, |node| node.tvu(Protocol::QUIC))
         .flatten()
@@ -342,12 +346,14 @@ mod tests {
         solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
         solana_keypair::Keypair,
         solana_ledger::{
-            genesis_utils::create_genesis_config, leader_schedule_cache::LeaderScheduleCache,
+            genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
+            leader_schedule_cache::LeaderScheduleCache,
         },
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
         std::{collections::HashMap, net::SocketAddr, sync::Arc},
+        tokio::sync::mpsc::error::TryRecvError,
     };
 
     fn signed_entry(
@@ -619,6 +625,46 @@ mod tests {
         let (addr, frame) = receiver.try_recv().unwrap();
         assert_eq!(addr, expected_addr);
         assert_eq!(frame, Bytes::from(dispatch.frame.clone()));
+    }
+
+    #[test]
+    fn test_dispatch_relay_attestation_to_slot_leader_skips_self_send() {
+        let leader = Arc::new(Keypair::new());
+        let proposer = Keypair::new();
+        let genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let leader_pubkey = leader_schedule_cache
+            .slot_leader_at(slot, Some(&root_bank))
+            .expect("slot leader should resolve");
+        assert_eq!(leader_pubkey, leader.pubkey());
+        let cluster_info = ClusterInfo::new(
+            ContactInfo::new_localhost(&leader.pubkey(), 0),
+            leader,
+            SocketAddrSpace::Unspecified,
+        );
+
+        let attestation = signed_attestation(
+            slot,
+            12,
+            vec![signed_entry(1, [7u8; 32], &proposer)],
+            &Keypair::new(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+
+        let dispatch = dispatch_relay_attestation_to_slot_leader(
+            &attestation,
+            &leader_schedule_cache,
+            &root_bank,
+            &cluster_info,
+            &sender,
+        )
+        .unwrap();
+
+        assert_eq!(dispatch.leader_pubkey, cluster_info.id());
+        assert_eq!(receiver.try_recv().unwrap_err(), TryRecvError::Empty);
     }
 
     #[test]

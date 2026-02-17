@@ -75,6 +75,11 @@ fn load_relay_schedule(
         .unwrap_or_default()
 }
 
+fn consensus_leader_index_for_slot(slot: Slot, bank: &Bank) -> Option<u32> {
+    let (_, slot_index) = bank.get_epoch_and_slot_index(slot);
+    u32::try_from(slot_index).ok()
+}
+
 fn derive_selected_commitments(
     aggregate: &[RelayAttestationObservation],
 ) -> HashMap<u32, Commitment> {
@@ -155,19 +160,19 @@ fn build_vote_gate_input(
         return None;
     }
 
-    let leader_pubkey = proposers
-        .get(consensus_block.leader_index as usize)
-        .copied();
-    let leader_signature_valid = leader_pubkey
+    // MCP spec §3.5: validator MUST verify leader_signature and that
+    // leader_index matches Leader[s] (consensus leader schedule), not proposer index.
+    let expected_leader = leader_schedule_cache
+        .slot_leader_at(slot, Some(bank))
+        .or_else(|| leader_schedule_cache.slot_leader_at(slot, Some(root_bank)))
+        .or_else(|| leader_schedule_cache.slot_leader_at(slot, None));
+    let leader_signature_valid = expected_leader
         .as_ref()
         .is_some_and(|leader_pubkey| consensus_block.verify_leader_signature(leader_pubkey));
-    let leader_index_matches = leader_pubkey.is_some_and(|leader_pubkey| {
-        leader_schedule_cache
-            .slot_leader_at(slot, Some(bank))
-            .or_else(|| leader_schedule_cache.slot_leader_at(slot, Some(root_bank)))
-            .or_else(|| leader_schedule_cache.slot_leader_at(slot, None))
-            .is_some_and(|expected_leader| expected_leader == leader_pubkey)
-    });
+    let expected_leader_index = consensus_leader_index_for_slot(slot, bank)
+        .or_else(|| consensus_leader_index_for_slot(slot, root_bank));
+    let leader_index_matches = expected_leader_index
+        .is_some_and(|expected_index| expected_index == consensus_block.leader_index);
 
     let aggregate_attestation =
         AggregateAttestation::from_wire_bytes(&consensus_block.aggregate_bytes).ok()?;
@@ -679,15 +684,8 @@ mod tests {
             .clone_without_scheduler();
 
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
-        let leader_index = leader_schedule_cache
-            .proposers_at_slot(slot, Some(&bank))
-            .and_then(|proposers| {
-                proposers
-                    .iter()
-                    .position(|pubkey| *pubkey == leader.pubkey())
-                    .and_then(|index| u32::try_from(index).ok())
-            })
-            .expect("leader should appear in proposer schedule");
+        let leader_index = consensus_leader_index_for_slot(slot, &bank)
+            .expect("leader index should resolve for slot");
 
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
             .unwrap()

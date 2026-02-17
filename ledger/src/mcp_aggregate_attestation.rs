@@ -72,8 +72,6 @@ pub enum AggregateAttestationError {
     },
     #[error("proposer index out of range: {0}")]
     ProposerIndexOutOfRange(u32),
-    #[error("leader index out of range: {0}")]
-    LeaderIndexOutOfRange(u32),
     #[error("relay entries must be strictly sorted by relay_index")]
     RelayEntriesNotStrictlySorted,
     #[error("proposer entries must be strictly sorted by proposer_index")]
@@ -92,7 +90,6 @@ impl AggregateAttestation {
         leader_index: u32,
         mut relay_entries: Vec<AggregateRelayEntry>,
     ) -> Result<Self, AggregateAttestationError> {
-        ensure_leader_index_in_range(leader_index)?;
         if relay_entries.len() > mcp::NUM_RELAYS {
             return Err(AggregateAttestationError::TooManyRelayEntries(
                 relay_entries.len(),
@@ -182,7 +179,6 @@ impl AggregateAttestation {
 
         let slot = read_u64_le(bytes, &mut cursor)?;
         let leader_index = read_u32_le(bytes, &mut cursor)?;
-        ensure_leader_index_in_range(leader_index)?;
         let relays_len = read_u16_le(bytes, &mut cursor)? as usize;
         if relays_len > mcp::NUM_RELAYS {
             return Err(AggregateAttestationError::TooManyRelayEntries(relays_len));
@@ -319,7 +315,6 @@ impl AggregateAttestation {
     }
 
     fn validate_for_serialize(&self) -> Result<(), AggregateAttestationError> {
-        ensure_leader_index_in_range(self.leader_index)?;
         if self.relay_entries.len() > mcp::NUM_RELAYS {
             return Err(AggregateAttestationError::TooManyRelayEntries(
                 self.relay_entries.len(),
@@ -464,15 +459,6 @@ fn ensure_proposer_indices_in_range(
                 entry.proposer_index,
             ));
         }
-    }
-    Ok(())
-}
-
-fn ensure_leader_index_in_range(leader_index: u32) -> Result<(), AggregateAttestationError> {
-    if leader_index as usize >= mcp::NUM_PROPOSERS {
-        return Err(AggregateAttestationError::LeaderIndexOutOfRange(
-            leader_index,
-        ));
     }
     Ok(())
 }
@@ -1008,25 +994,11 @@ mod tests {
     }
 
     #[test]
-    fn test_new_canonical_rejects_out_of_range_leader_index() {
-        assert_eq!(
-            AggregateAttestation::new_canonical(1, mcp::NUM_PROPOSERS as u32, Vec::new())
-                .unwrap_err(),
-            AggregateAttestationError::LeaderIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
-        );
-    }
-
-    #[test]
-    fn test_from_wire_rejects_out_of_range_leader_index() {
-        let mut bytes = Vec::new();
-        bytes.push(AGGREGATE_ATTESTATION_V1);
-        bytes.extend_from_slice(&1u64.to_le_bytes()); // slot
-        bytes.extend_from_slice(&(mcp::NUM_PROPOSERS as u32).to_le_bytes()); // leader_index
-        bytes.extend_from_slice(&0u16.to_le_bytes()); // relay_entries_len
-
-        assert_eq!(
-            AggregateAttestation::from_wire_bytes(&bytes).unwrap_err(),
-            AggregateAttestationError::LeaderIndexOutOfRange(mcp::NUM_PROPOSERS as u32),
-        );
+    fn test_roundtrip_accepts_large_leader_index() {
+        let leader_index = u32::MAX;
+        let aggregate = AggregateAttestation::new_canonical(1, leader_index, Vec::new()).unwrap();
+        let bytes = aggregate.to_wire_bytes().unwrap();
+        let decoded = AggregateAttestation::from_wire_bytes(&bytes).unwrap();
+        assert_eq!(decoded.leader_index, leader_index);
     }
 }
