@@ -26,6 +26,7 @@ pub fn decode_payload(
 }
 
 /// Derive commitment root and witnesses for all relay shards.
+#[allow(clippy::type_complexity)]
 pub fn commitment_and_witnesses(
     slot: u64,
     proposer_index: u32,

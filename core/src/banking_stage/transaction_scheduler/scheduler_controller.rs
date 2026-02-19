@@ -213,7 +213,7 @@ where
                 &mut mcp_fee_payer_tracker,
                 &mut error_counters,
             );
-            *result = check_result.and_then(|_| fee_check_result).is_ok();
+            *result = check_result.and(fee_check_result).is_ok();
         }
     }
 

@@ -371,8 +371,8 @@ mod tests {
         let root = commitment_root(12, 4, &shreds).unwrap();
         let mut state = McpReconstructionState::new(12, 4, payload.len(), root).unwrap();
 
-        for i in 0..(MCP_RECON_DATA_SHREDS - 1) {
-            let attempt = state.insert_and_try_reconstruct(i, shreds[i]).unwrap();
+        for (i, shred) in shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS - 1) {
+            let attempt = state.insert_and_try_reconstruct(i, *shred).unwrap();
             assert_eq!(
                 attempt,
                 McpReconstructionAttempt::Pending {
@@ -446,8 +446,8 @@ mod tests {
         let shreds = encode_payload(&payload);
         let root = commitment_root(22, 1, &shreds).unwrap();
         let mut state = McpReconstructionState::new(22, 1, payload.len(), root).unwrap();
-        for i in 0..MCP_RECON_DATA_SHREDS {
-            state.insert_shard(i, shreds[i]).unwrap();
+        for (i, shred) in shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS) {
+            state.insert_shard(i, *shred).unwrap();
         }
 
         let first = state.try_reconstruct().unwrap();
@@ -468,8 +468,8 @@ mod tests {
         invalid_shreds[0][0] ^= 1;
 
         let mut state = McpReconstructionState::new(31, 2, payload.len(), root).unwrap();
-        for i in 0..MCP_RECON_DATA_SHREDS {
-            state.insert_shard(i, invalid_shreds[i]).unwrap();
+        for (i, shred) in invalid_shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS) {
+            state.insert_shard(i, *shred).unwrap();
         }
 
         assert_eq!(
@@ -484,8 +484,8 @@ mod tests {
         // First insert after poisoning clears stale shards and restarts accumulation.
         state.insert_shard(0, valid_shreds[0]).unwrap();
         assert_eq!(state.present_shards(), 1);
-        for i in 1..MCP_RECON_DATA_SHREDS {
-            state.insert_shard(i, valid_shreds[i]).unwrap();
+        for (i, shred) in valid_shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS).skip(1) {
+            state.insert_shard(i, *shred).unwrap();
         }
         assert_eq!(
             state.try_reconstruct().unwrap(),

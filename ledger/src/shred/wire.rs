@@ -673,7 +673,11 @@ mod tests {
         };
         let mcp_bytes = mcp_shred.to_bytes();
         let mut packet = Packet::default();
-        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet
+            .buffer_mut()
+            .get_mut(..mcp_bytes.len())
+            .unwrap()
+            .copy_from_slice(&mcp_bytes);
         packet.meta_mut().size = mcp_bytes.len();
         packet.meta_mut().flags |= PacketFlags::REPAIR;
 

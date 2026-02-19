@@ -188,12 +188,13 @@ impl McpTransaction {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
         // Always emit latest format on serialization.
-        bytes.push(MCP_TX_LATEST_VERSION);
-        bytes.push(self.legacy_header.num_required_signatures);
-        bytes.push(self.legacy_header.num_readonly_signed);
-        bytes.push(self.legacy_header.num_readonly_unsigned);
+        let mut bytes = vec![
+            MCP_TX_LATEST_VERSION,
+            self.legacy_header.num_required_signatures,
+            self.legacy_header.num_readonly_signed,
+            self.legacy_header.num_readonly_unsigned,
+        ];
         bytes.extend_from_slice(&self.transaction_config_mask.to_le_bytes());
         bytes.extend_from_slice(&self.lifetime_specifier);
         bytes.push(self.instruction_headers.len() as u8);

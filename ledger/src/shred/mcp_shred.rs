@@ -69,9 +69,9 @@ const fn mcp_witness_len(num_relays: usize) -> usize {
 
 pub fn is_mcp_shred_bytes(data: &[u8]) -> bool {
     if data.len() != MCP_SHRED_WIRE_SIZE
-        || !data
+        || data
             .get(OFFSET_WITNESS_LEN)
-            .is_some_and(|len| *len as usize == MCP_WITNESS_LEN)
+            .is_none_or(|len| *len as usize != MCP_WITNESS_LEN)
     {
         return false;
     }
