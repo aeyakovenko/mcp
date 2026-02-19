@@ -17,7 +17,9 @@ use {
     solana_gossip::cluster_info::ClusterInfo,
     solana_keypair::Keypair,
     solana_ledger::{
-        mcp_consensus_block::ConsensusBlock,
+        mcp_consensus_block::{
+            ConsensusBlock, MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT, FRAGMENT_OVERHEAD,
+        },
         shred::{self, mcp_shred::is_mcp_shred_bytes, should_discard_shred, ShredFetchStats},
     },
     solana_metrics::inc_new_counter_error,
@@ -459,6 +461,9 @@ fn is_valid_mcp_control_frame(bytes: &[u8]) -> bool {
         Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK) => bytes
             .get(1..)
             .is_some_and(|payload| ConsensusBlock::from_wire_bytes(payload).is_ok()),
+        Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT) => {
+            bytes.len() > FRAGMENT_OVERHEAD && bytes.len() <= PACKET_DATA_SIZE
+        }
         _ => false,
     }
 }

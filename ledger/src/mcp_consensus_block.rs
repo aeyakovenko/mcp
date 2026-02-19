@@ -2,9 +2,14 @@ use {
     crate::mcp,
     solana_clock::Slot,
     solana_hash::{Hash, HASH_BYTES},
+    solana_packet::PACKET_DATA_SIZE,
     solana_pubkey::Pubkey,
     solana_signature::{Signature, SIGNATURE_BYTES},
     solana_signer::Signer,
+    std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    },
 };
 
 pub const CONSENSUS_BLOCK_V1: u8 = 1;
@@ -275,6 +280,167 @@ fn read_array<const N: usize>(
     Ok(out)
 }
 
+// ── ConsensusBlock fragment protocol ──────────────────────────────────────────
+//
+// ConsensusBlocks (20KB–400KB) exceed the ~1232-byte QUIC datagram MTU on
+// production networks.  We split them into MTU-sized fragments with a thin
+// framing header so each fragment fits in a single datagram.
+//
+// Fragment wire format (max PACKET_DATA_SIZE = 1232 bytes):
+//   type_tag  : u8       = 0x03   (1 byte)
+//   slot      : u64               (8 bytes)
+//   frag_idx  : u16               (2 bytes, 0-based)
+//   total     : u16               (2 bytes, total fragment count)
+//   cb_hash   : [u8; 32]          (32 bytes, SHA-256 of full ConsensusBlock wire bytes)
+//   data      : [u8; N]           (remaining, up to MAX_FRAGMENT_DATA)
+
+pub const MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT: u8 = 0x03;
+/// Fragment header overhead: type_tag(1) + slot(8) + frag_idx(2) + total(2) + cb_hash(32).
+pub const FRAGMENT_OVERHEAD: usize = 1 + 8 + 2 + 2 + 32;
+/// Maximum data payload per fragment.
+pub const MAX_FRAGMENT_DATA: usize = PACKET_DATA_SIZE - FRAGMENT_OVERHEAD;
+
+const MAX_PENDING_REASSEMBLIES: usize = 64;
+
+/// Split ConsensusBlock wire bytes into MTU-sized fragments.
+pub fn fragment_consensus_block(slot: Slot, consensus_wire_bytes: &[u8]) -> Vec<Vec<u8>> {
+    use solana_sha256_hasher::hash;
+
+    let cb_hash = hash(consensus_wire_bytes);
+    let total_fragments = consensus_wire_bytes
+        .len()
+        .div_ceil(MAX_FRAGMENT_DATA)
+        .max(1);
+    let total = total_fragments as u16;
+
+    let mut fragments = Vec::with_capacity(total_fragments);
+    for (frag_idx, chunk) in consensus_wire_bytes
+        .chunks(MAX_FRAGMENT_DATA)
+        .enumerate()
+    {
+        let mut buf = Vec::with_capacity(FRAGMENT_OVERHEAD + chunk.len());
+        buf.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT);
+        buf.extend_from_slice(&slot.to_le_bytes());
+        buf.extend_from_slice(&(frag_idx as u16).to_le_bytes());
+        buf.extend_from_slice(&total.to_le_bytes());
+        buf.extend_from_slice(cb_hash.as_ref());
+        buf.extend_from_slice(chunk);
+        fragments.push(buf);
+    }
+    fragments
+}
+
+/// Parse the header of a consensus block fragment.  Returns
+/// `(slot, frag_idx, total, cb_hash, data_slice)` on success.
+pub fn parse_fragment_header(bytes: &[u8]) -> Option<(Slot, u16, u16, [u8; 32], &[u8])> {
+    if bytes.len() <= FRAGMENT_OVERHEAD || bytes.len() > PACKET_DATA_SIZE {
+        return None;
+    }
+    if bytes[0] != MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT {
+        return None;
+    }
+    let slot = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+    let frag_idx = u16::from_le_bytes(bytes[9..11].try_into().ok()?);
+    let total = u16::from_le_bytes(bytes[11..13].try_into().ok()?);
+    if total == 0 || frag_idx >= total {
+        return None;
+    }
+    let mut cb_hash = [0u8; 32];
+    cb_hash.copy_from_slice(&bytes[13..45]);
+    let data = &bytes[FRAGMENT_OVERHEAD..];
+    Some((slot, frag_idx, total, cb_hash, data))
+}
+
+struct FragmentState {
+    total: u16,
+    received: Vec<Option<Vec<u8>>>,
+    received_count: u16,
+    first_seen: Instant,
+}
+
+/// Collects consensus block fragments and reassembles complete blocks.
+pub struct ConsensusBlockFragmentCollector {
+    pending: HashMap<(Slot, [u8; 32]), FragmentState>,
+}
+
+impl Default for ConsensusBlockFragmentCollector {
+    fn default() -> Self {
+        Self {
+            pending: HashMap::new(),
+        }
+    }
+}
+
+impl ConsensusBlockFragmentCollector {
+    /// Ingest a raw fragment datagram.  Returns `(slot, reassembled_consensus_bytes)`
+    /// when all fragments for a ConsensusBlock have arrived.
+    pub fn ingest(&mut self, fragment_bytes: &[u8]) -> Option<(Slot, Vec<u8>)> {
+        let (slot, frag_idx, total, cb_hash, data) = parse_fragment_header(fragment_bytes)?;
+        let key = (slot, cb_hash);
+        let frag_idx = frag_idx as usize;
+
+        let state = self.pending.entry(key).or_insert_with(|| FragmentState {
+            total,
+            received: vec![None; total as usize],
+            received_count: 0,
+            first_seen: Instant::now(),
+        });
+
+        // Reject mismatched total for same key.
+        if state.total != total {
+            return None;
+        }
+
+        // Deduplicate: ignore if already received.
+        if state.received[frag_idx].is_some() {
+            return None;
+        }
+
+        state.received[frag_idx] = Some(data.to_vec());
+        state.received_count += 1;
+
+        if state.received_count == state.total {
+            let state = self.pending.remove(&key)?;
+            let mut assembled = Vec::new();
+            for part in state.received {
+                assembled.extend_from_slice(part.as_ref()?);
+            }
+            // Verify hash matches.
+            let actual_hash = solana_sha256_hasher::hash(&assembled);
+            if actual_hash.as_ref() != cb_hash {
+                return None;
+            }
+            Some((slot, assembled))
+        } else {
+            // Enforce max pending reassemblies after insert.
+            self.enforce_max_pending();
+            None
+        }
+    }
+
+    /// Remove reassembly entries older than `max_age`.
+    pub fn evict_stale(&mut self, max_age: Duration) {
+        self.pending
+            .retain(|_, state| state.first_seen.elapsed() < max_age);
+    }
+
+    fn enforce_max_pending(&mut self) {
+        while self.pending.len() > MAX_PENDING_REASSEMBLIES {
+            // Evict the oldest entry.
+            let oldest_key = self
+                .pending
+                .iter()
+                .min_by_key(|(_, state)| state.first_seen)
+                .map(|(key, _)| *key);
+            if let Some(key) = oldest_key {
+                self.pending.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {super::*, solana_keypair::Keypair};
@@ -466,5 +632,164 @@ mod tests {
         let bytes = block.to_wire_bytes().unwrap();
         let decoded = ConsensusBlock::from_wire_bytes(&bytes).unwrap();
         assert_eq!(decoded.leader_index, leader_index);
+    }
+
+    // ── Fragment tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_fragment_roundtrip() {
+        let leader = Keypair::new();
+        let mut block = ConsensusBlock::new_unsigned(
+            42,
+            5,
+            vec![1u8; 5000],
+            vec![2u8; 32],
+            Hash::new_unique(),
+        )
+        .unwrap();
+        block.sign_leader(&leader).unwrap();
+        let wire_bytes = block.to_wire_bytes().unwrap();
+
+        let fragments = fragment_consensus_block(42, &wire_bytes);
+        assert!(fragments.len() > 1);
+        for frag in &fragments {
+            assert!(frag.len() <= PACKET_DATA_SIZE);
+        }
+
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let mut result = None;
+        for frag in &fragments {
+            result = collector.ingest(frag);
+        }
+        let (slot, reassembled) = result.expect("should reassemble");
+        assert_eq!(slot, 42);
+        assert_eq!(reassembled, wire_bytes);
+
+        let decoded = ConsensusBlock::from_wire_bytes(&reassembled).unwrap();
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn test_fragment_out_of_order_delivery() {
+        let wire_bytes = vec![0xABu8; 5000];
+        let fragments = fragment_consensus_block(99, &wire_bytes);
+        assert!(fragments.len() > 1);
+
+        // Deliver in reverse order.
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let mut result = None;
+        for frag in fragments.iter().rev() {
+            result = collector.ingest(frag);
+        }
+        let (slot, reassembled) = result.expect("should reassemble");
+        assert_eq!(slot, 99);
+        assert_eq!(reassembled, wire_bytes);
+    }
+
+    #[test]
+    fn test_fragment_duplicate_is_idempotent() {
+        let wire_bytes = vec![0xCDu8; 3000];
+        let fragments = fragment_consensus_block(10, &wire_bytes);
+
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        // Send first fragment twice.
+        assert!(collector.ingest(&fragments[0]).is_none());
+        assert!(collector.ingest(&fragments[0]).is_none());
+        // Complete the rest.
+        let mut result = None;
+        for frag in &fragments[1..] {
+            result = collector.ingest(frag);
+        }
+        let (slot, reassembled) = result.expect("should reassemble");
+        assert_eq!(slot, 10);
+        assert_eq!(reassembled, wire_bytes);
+    }
+
+    #[test]
+    fn test_fragment_stale_eviction() {
+        let wire_bytes = vec![0xEFu8; 2000];
+        let fragments = fragment_consensus_block(50, &wire_bytes);
+
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        // Ingest only first fragment.
+        collector.ingest(&fragments[0]);
+        assert_eq!(collector.pending.len(), 1);
+
+        // Evict with zero duration => everything is stale.
+        collector.evict_stale(Duration::from_secs(0));
+        assert!(collector.pending.is_empty());
+    }
+
+    #[test]
+    fn test_fragment_small_payload() {
+        // Payload that fits in a single fragment.
+        let wire_bytes = vec![0x11u8; 100];
+        let fragments = fragment_consensus_block(1, &wire_bytes);
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].len() <= PACKET_DATA_SIZE);
+
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let (slot, reassembled) = collector
+            .ingest(&fragments[0])
+            .expect("single fragment should complete");
+        assert_eq!(slot, 1);
+        assert_eq!(reassembled, wire_bytes);
+    }
+
+    #[test]
+    fn test_fragment_max_size_consensus_block() {
+        // Use a large payload close to protocol max.
+        let wire_bytes = vec![0x77u8; MAX_CONSENSUS_BLOCK_WIRE_BYTES];
+        let fragments = fragment_consensus_block(200, &wire_bytes);
+        let expected_fragments = MAX_CONSENSUS_BLOCK_WIRE_BYTES.div_ceil(MAX_FRAGMENT_DATA);
+        assert_eq!(fragments.len(), expected_fragments);
+
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let mut result = None;
+        for frag in &fragments {
+            result = collector.ingest(frag);
+        }
+        let (slot, reassembled) = result.expect("should reassemble");
+        assert_eq!(slot, 200);
+        assert_eq!(reassembled, wire_bytes);
+    }
+
+    #[test]
+    fn test_fragment_constants() {
+        assert_eq!(FRAGMENT_OVERHEAD, 45);
+        assert_eq!(MAX_FRAGMENT_DATA, PACKET_DATA_SIZE - 45);
+        assert!(MAX_FRAGMENT_DATA > 0);
+    }
+
+    #[test]
+    fn test_parse_fragment_header_rejects_invalid() {
+        // Too short.
+        assert!(parse_fragment_header(&[0x03; FRAGMENT_OVERHEAD]).is_none());
+        // Wrong type tag.
+        let mut frag = vec![0x01; FRAGMENT_OVERHEAD + 1];
+        assert!(parse_fragment_header(&frag).is_none());
+        // total == 0.
+        frag[0] = 0x03;
+        frag[11..13].copy_from_slice(&0u16.to_le_bytes());
+        assert!(parse_fragment_header(&frag).is_none());
+    }
+
+    #[test]
+    fn test_fragment_hash_mismatch_rejected() {
+        let wire_bytes = vec![0xAAu8; 2000];
+        let mut fragments = fragment_consensus_block(5, &wire_bytes);
+        // Corrupt data in one fragment.
+        let last = fragments.last_mut().unwrap();
+        let data_start = FRAGMENT_OVERHEAD;
+        if last.len() > data_start {
+            last[data_start] ^= 0xFF;
+        }
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let mut result = None;
+        for frag in &fragments {
+            result = collector.ingest(frag);
+        }
+        // Hash mismatch should prevent reassembly.
+        assert!(result.is_none());
     }
 }
