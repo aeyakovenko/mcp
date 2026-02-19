@@ -257,21 +257,7 @@ pub(crate) fn refresh_vote_gate_input(
     mcp_consensus_blocks: &McpConsensusBlockStore,
     mcp_vote_gate_inputs: &RwLock<HashMap<Slot, VoteGateInput>>,
 ) {
-    let delayed_slot = slot.saturating_sub(1);
-    let (root_bank, root_slot, mut local_delayed_bankhash) = {
-        let bank_forks = bank_forks.read().unwrap();
-        (
-            bank_forks.root_bank(),
-            bank_forks.root(),
-            // Until consensus metadata explicitly carries delayed-slot semantics, use the
-            // immediately delayed slot as the local availability gate.
-            bank_forks.get(delayed_slot).map(|bank| bank.hash()),
-        )
-    };
-    if local_delayed_bankhash.is_none() {
-        local_delayed_bankhash = blockstore.get_bank_hash(delayed_slot);
-    }
-
+    // First, retrieve and parse the consensus block to get the delayed_slot from ConsensusMeta.
     let consensus_block = {
         let Ok(consensus_blocks) = mcp_consensus_blocks.read() else {
             warn!(
@@ -300,6 +286,42 @@ pub(crate) fn refresh_vote_gate_input(
         };
         consensus_block
     };
+
+    // Parse consensus_meta to get the delayed_slot. If parsing fails, remove the invalid block.
+    let consensus_meta = match consensus_block.consensus_meta_parsed() {
+        Ok(meta) => meta,
+        Err(err) => {
+            warn!(
+                "failed to parse consensus_meta for slot {}: {}; removing invalid block",
+                slot, err
+            );
+            match mcp_consensus_blocks.write() {
+                Ok(mut consensus_blocks) => {
+                    consensus_blocks.remove(&slot);
+                }
+                Err(err) => {
+                    warn!(
+                        "failed to prune invalid MCP consensus block at slot {}: {}",
+                        slot, err
+                    );
+                }
+            }
+            return;
+        }
+    };
+
+    let delayed_slot = consensus_meta.delayed_slot();
+    let (root_bank, root_slot, mut local_delayed_bankhash) = {
+        let bank_forks = bank_forks.read().unwrap();
+        (
+            bank_forks.root_bank(),
+            bank_forks.root(),
+            bank_forks.get(delayed_slot).map(|bank| bank.hash()),
+        )
+    };
+    if local_delayed_bankhash.is_none() {
+        local_delayed_bankhash = blockstore.get_bank_hash(delayed_slot);
+    }
 
     let delayed_bankhash_available = local_delayed_bankhash.is_some();
     let delayed_bankhash_matches =
@@ -601,11 +623,13 @@ mod tests {
         super::*,
         crate::mcp_vote_gate::{RelayAttestationObservation, RelayProposerEntry},
         agave_feature_set as feature_set,
+        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             blockstore::Blockstore, genesis_utils::create_genesis_config_with_leader,
             get_tmp_ledger_path_auto_delete, mcp_aggregate_attestation::AggregateAttestation,
-            mcp_erasure::encode_fec_set, shred::mcp_shred::McpShred,
+            mcp_consensus_block::ConsensusMeta, mcp_erasure::encode_fec_set,
+            shred::mcp_shred::McpShred,
         },
         solana_runtime::bank_forks::BankForks,
         solana_signer::Signer,
@@ -692,11 +716,14 @@ mod tests {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = root_bank.hash();
-        let mut consensus_block = ConsensusBlock::new_unsigned(
+        let block_id = Hash::new_unique();
+        let delayed_slot = root_bank.slot();
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+        let mut consensus_block = ConsensusBlock::new_unsigned_with_meta(
             slot,
             leader_index,
             aggregate_bytes,
-            vec![],
+            consensus_meta,
             delayed_bankhash,
         )
         .unwrap();

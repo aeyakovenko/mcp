@@ -45,7 +45,7 @@ use {
     solana_entry::entry::VerifyRecyclers,
     solana_geyser_plugin_manager::block_metadata_notifier_interface::BlockMetadataNotifierArc,
     solana_gossip::cluster_info::ClusterInfo,
-    solana_hash::{Hash, HASH_BYTES},
+    solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         block_error::BlockError,
@@ -3970,12 +3970,11 @@ impl ReplayStage {
             }
         }?;
         let consensus_block = ConsensusBlock::from_wire_bytes(&payload).ok()?;
-        if consensus_block.slot != slot || consensus_block.consensus_meta.len() != HASH_BYTES {
+        if consensus_block.slot != slot {
             return None;
         }
-        let mut block_id = [0u8; HASH_BYTES];
-        block_id.copy_from_slice(&consensus_block.consensus_meta[..HASH_BYTES]);
-        Some(Hash::new_from_array(block_id))
+        let consensus_meta = consensus_block.consensus_meta_parsed().ok()?;
+        Some(consensus_meta.block_id())
     }
 
     fn determine_and_set_block_id(
@@ -5422,7 +5421,7 @@ pub(crate) mod tests {
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
             mcp_aggregate_attestation::AggregateAttestation,
-            mcp_consensus_block::ConsensusBlock,
+            mcp_consensus_block::{ConsensusMeta, ConsensusBlock},
             shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
         solana_poh::poh_recorder::create_test_recorder,
@@ -5552,18 +5551,20 @@ pub(crate) mod tests {
 
     #[test]
     fn test_mcp_authoritative_block_id_for_slot_reads_hash_sized_consensus_meta() {
-        let slot = 21;
+        let slot: Slot = 21;
         let leader = Keypair::new();
         let block_id = Hash::new_unique();
+        let delayed_slot = slot.saturating_sub(1);
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, 0, vec![])
             .unwrap()
             .to_wire_bytes()
             .unwrap();
-        let mut consensus_block = ConsensusBlock::new_unsigned(
+        let mut consensus_block = ConsensusBlock::new_unsigned_with_meta(
             slot,
             0,
             aggregate_bytes,
-            block_id.to_bytes().to_vec(),
+            consensus_meta,
             Hash::new_unique(),
         )
         .unwrap();
@@ -5582,18 +5583,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_mcp_authoritative_block_id_for_slot_rejects_non_hash_sized_consensus_meta() {
+    fn test_mcp_authoritative_block_id_for_slot_rejects_invalid_consensus_meta() {
         let slot = 22;
         let leader = Keypair::new();
         let aggregate_bytes = AggregateAttestation::new_canonical(slot, 0, vec![])
             .unwrap()
             .to_wire_bytes()
             .unwrap();
+        // Create invalid consensus_meta with unknown version
         let mut consensus_block = ConsensusBlock::new_unsigned(
             slot,
             0,
             aggregate_bytes,
-            vec![9u8; HASH_BYTES - 1],
+            vec![99u8; 41], // Invalid: unknown version 99
             Hash::new_unique(),
         )
         .unwrap();
@@ -5643,11 +5645,12 @@ pub(crate) mod tests {
             .unwrap()
             .to_wire_bytes()
             .unwrap();
+        // Create invalid consensus_meta with unknown version
         let mut invalid_consensus_block = ConsensusBlock::new_unsigned(
             1,
             0,
             aggregate_bytes.clone(),
-            vec![7u8; HASH_BYTES - 1],
+            vec![99u8; 41], // Invalid: unknown version 99
             Hash::new_unique(),
         )
         .unwrap();
@@ -5665,11 +5668,12 @@ pub(crate) mod tests {
         );
 
         let block_id = Hash::new_unique();
-        let mut consensus_block = ConsensusBlock::new_unsigned(
+        let consensus_meta = ConsensusMeta::new_v1(block_id, 0);
+        let mut consensus_block = ConsensusBlock::new_unsigned_with_meta(
             1,
             0,
             aggregate_bytes,
-            block_id.to_bytes().to_vec(),
+            consensus_meta,
             Hash::new_unique(),
         )
         .unwrap();

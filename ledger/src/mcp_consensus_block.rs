@@ -13,6 +13,108 @@ use {
 };
 
 pub const CONSENSUS_BLOCK_V1: u8 = 1;
+pub const CONSENSUS_META_V1: u8 = 1;
+
+/// Wire size of ConsensusMeta::V1: version (1) + block_id (32) + delayed_slot (8)
+pub const CONSENSUS_META_V1_WIRE_BYTES: usize = 1 + HASH_BYTES + 8;
+
+/// Typed consensus metadata that replaces the opaque `consensus_meta` bytes.
+/// This struct provides explicit versioning and carries fields that were
+/// previously hardcoded (like delayed_slot).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConsensusMeta {
+    V1 {
+        /// The authoritative block_id for this slot, as defined by consensus.
+        block_id: Hash,
+        /// The slot whose bank hash is referenced by `delayed_bankhash`.
+        /// Previously hardcoded as `slot - 1`.
+        delayed_slot: Slot,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+pub enum ConsensusMetaError {
+    #[error("unknown consensus meta version: {0}")]
+    UnknownVersion(u8),
+    #[error("consensus meta is truncated")]
+    Truncated,
+    #[error("consensus meta has trailing bytes")]
+    TrailingBytes,
+}
+
+impl ConsensusMeta {
+    /// Create a new V1 consensus meta with the given block_id and delayed_slot.
+    pub fn new_v1(block_id: Hash, delayed_slot: Slot) -> Self {
+        ConsensusMeta::V1 {
+            block_id,
+            delayed_slot,
+        }
+    }
+
+    /// Serialize to wire bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            ConsensusMeta::V1 {
+                block_id,
+                delayed_slot,
+            } => {
+                let mut out = Vec::with_capacity(CONSENSUS_META_V1_WIRE_BYTES);
+                out.push(CONSENSUS_META_V1);
+                out.extend_from_slice(block_id.as_ref());
+                out.extend_from_slice(&delayed_slot.to_le_bytes());
+                out
+            }
+        }
+    }
+
+    /// Deserialize from wire bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConsensusMetaError> {
+        if bytes.is_empty() {
+            return Err(ConsensusMetaError::Truncated);
+        }
+
+        let version = bytes[0];
+        match version {
+            CONSENSUS_META_V1 => {
+                if bytes.len() < CONSENSUS_META_V1_WIRE_BYTES {
+                    return Err(ConsensusMetaError::Truncated);
+                }
+                if bytes.len() > CONSENSUS_META_V1_WIRE_BYTES {
+                    return Err(ConsensusMetaError::TrailingBytes);
+                }
+
+                let mut block_id_bytes = [0u8; HASH_BYTES];
+                block_id_bytes.copy_from_slice(&bytes[1..1 + HASH_BYTES]);
+                let block_id = Hash::new_from_array(block_id_bytes);
+
+                let mut delayed_slot_bytes = [0u8; 8];
+                delayed_slot_bytes.copy_from_slice(&bytes[1 + HASH_BYTES..]);
+                let delayed_slot = Slot::from_le_bytes(delayed_slot_bytes);
+
+                Ok(ConsensusMeta::V1 {
+                    block_id,
+                    delayed_slot,
+                })
+            }
+            _ => Err(ConsensusMetaError::UnknownVersion(version)),
+        }
+    }
+
+    /// Get the block_id from this consensus meta.
+    pub fn block_id(&self) -> Hash {
+        match self {
+            ConsensusMeta::V1 { block_id, .. } => *block_id,
+        }
+    }
+
+    /// Get the delayed_slot from this consensus meta.
+    pub fn delayed_slot(&self) -> Slot {
+        match self {
+            ConsensusMeta::V1 { delayed_slot, .. } => *delayed_slot,
+        }
+    }
+}
+
 const HEADER_LEN: usize = 1 + 8 + 4 + 4 + 4;
 const TRAILER_LEN: usize = HASH_BYTES + SIGNATURE_BYTES;
 const RELAY_ENTRY_HEADER_LEN: usize = 4 + 1;
@@ -41,9 +143,9 @@ pub struct ConsensusBlock {
     pub slot: Slot,
     pub leader_index: u32,
     pub aggregate_bytes: Vec<u8>,
+    /// Serialized ConsensusMeta bytes. Use `consensus_meta_parsed()` to access
+    /// the typed version which includes block_id and delayed_slot.
     pub consensus_meta: Vec<u8>,
-    // Opaque Alpenglow sidecar bytes. When present in v1, a 32-byte payload is
-    // interpreted by replay as an authoritative block_id.
     pub delayed_bankhash: Hash,
     pub leader_signature: Signature,
 }
@@ -66,6 +168,8 @@ pub enum ConsensusBlockError {
     TrailingBytes,
     #[error("consensus block exceeds protocol maximum: {actual} > {max}")]
     WireBytesTooLarge { actual: usize, max: usize },
+    #[error("invalid consensus_meta: {0}")]
+    InvalidConsensusMeta(#[from] ConsensusMetaError),
 }
 
 impl ConsensusBlock {
@@ -108,6 +212,30 @@ impl ConsensusBlock {
             delayed_bankhash,
             leader_signature: Signature::default(),
         })
+    }
+
+    /// Create a new unsigned ConsensusBlock with typed ConsensusMeta.
+    /// This is the preferred constructor as it ensures consensus_meta is properly formatted.
+    pub fn new_unsigned_with_meta(
+        slot: Slot,
+        leader_index: u32,
+        aggregate_bytes: Vec<u8>,
+        consensus_meta: ConsensusMeta,
+        delayed_bankhash: Hash,
+    ) -> Result<Self, ConsensusBlockError> {
+        Self::new_unsigned(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            consensus_meta.to_bytes(),
+            delayed_bankhash,
+        )
+    }
+
+    /// Parse the consensus_meta bytes into a typed ConsensusMeta.
+    /// Returns an error if the bytes are malformed or use an unknown version.
+    pub fn consensus_meta_parsed(&self) -> Result<ConsensusMeta, ConsensusBlockError> {
+        ConsensusMeta::from_bytes(&self.consensus_meta).map_err(ConsensusBlockError::from)
     }
 
     fn wire_body_bytes(&self) -> Result<Vec<u8>, ConsensusBlockError> {
@@ -330,9 +458,12 @@ pub fn fragment_consensus_block(slot: Slot, consensus_wire_bytes: &[u8]) -> Vec<
     fragments
 }
 
+/// Parsed fragment header: `(slot, frag_idx, total, cb_hash)`.
+pub type FragmentHeader = (Slot, u16, u16, [u8; 32]);
+
 /// Parse the header of a consensus block fragment.  Returns
-/// `(slot, frag_idx, total, cb_hash, data_slice)` on success.
-pub fn parse_fragment_header(bytes: &[u8]) -> Option<(Slot, u16, u16, [u8; 32], &[u8])> {
+/// `(header, data_slice)` on success where header is `(slot, frag_idx, total, cb_hash)`.
+pub fn parse_fragment_header(bytes: &[u8]) -> Option<(FragmentHeader, &[u8])> {
     if bytes.len() <= FRAGMENT_OVERHEAD || bytes.len() > PACKET_DATA_SIZE {
         return None;
     }
@@ -348,7 +479,7 @@ pub fn parse_fragment_header(bytes: &[u8]) -> Option<(Slot, u16, u16, [u8; 32], 
     let mut cb_hash = [0u8; 32];
     cb_hash.copy_from_slice(&bytes[13..45]);
     let data = &bytes[FRAGMENT_OVERHEAD..];
-    Some((slot, frag_idx, total, cb_hash, data))
+    Some(((slot, frag_idx, total, cb_hash), data))
 }
 
 struct FragmentState {
@@ -359,23 +490,16 @@ struct FragmentState {
 }
 
 /// Collects consensus block fragments and reassembles complete blocks.
+#[derive(Default)]
 pub struct ConsensusBlockFragmentCollector {
     pending: HashMap<(Slot, [u8; 32]), FragmentState>,
-}
-
-impl Default for ConsensusBlockFragmentCollector {
-    fn default() -> Self {
-        Self {
-            pending: HashMap::new(),
-        }
-    }
 }
 
 impl ConsensusBlockFragmentCollector {
     /// Ingest a raw fragment datagram.  Returns `(slot, reassembled_consensus_bytes)`
     /// when all fragments for a ConsensusBlock have arrived.
     pub fn ingest(&mut self, fragment_bytes: &[u8]) -> Option<(Slot, Vec<u8>)> {
-        let (slot, frag_idx, total, cb_hash, data) = parse_fragment_header(fragment_bytes)?;
+        let ((slot, frag_idx, total, cb_hash), data) = parse_fragment_header(fragment_bytes)?;
         let key = (slot, cb_hash);
         let frag_idx = frag_idx as usize;
 
@@ -634,6 +758,99 @@ mod tests {
         assert_eq!(decoded.leader_index, leader_index);
     }
 
+    #[test]
+    fn test_consensus_meta_v1_roundtrip() {
+        let block_id = Hash::new_unique();
+        let delayed_slot = 12345u64;
+        let meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+
+        let bytes = meta.to_bytes();
+        assert_eq!(bytes.len(), CONSENSUS_META_V1_WIRE_BYTES);
+        assert_eq!(bytes[0], CONSENSUS_META_V1);
+
+        let parsed = ConsensusMeta::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, meta);
+        assert_eq!(parsed.block_id(), block_id);
+        assert_eq!(parsed.delayed_slot(), delayed_slot);
+    }
+
+    #[test]
+    fn test_consensus_meta_unknown_version_rejected() {
+        let mut bytes = vec![0u8; CONSENSUS_META_V1_WIRE_BYTES];
+        bytes[0] = 99; // Unknown version
+        assert_eq!(
+            ConsensusMeta::from_bytes(&bytes).unwrap_err(),
+            ConsensusMetaError::UnknownVersion(99)
+        );
+    }
+
+    #[test]
+    fn test_consensus_meta_truncated_rejected() {
+        let bytes = vec![CONSENSUS_META_V1; 10]; // Too short
+        assert_eq!(
+            ConsensusMeta::from_bytes(&bytes).unwrap_err(),
+            ConsensusMetaError::Truncated
+        );
+    }
+
+    #[test]
+    fn test_consensus_meta_trailing_bytes_rejected() {
+        let mut bytes = ConsensusMeta::new_v1(Hash::new_unique(), 100).to_bytes();
+        bytes.push(0); // Extra byte
+        assert_eq!(
+            ConsensusMeta::from_bytes(&bytes).unwrap_err(),
+            ConsensusMetaError::TrailingBytes
+        );
+    }
+
+    #[test]
+    fn test_consensus_block_with_typed_meta_roundtrip() {
+        let leader = Keypair::new();
+        let block_id = Hash::new_unique();
+        let delayed_slot = 99u64;
+        let delayed_bankhash = Hash::new_unique();
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+
+        let mut block = ConsensusBlock::new_unsigned_with_meta(
+            100,
+            7,
+            vec![1, 2, 3],
+            consensus_meta.clone(),
+            delayed_bankhash,
+        )
+        .unwrap();
+        block.sign_leader(&leader).unwrap();
+
+        let bytes = block.to_wire_bytes().unwrap();
+        let decoded = ConsensusBlock::from_wire_bytes(&bytes).unwrap();
+
+        assert!(decoded.verify_leader_signature(&leader.pubkey()));
+
+        let parsed_meta = decoded.consensus_meta_parsed().unwrap();
+        assert_eq!(parsed_meta, consensus_meta);
+        assert_eq!(parsed_meta.block_id(), block_id);
+        assert_eq!(parsed_meta.delayed_slot(), delayed_slot);
+    }
+
+    #[test]
+    fn test_consensus_block_invalid_meta_returns_error() {
+        let leader = Keypair::new();
+        let mut block = ConsensusBlock::new_unsigned(
+            100,
+            7,
+            vec![],
+            vec![99, 1, 2, 3], // Invalid: unknown version 99
+            Hash::new_unique(),
+        )
+        .unwrap();
+        block.sign_leader(&leader).unwrap();
+
+        assert!(matches!(
+            block.consensus_meta_parsed().unwrap_err(),
+            ConsensusBlockError::InvalidConsensusMeta(_)
+        ));
+    }
+    
     // ── Fragment tests ───────────────────────────────────────────────────
 
     #[test]
@@ -755,6 +972,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_fragment_constants() {
         assert_eq!(FRAGMENT_OVERHEAD, 45);
         assert_eq!(MAX_FRAGMENT_DATA, PACKET_DATA_SIZE - 45);
