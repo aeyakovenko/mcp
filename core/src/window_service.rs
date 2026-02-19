@@ -35,7 +35,10 @@ use {
         mcp_aggregate_attestation::{
             AggregateAttestation, AggregateProposerEntry, AggregateRelayEntry,
         },
-        mcp_consensus_block::ConsensusBlock,
+        mcp_consensus_block::{
+            ConsensusBlock, ConsensusBlockFragmentCollector,
+            MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT, fragment_consensus_block,
+        },
         shred::{self, ReedSolomonCache, Shred},
     },
     solana_measure::measure::Measure,
@@ -373,17 +376,17 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     );
 
     if let Some(sender) = turbine_quic_endpoint_sender {
-        let mut frame = Vec::with_capacity(1 + consensus_bytes.len());
-        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
-        frame.extend_from_slice(&consensus_bytes);
-        let frame = Bytes::from(frame);
+        let fragments = fragment_consensus_block(slot, &consensus_bytes);
         for peer_addr in cluster_info
             .tvu_peers(|node| node.tvu(Protocol::QUIC))
             .into_iter()
             .flatten()
         {
-            if !try_send_mcp_control_frame(sender, peer_addr, frame.clone()) {
-                inc_new_counter_error!("mcp-consensus-block-send-dropped", 1, 1);
+            for fragment in &fragments {
+                if !try_send_mcp_control_frame(sender, peer_addr, Bytes::from(fragment.clone())) {
+                    inc_new_counter_error!("mcp-consensus-block-fragment-send-dropped", 1, 1);
+                    break;
+                }
             }
         }
     }
@@ -896,6 +899,94 @@ where
     Ok(())
 }
 
+/// Validate a consensus block payload and store it in the consensus block cache.
+/// Returns the slot on success, or None if validation fails.
+fn validate_and_store_consensus_block(
+    payload: &[u8],
+    sender_pubkey: Pubkey,
+    remote_address: SocketAddr,
+    bank_forks: &RwLock<BankForks>,
+    leader_schedule_cache: &LeaderScheduleCache,
+    mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
+) -> Option<Slot> {
+    let Ok(consensus_block) = ConsensusBlock::from_wire_bytes(payload) else {
+        return None;
+    };
+
+    let root_bank = bank_forks.read().unwrap().root_bank();
+    if !cluster_nodes::check_feature_activation(
+        &feature_set::mcp_protocol_v1::id(),
+        consensus_block.slot,
+        &root_bank,
+    ) {
+        return None;
+    }
+
+    let leader_pubkey = leader_schedule_cache
+        .slot_leader_at(consensus_block.slot, Some(&root_bank))
+        .or_else(|| leader_schedule_cache.slot_leader_at(consensus_block.slot, None));
+    let leader_pubkey = leader_pubkey?;
+    // MCP spec §3.5: leader_index MUST match Leader[s] from the consensus leader schedule.
+    if consensus_leader_index_for_slot(consensus_block.slot, &root_bank)
+        .is_some_and(|expected_index| expected_index != consensus_block.leader_index)
+    {
+        debug!(
+            "dropping MCP ConsensusBlock for slot {} from {} due to leader_index mismatch (actual {}, expected schedule)",
+            consensus_block.slot,
+            remote_address,
+            consensus_block.leader_index,
+        );
+        return None;
+    }
+    if sender_pubkey != leader_pubkey {
+        debug!(
+            "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
+            consensus_block.slot, remote_address, sender_pubkey, leader_pubkey
+        );
+        return None;
+    }
+    if !consensus_block.verify_leader_signature(&leader_pubkey) {
+        return None;
+    }
+    if consensus_block.consensus_meta.len() != HASH_BYTES {
+        debug!(
+            "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta length {}",
+            consensus_block.slot,
+            remote_address,
+            consensus_block.consensus_meta.len(),
+        );
+        return None;
+    }
+
+    if let Some(consensus_blocks) = mcp_consensus_blocks {
+        let root_slot = root_bank.slot();
+        match consensus_blocks.write() {
+            Ok(mut consensus_blocks) => {
+                let min_slot =
+                    root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
+                consensus_blocks.retain(|slot, _| *slot >= min_slot);
+                if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
+                    if existing != payload {
+                        warn!(
+                            "MCP consensus block conflict at slot {} (keeping first valid block)",
+                            consensus_block.slot
+                        );
+                    }
+                } else {
+                    consensus_blocks.insert(consensus_block.slot, payload.to_vec());
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "failed to ingest MCP consensus block for slot {} due to poisoned lock: {}",
+                    consensus_block.slot, err
+                );
+            }
+        }
+    }
+    Some(consensus_block.slot)
+}
+
 fn ingest_mcp_control_message(
     sender_pubkey: Pubkey,
     remote_address: SocketAddr,
@@ -904,6 +995,7 @@ fn ingest_mcp_control_message(
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
     mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
+    fragment_collector: &mut ConsensusBlockFragmentCollector,
 ) -> Option<Slot> {
     let message_type = frame.first().copied()?;
 
@@ -972,80 +1064,29 @@ fn ingest_mcp_control_message(
         }
         MCP_CONTROL_MSG_CONSENSUS_BLOCK => {
             let payload = &frame[1..];
-            let Ok(consensus_block) = ConsensusBlock::from_wire_bytes(payload) else {
-                return None;
-            };
-
-            let root_bank = bank_forks.read().unwrap().root_bank();
-            if !cluster_nodes::check_feature_activation(
-                &feature_set::mcp_protocol_v1::id(),
-                consensus_block.slot,
-                &root_bank,
-            ) {
-                return None;
-            }
-
-            let leader_pubkey = leader_schedule_cache
-                .slot_leader_at(consensus_block.slot, Some(&root_bank))
-                .or_else(|| leader_schedule_cache.slot_leader_at(consensus_block.slot, None));
-            let leader_pubkey = leader_pubkey?;
-            // MCP spec §3.5: leader_index MUST match Leader[s] from the consensus leader schedule.
-            if consensus_leader_index_for_slot(consensus_block.slot, &root_bank)
-                .is_some_and(|expected_index| expected_index != consensus_block.leader_index)
-            {
-                debug!(
-                    "dropping MCP ConsensusBlock for slot {} from {} due to leader_index mismatch (actual {}, expected schedule)",
-                    consensus_block.slot,
+            validate_and_store_consensus_block(
+                payload,
+                sender_pubkey,
+                remote_address,
+                bank_forks,
+                leader_schedule_cache,
+                mcp_consensus_blocks,
+            );
+            None
+        }
+        MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT => {
+            fragment_collector.evict_stale(Duration::from_secs(30));
+            if let Some((slot, reassembled)) = fragment_collector.ingest(frame) {
+                validate_and_store_consensus_block(
+                    &reassembled,
+                    sender_pubkey,
                     remote_address,
-                    consensus_block.leader_index,
+                    bank_forks,
+                    leader_schedule_cache,
+                    mcp_consensus_blocks,
                 );
-                return None;
-            }
-            if sender_pubkey != leader_pubkey {
-                debug!(
-                    "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
-                    consensus_block.slot, remote_address, sender_pubkey, leader_pubkey
-                );
-                return None;
-            }
-            if !consensus_block.verify_leader_signature(&leader_pubkey) {
-                return None;
-            }
-            if consensus_block.consensus_meta.len() != HASH_BYTES {
-                debug!(
-                    "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta length {}",
-                    consensus_block.slot,
-                    remote_address,
-                    consensus_block.consensus_meta.len(),
-                );
-                return None;
-            }
-
-            if let Some(consensus_blocks) = mcp_consensus_blocks {
-                let root_slot = root_bank.slot();
-                match consensus_blocks.write() {
-                    Ok(mut consensus_blocks) => {
-                        let min_slot =
-                            root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
-                        consensus_blocks.retain(|slot, _| *slot >= min_slot);
-                        if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
-                            if existing != payload {
-                                warn!(
-                                    "MCP consensus block conflict at slot {} (keeping first valid block)",
-                                    consensus_block.slot
-                                );
-                            }
-                        } else {
-                            consensus_blocks.insert(consensus_block.slot, payload.to_vec());
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            "failed to ingest MCP consensus block for slot {} due to poisoned lock: {}",
-                            consensus_block.slot, err
-                        );
-                    }
-                }
+                // Return slot so consensus finalization can be attempted.
+                return Some(slot);
             }
             None
         }
@@ -1265,6 +1306,7 @@ impl WindowService {
                 let mut suppressed_mcp_attestation_proposers: HashMap<Slot, HashSet<u32>> =
                     HashMap::new();
                 let mut pending_mcp_consensus_slots: HashSet<Slot> = HashSet::new();
+                let mut fragment_collector = ConsensusBlockFragmentCollector::default();
                 const MCP_PENDING_CONSENSUS_RETENTION_SLOTS: Slot = 1024;
                 let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
@@ -1306,6 +1348,7 @@ impl WindowService {
                                 &bank_forks,
                                 &leader_schedule_cache,
                                 mcp_consensus_blocks.as_ref(),
+                                &mut fragment_collector,
                             ) {
                                 candidate_slots.insert(slot);
                             }
@@ -1497,6 +1540,7 @@ mod test {
             &bank_forks,
             &leader_schedule_cache,
             Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
         );
 
         assert_eq!(
@@ -1553,6 +1597,7 @@ mod test {
             &bank_forks,
             &leader_schedule_cache,
             Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
         );
 
         assert!(consensus_blocks.read().unwrap().is_empty());
@@ -1605,6 +1650,7 @@ mod test {
             &bank_forks,
             &leader_schedule_cache,
             Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
         );
 
         assert!(consensus_blocks.read().unwrap().is_empty());
@@ -1675,6 +1721,7 @@ mod test {
                 &bank_forks,
                 &leader_schedule_cache,
                 None,
+                &mut ConsensusBlockFragmentCollector::default(),
             ),
             Some(slot),
         );
@@ -2154,7 +2201,7 @@ mod test {
         cluster_info.insert_info(peer_contact_info);
 
         let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
-        let (sender, mut receiver) = mpsc::channel(8);
+        let (sender, mut receiver) = mpsc::channel(512);
         maybe_finalize_and_broadcast_mcp_consensus_block(
             slot,
             &leader.pubkey(),
@@ -2166,13 +2213,24 @@ mod test {
             Some(&sender),
         );
 
-        let (remote_addr, frame) = receiver.try_recv().unwrap();
+        // Broadcast now sends fragments (type 0x03).
+        let (remote_addr, first_frame) = receiver.try_recv().unwrap();
         assert_eq!(remote_addr, expected_peer_tvu_quic);
         assert_eq!(
-            frame.first().copied(),
-            Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK)
+            first_frame.first().copied(),
+            Some(MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT)
         );
-        let broadcast_block = ConsensusBlock::from_wire_bytes(&frame[1..]).unwrap();
+
+        // Collect all fragments and reassemble.
+        let mut collector = ConsensusBlockFragmentCollector::default();
+        let mut result = collector.ingest(&first_frame);
+        while let Ok((_addr, frag)) = receiver.try_recv() {
+            if result.is_none() {
+                result = collector.ingest(&frag);
+            }
+        }
+        let (_slot, reassembled) = result.expect("fragments should reassemble");
+        let broadcast_block = ConsensusBlock::from_wire_bytes(&reassembled).unwrap();
         assert_eq!(broadcast_block.slot, slot);
     }
 
