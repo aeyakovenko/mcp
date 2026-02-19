@@ -1815,10 +1815,10 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
     replay_entries: Vec<ReplayEntry>,
     default_num_txs: usize,
 ) -> result::Result<(Vec<ReplayEntry>, usize), BlockstoreProcessorError> {
-    if !bank
+    if bank
         .feature_set
         .activated_slot(&feature_set::mcp_protocol_v1::id())
-        .is_some_and(|activated_slot| slot >= activated_slot)
+        .is_none_or(|activated_slot| slot < activated_slot)
     {
         return Ok((replay_entries, default_num_txs));
     }
@@ -1833,7 +1833,7 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
         TransactionVerificationMode::FullVerification
     };
 
-    let transaction_wires = decode_mcp_execution_output_wire_transactions(slot, &encoded_output)?;
+    let transaction_wires = decode_mcp_execution_output_wire_transactions(slot, encoded_output)?;
     let transactions = transaction_wires
         .iter()
         .enumerate()

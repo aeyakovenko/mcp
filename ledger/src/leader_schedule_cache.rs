@@ -261,12 +261,9 @@ impl LeaderScheduleCache {
     ) -> Option<Vec<Pubkey>> {
         let (epoch, slot_index) = self.epoch_schedule.get_epoch_and_slot_index(slot);
         let schedule = if let Some(bank) = bank {
-            let Some(activated_slot) = bank
+            let activated_slot = bank
                 .feature_set
-                .activated_slot(&feature_set::mcp_protocol_v1::id())
-            else {
-                return None;
-            };
+                .activated_slot(&feature_set::mcp_protocol_v1::id())?;
             if slot < activated_slot {
                 return None;
             }

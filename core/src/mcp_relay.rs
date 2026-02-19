@@ -51,9 +51,8 @@ impl McpRelayProcessor {
     }
 
     pub fn process_shred(&mut self, payload: &[u8], proposer_pubkey: &Pubkey) -> McpRelayOutcome {
-        let message = match McpShred::from_bytes(payload) {
-            Ok(message) => message,
-            Err(_) => return McpRelayOutcome::Dropped(McpDropReason::DecodeError),
+        let Ok(message) = McpShred::from_bytes(payload) else {
+            return McpRelayOutcome::Dropped(McpDropReason::DecodeError);
         };
         if message.proposer_index as usize >= MCP_NUM_PROPOSERS {
             return McpRelayOutcome::Dropped(McpDropReason::ProposerIndexOutOfRange);

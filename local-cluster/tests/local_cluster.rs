@@ -7261,7 +7261,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 1,
                 recent_blockhash,
             );
-            match entry_client.send_transaction_with_config(
+            if let Ok(signature) = entry_client.send_transaction_with_config(
                 &transaction,
                 RpcSendTransactionConfig {
                     skip_preflight: true,
@@ -7269,8 +7269,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                     ..RpcSendTransactionConfig::default()
                 },
             ) {
-                Ok(signature) => sent.push(signature.to_string()),
-                Err(_) => {}
+                sent.push(signature.to_string());
             }
         }
         sent
@@ -7306,12 +7305,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     // progress before MCP vote-gate checks are enforced.
     let mcp_activation_slot = 8;
     let mcp_feature_account =
-        AccountSharedData::from(solana_feature_gate_interface::create_account(
+        solana_feature_gate_interface::create_account(
             &solana_feature_gate_interface::Feature {
                 activated_at: Some(mcp_activation_slot),
             },
             mcp_feature_lamports,
-        ));
+        );
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
     let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
@@ -8015,11 +8014,8 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .take(128)
                 .find_map(|slot| {
                     blockstores.iter().find_map(|(pubkey, blockstore)| {
-                        let Some(encoded_output) =
-                            blockstore.get_mcp_execution_output(slot).unwrap()
-                        else {
-                            return None;
-                        };
+                        let encoded_output =
+                            blockstore.get_mcp_execution_output(slot).unwrap()?;
                         let transactions =
                             decode_execution_output_wire_transactions(&encoded_output)?;
                         if transactions.is_empty() {

@@ -905,9 +905,7 @@ fn ingest_mcp_control_message(
     leader_schedule_cache: &LeaderScheduleCache,
     mcp_consensus_blocks: Option<&McpConsensusBlockStore>,
 ) -> Option<Slot> {
-    let Some(message_type) = frame.first().copied() else {
-        return None;
-    };
+    let message_type = frame.first().copied()?;
 
     match message_type {
         MCP_CONTROL_MSG_RELAY_ATTESTATION => {
@@ -931,9 +929,7 @@ fn ingest_mcp_control_message(
                 .relays_at_slot(attestation.slot, Some(&root_bank))
                 .or_else(|| leader_schedule_cache.relays_at_slot(attestation.slot, None))
                 .and_then(|relays| relays.get(attestation.relay_index as usize).copied());
-            let Some(relay_pubkey) = relay_pubkey else {
-                return None;
-            };
+            let relay_pubkey = relay_pubkey?;
             if sender_pubkey != relay_pubkey {
                 debug!(
                     "dropping MCP relay attestation for slot {} relay {} from {} (claimed {}, expected {})",
@@ -992,9 +988,7 @@ fn ingest_mcp_control_message(
             let leader_pubkey = leader_schedule_cache
                 .slot_leader_at(consensus_block.slot, Some(&root_bank))
                 .or_else(|| leader_schedule_cache.slot_leader_at(consensus_block.slot, None));
-            let Some(leader_pubkey) = leader_pubkey else {
-                return None;
-            };
+            let leader_pubkey = leader_pubkey?;
             // MCP spec §3.5: leader_index MUST match Leader[s] from the consensus leader schedule.
             if consensus_leader_index_for_slot(consensus_block.slot, &root_bank)
                 .is_some_and(|expected_index| expected_index != consensus_block.leader_index)
@@ -1073,6 +1067,7 @@ pub struct WindowServiceChannels {
 }
 
 impl WindowServiceChannels {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         verified_receiver: Receiver<Vec<(shred::Payload, /*is_repaired:*/ bool, BlockLocation)>>,
         retransmit_sender: EvictingSender<Vec<shred::Payload>>,
@@ -1221,6 +1216,7 @@ impl WindowService {
             .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_window_insert_thread(
         exit: Arc<AtomicBool>,
         blockstore: Arc<Blockstore>,

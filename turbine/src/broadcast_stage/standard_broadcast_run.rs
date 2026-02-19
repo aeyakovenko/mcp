@@ -88,6 +88,7 @@ struct McpPayloadTransaction {
     target_proposer: Option<u32>,
 }
 
+#[derive(Default)]
 struct McpSlotDispatchState {
     seen_batches: usize,
     expected_batches: Option<usize>,
@@ -106,15 +107,6 @@ const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
 const MCP_PAYLOAD_COUNT_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 const MCP_PAYLOAD_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 
-impl Default for McpSlotDispatchState {
-    fn default() -> Self {
-        Self {
-            seen_batches: 0,
-            expected_batches: None,
-            proposer_states: HashMap::new(),
-        }
-    }
-}
 
 impl Default for McpProposerDispatchState {
     fn default() -> Self {
@@ -264,7 +256,7 @@ impl StandardBroadcastRun {
             .compute_budget_instruction_details()
             .sanitize_and_convert_to_compute_budget_limits(&bank.feature_set)
             .ok()
-            .map(|limits| u64::from(FeeBudgetLimits::from(limits).prioritization_fee))
+            .map(|limits| FeeBudgetLimits::from(limits).prioritization_fee)
             .unwrap_or_default();
         let signature_fee = runtime_tx
             .signature_details()
@@ -760,7 +752,7 @@ impl StandardBroadcastRun {
 
         broadcast_shreds(
             sock,
-            &shreds,
+            shreds,
             &self.cluster_nodes_cache,
             &self.last_datapoint_submit,
             &mut transmit_stats,
@@ -812,10 +804,10 @@ impl StandardBroadcastRun {
         component: &BlockComponent,
         num_expected_batches: Option<usize>,
     ) {
-        if !bank
+        if bank
             .feature_set
             .activated_slot(&feature_set::mcp_protocol_v1::id())
-            .is_some_and(|activated_slot| bank.slot() >= activated_slot)
+            .is_none_or(|activated_slot| bank.slot() < activated_slot)
         {
             return;
         }
@@ -1368,7 +1360,7 @@ mod test {
         assert!(state
             .proposer_states
             .get(&0)
-            .map_or(true, |state| state.payload_transactions.is_empty()));
+            .is_none_or(|state| state.payload_transactions.is_empty()));
 
         account.set_lamports(mcp::NUM_PROPOSERS as u64);
         bank.store_account(&fee_payer, &account);
@@ -1468,9 +1460,11 @@ mod test {
             0,
             Arc::new(MigrationStatus::post_migration_status()),
         );
-        let mut slot_state = McpSlotDispatchState::default();
-        slot_state.seen_batches = 1;
-        slot_state.expected_batches = Some(1);
+        let mut slot_state = McpSlotDispatchState {
+            seen_batches: 1,
+            expected_batches: Some(1),
+            ..McpSlotDispatchState::default()
+        };
         assert!(slot_state.try_push_transaction(
             0,
             bank.as_ref(),

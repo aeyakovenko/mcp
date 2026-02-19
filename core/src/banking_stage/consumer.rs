@@ -25,7 +25,7 @@ use {
         transaction_batch::TransactionBatch,
     },
     solana_runtime_transaction::{
-        transaction_meta::StaticMeta, transaction_with_meta::TransactionWithMeta,
+        transaction_with_meta::TransactionWithMeta,
     },
     solana_svm::{
         account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
@@ -602,7 +602,7 @@ impl Consumer {
 
     pub fn check_fee_payer_unlocked_admission(
         bank: &Bank,
-        transaction: &(impl TransactionWithMeta + StaticMeta),
+        transaction: &impl TransactionWithMeta,
         fee_tracker: &mut McpFeePayerTracker,
         error_counters: &mut TransactionErrorMetrics,
     ) -> Result<(), TransactionError> {

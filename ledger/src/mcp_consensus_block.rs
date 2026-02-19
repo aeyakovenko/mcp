@@ -428,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_max_wire_fits_quic_control_payload_bound() {
         assert!(MAX_CONSENSUS_BLOCK_WIRE_BYTES <= mcp::MAX_QUIC_CONTROL_PAYLOAD_BYTES);
     }
