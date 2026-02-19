@@ -129,6 +129,7 @@ pub fn witness_for_leaf<const SHRED_DATA_BYTES: usize>(
     Ok((levels.last().unwrap()[0], witness))
 }
 
+#[allow(clippy::type_complexity)]
 pub fn commitment_and_witnesses<const SHRED_DATA_BYTES: usize, const WITNESS_LEN: usize>(
     slot: u64,
     proposer_index: u32,

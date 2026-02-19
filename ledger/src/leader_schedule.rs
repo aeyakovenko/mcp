@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_domain_separated_schedule_seed() {
-        let stakes = vec![
+        let stakes = [
             (Pubkey::new_unique(), 100),
             (Pubkey::new_unique(), 50),
             (Pubkey::new_unique(), 25),

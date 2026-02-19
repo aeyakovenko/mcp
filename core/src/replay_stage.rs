@@ -3002,10 +3002,10 @@ impl ReplayStage {
         blockstore: &Blockstore,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
     ) {
-        if !heaviest_bank
+        if heaviest_bank
             .feature_set
             .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-            .is_some_and(|activated_slot| heaviest_bank.slot() >= activated_slot)
+            .is_none_or(|activated_slot| heaviest_bank.slot() < activated_slot)
         {
             return;
         }

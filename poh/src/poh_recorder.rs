@@ -1579,8 +1579,10 @@ mod tests {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
 
-        let mut poh_config = PohConfig::default();
-        poh_config.hashes_per_tick = Some(4);
+        let poh_config = PohConfig {
+            hashes_per_tick: Some(4),
+            ..PohConfig::default()
+        };
         let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
             bank.tick_height(),
             bank.last_blockhash(),
