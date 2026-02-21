@@ -428,11 +428,49 @@ proposer signature at bytes 0-63, followed by the discriminator at byte 64.
 - Reuse existing QUIC endpoint patterns (no new gossip socket enums unless proven necessary).
 - MCP control messages use `1-byte type + payload` framing:
   - `0x01` RelayAttestation
-  - `0x02` ConsensusBlock
+  - `0x02` ConsensusBlock (unfragmented; only valid for blocks ≤ MTU, essentially unused on production)
+  - `0x03` ConsensusBlockFragment (MTU-safe; used for all ConsensusBlocks on real networks)
 - Leader resolution reuses existing leader-schedule lookup and TVU QUIC contact info.
 - Dispatch retries are bounded and instrumented; dropped sends must increment explicit counters.
 - TVU MCP control ingress channel is bounded; fetch-stage enqueue is non-blocking with explicit full/disconnected drop counters.
 - Reject unknown type and oversize frame.
+
+#### 4.3.1 ConsensusBlock fragmentation
+
+ConsensusBlocks (20KB–400KB) exceed the QUIC datagram MTU (~1232 bytes). They are
+serialized, then split into MTU-sized fragments for transmission. Validators reassemble
+and verify before processing.
+
+- Fragment wire format (max 1232 bytes):
+  - `type_tag: u8` = `0x03` (1 byte)
+  - `slot: u64` (8 bytes)
+  - `frag_idx: u16` (2 bytes, 0-based)
+  - `total: u16` (2 bytes, total fragment count)
+  - `cb_hash: [u8; 32]` (SHA-256 of full ConsensusBlock wire bytes)
+  - `data: [u8; N]` (up to `MAX_FRAGMENT_DATA` = 1187 bytes)
+  - `FRAGMENT_OVERHEAD` = 45 bytes
+
+- Send path (`window_service.rs::maybe_finalize_and_broadcast_mcp_consensus_block`):
+  - `fragment_consensus_block(slot, &consensus_bytes)` splits into fragments
+  - each fragment sent to all TVU QUIC peers via `try_send_mcp_control_frame`
+  - if channel is full for a peer, remaining fragments for that peer are dropped with counter
+
+- Receive path (`window_service.rs::ingest_mcp_control_message`):
+  - `ConsensusBlockFragmentCollector` (thread-local in window service insert thread)
+  - `collector.ingest(frame)` buffers fragments keyed by `(slot, cb_hash)`
+  - when all `total` fragments arrive, concatenate in `frag_idx` order
+  - verify `SHA-256(reassembled) == cb_hash`, reject on mismatch
+  - pass reassembled bytes to `validate_and_store_consensus_block()` (shared with 0x02 path)
+
+- Classification (`shred_fetch_stage.rs::is_valid_mcp_control_frame`):
+  - `0x03` recognized with lightweight check: `len > FRAGMENT_OVERHEAD && len <= PACKET_DATA_SIZE`
+
+- DoS hardening:
+  - `MAX_FRAGMENT_COUNT` = `MAX_CONSENSUS_BLOCK_WIRE_BYTES / MAX_FRAGMENT_DATA` (ceil) — rejects inflated `total`
+  - `MAX_PENDING_PER_SLOT` = 2 — at most 2 distinct `cb_hash` per slot (1 legitimate + 1 equivocation margin)
+  - `MAX_PENDING_REASSEMBLIES` = 64 — global cap, oldest evicted when exceeded
+  - mismatched `total` for same `(slot, cb_hash)` key silently dropped
+  - stale eviction: `evict_stale(Duration::from_secs(30))` called before each ingest
 
 ### 4.4 Relay shred broadcast
 
@@ -458,6 +496,15 @@ proposer signature at bytes 0-63, followed by the discriminator at byte 64.
 - Duplicate relay-index behavior (one attestation per relay index).
 - Equivocation suppression.
 - QUIC payload >1232B accepted by MCP transport path.
+- Fragment round-trip: `fragment_consensus_block()` → `ConsensusBlockFragmentCollector::ingest()` → verify reassembled matches original.
+- Out-of-order fragment delivery reassembles correctly.
+- Duplicate fragment ingestion is idempotent.
+- Stale eviction removes old incomplete reassemblies.
+- Max-size ConsensusBlock fragments and reassembles correctly.
+- Hash mismatch (corrupted fragment) rejects reassembly.
+- `total` exceeding `MAX_FRAGMENT_COUNT` rejected at parse time.
+- Per-slot cap (`MAX_PENDING_PER_SLOT`) blocks third distinct `cb_hash` for same slot.
+- Mismatched `total` for same `(slot, cb_hash)` key rejected.
 
 ---
 
@@ -524,11 +571,12 @@ proposer signature at bytes 0-63, followed by the discriminator at byte 64.
 ### 6.1 Control-path ingestion in window service
 
 - `core/src/shred_fetch_stage.rs`:
-  - classify MCP control frames (`0x01` relay attestation, `0x02` consensus block) and forward to TVU control channel.
+  - classify MCP control frames (`0x01` relay attestation, `0x02` consensus block, `0x03` consensus block fragment) and forward to TVU control channel.
 - `core/src/window_service.rs`:
   - ingest and validate control frames with slot-effective feature gating.
   - store validated relay attestations in MCP CF exactly as signed (no ingestion-time entry filtering or entry-list reserialization after relay-signature verification).
   - store validated consensus blocks in shared in-memory slot map for replay consumption.
+  - reassemble consensus block fragments via thread-local `ConsensusBlockFragmentCollector`; on complete reassembly, validate and store via same path as unfragmented `0x02` blocks (see §4.3.1).
 
 Validation rules:
 - invalid relay signature => drop relay message
@@ -555,7 +603,7 @@ Implementation point:
 
 ### 6.3 Distribution
 
-- Leader broadcasts `ConsensusBlock` (`0x02` control frame) to TVU QUIC peers using existing turbine QUIC endpoint sender.
+- Leader broadcasts `ConsensusBlock` as `0x03` fragments (see §4.3.1) to TVU QUIC peers using existing turbine QUIC endpoint sender. Each fragment fits within QUIC datagram MTU.
 
 ### 6.4 Replay consumption
 
@@ -569,6 +617,8 @@ Implementation point:
 - relay/proposer filtering semantics
 - canonical aggregate ordering
 - direct QUIC block distribution + frame typing
+- fragmented consensus block broadcast produces `0x03` type-tagged fragments
+- fragmented consensus block ingestion reassembles and stores via same validation path as `0x02`
 
 ---
 
