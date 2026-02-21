@@ -457,7 +457,7 @@ below (ConsensusMeta).
 
 NOTE: ConsensusBlocks typically exceed the QUIC datagram MTU limit (~1200 bytes).
 They are serialized using the format below, then fragmented into
-ConsensusBlockFragment messages (Section 7.5.1) for transmission over QUIC.
+ConsensusBlockFragment messages (Section 7.5.2) for transmission over QUIC.
 
 ConsensusBlock Serialization Format (variable length)
 ```text
@@ -554,6 +554,7 @@ Receivers MUST:
 - Deduplicate fragments by (slot, cb_hash, frag_idx)
 - Evict stale incomplete fragment sets after a timeout
 - Verify cb_hash matches the reassembled ConsensusBlock
+
 7.6. Vote
 
 A Vote message is serialized as slot (u64), validator_index (u32), block_hash
