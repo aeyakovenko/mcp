@@ -23,7 +23,7 @@ use {
     rayon::{prelude::*, ThreadPool},
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT},
     solana_gossip::{cluster_info::ClusterInfo, contact_info::Protocol},
-    solana_hash::{Hash, HASH_BYTES},
+    solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{
@@ -36,7 +36,7 @@ use {
             AggregateAttestation, AggregateProposerEntry, AggregateRelayEntry,
         },
         mcp_consensus_block::{
-            ConsensusBlock, ConsensusBlockFragmentCollector,
+            ConsensusMeta, ConsensusBlock, ConsensusBlockFragmentCollector,
             MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT, fragment_consensus_block,
         },
         shred::{self, ReedSolomonCache, Shred},
@@ -178,24 +178,22 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
     };
 
     // Carry an authoritative block_id sidecar. Retry finalization until it is available.
-    let consensus_meta = working_bank
-        .block_id()
-        .or_else(|| {
-            blockstore
-                .check_last_fec_set_and_get_block_id(
-                    slot,
-                    working_bank.hash(),
-                    true,
-                    &working_bank.feature_set,
-                )
-                .ok()
-                .flatten()
-        })
-        .map(|block_id| block_id.to_bytes().to_vec());
-    let Some(consensus_meta) = consensus_meta else {
+    let block_id = working_bank.block_id().or_else(|| {
+        blockstore
+            .check_last_fec_set_and_get_block_id(
+                slot,
+                working_bank.hash(),
+                true,
+                &working_bank.feature_set,
+            )
+            .ok()
+            .flatten()
+    });
+    let Some(block_id) = block_id else {
         log_skip("missing authoritative block_id");
         return true;
     };
+    let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
 
     let proposer_schedule = leader_schedule_cache
         .proposers_at_slot(slot, Some(&working_bank))
@@ -301,7 +299,7 @@ fn maybe_finalize_and_broadcast_mcp_consensus_block(
         );
         return true;
     };
-    let Ok(mut consensus_block) = ConsensusBlock::new_unsigned(
+    let Ok(mut consensus_block) = ConsensusBlock::new_unsigned_with_meta(
         slot,
         leader_index,
         aggregate_bytes,
@@ -948,12 +946,12 @@ fn validate_and_store_consensus_block(
     if !consensus_block.verify_leader_signature(&leader_pubkey) {
         return None;
     }
-    if consensus_block.consensus_meta.len() != HASH_BYTES {
+    if let Err(err) = consensus_block.consensus_meta_parsed() {
         debug!(
-            "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta length {}",
+            "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta: {}",
             consensus_block.slot,
             remote_address,
-            consensus_block.consensus_meta.len(),
+            err,
         );
         return None;
     }
@@ -1448,7 +1446,7 @@ mod test {
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path_auto_delete,
             mcp_aggregate_attestation::AggregateAttestation,
-            mcp_consensus_block::ConsensusBlock,
+            mcp_consensus_block::{ConsensusMeta, ConsensusBlock},
             shred::{ProcessShredsStats, Shredder},
         },
         solana_runtime::bank::Bank,
@@ -1515,13 +1513,15 @@ mod test {
             .unwrap()
             .to_wire_bytes()
             .unwrap();
+        let delayed_slot = slot.saturating_sub(1);
         let delayed_bankhash = Hash::new_unique();
         let block_id = Hash::new_unique();
-        let mut block = ConsensusBlock::new_unsigned(
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+        let mut block = ConsensusBlock::new_unsigned_with_meta(
             slot,
             leader_index,
             aggregate_bytes,
-            block_id.to_bytes().to_vec(),
+            consensus_meta,
             delayed_bankhash,
         )
         .unwrap();
@@ -1572,13 +1572,15 @@ mod test {
             .unwrap()
             .to_wire_bytes()
             .unwrap();
+        let delayed_slot = slot.saturating_sub(1);
         let delayed_bankhash = Hash::new_unique();
         let block_id = Hash::new_unique();
-        let mut block = ConsensusBlock::new_unsigned(
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+        let mut block = ConsensusBlock::new_unsigned_with_meta(
             slot,
             leader_index,
             aggregate_bytes,
-            block_id.to_bytes().to_vec(),
+            consensus_meta,
             delayed_bankhash,
         )
         .unwrap();
@@ -1604,7 +1606,7 @@ mod test {
     }
 
     #[test]
-    fn test_ingest_mcp_consensus_block_rejects_invalid_consensus_meta_length() {
+    fn test_ingest_mcp_consensus_block_rejects_invalid_consensus_meta() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Keypair::new();
@@ -1627,11 +1629,12 @@ mod test {
             .to_wire_bytes()
             .unwrap();
         let delayed_bankhash = Hash::new_unique();
+        // Create invalid consensus_meta with unknown version byte (99)
         let mut block = ConsensusBlock::new_unsigned(
             slot,
             leader_index,
             aggregate_bytes,
-            vec![7u8; HASH_BYTES - 1],
+            vec![99u8; 41], // Invalid: unknown version 99
             delayed_bankhash,
         )
         .unwrap();
