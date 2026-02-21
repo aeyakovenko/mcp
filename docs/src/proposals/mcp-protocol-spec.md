@@ -455,7 +455,11 @@ ConsensusBlock. The consensus_meta field is a versioned payload that MUST be
 interpreted consistently by all validators. Its internal format is defined
 below (ConsensusMeta).
 
-ConsensusBlock Wire Format (variable length)
+NOTE: ConsensusBlocks typically exceed the QUIC datagram MTU limit (~1200 bytes).
+They are serialized using the format below, then fragmented into
+ConsensusBlockFragment messages (Section 7.5.1) for transmission over QUIC.
+
+ConsensusBlock Serialization Format (variable length)
 ```text
 +-------------------+------------------------------+
 | Field             | Size (bytes)                 |
@@ -494,6 +498,62 @@ ConsensusMeta v1 Wire Format (41 bytes)
 +-------------------+------------------------------+
 ```
 
+7.5.2. ConsensusBlock Fragmentation
+
+To enable reliable transport over QUIC datagrams, ConsensusBlocks are fragmented
+into MTU-sized pieces before transmission and reassembled by receivers.
+
+MCP control messages use byte 0 as a type tag to distinguish message types:
+- 0x01: RelayAttestation
+- 0x02: ConsensusBlock (unfragmented, only for small blocks)
+- 0x03: ConsensusBlockFragment (for blocks exceeding MTU)
+
+Each fragment carries a 45-byte header followed by a data payload:
+
+ConsensusBlockFragment Wire Format (fixed length = PACKET_DATA_SIZE)
+```text
++-------------------+------------------------------+--------+
+| Field             | Size (bytes)                 | Offset |
++-------------------+------------------------------+--------+
+| type_tag          | 1 (value 0x03)               | 0      |
+| slot              | 8                            | 1      |
+| frag_idx          | 2                            | 9      |
+| total             | 2                            | 11     |
+| cb_hash           | 32                           | 13     |
+| data              | up to 1187                   | 45     |
++-------------------+------------------------------+--------+
+FRAGMENT_OVERHEAD = 45 bytes
+MAX_FRAGMENT_DATA = PACKET_DATA_SIZE - FRAGMENT_OVERHEAD = 1187 bytes
+```
+
+Fragment fields:
+- type_tag: Message type identifier (0x03 for ConsensusBlockFragment)
+- slot: The slot this ConsensusBlock belongs to
+- frag_idx: Zero-based index of this fragment (0 to total-1)
+- total: Total number of fragments in the complete ConsensusBlock
+- cb_hash: SHA-256 hash of the complete ConsensusBlock wire bytes
+- data: Fragment payload (chunk of the serialized ConsensusBlock)
+
+Fragmentation algorithm:
+1. Serialize the ConsensusBlock to wire bytes
+2. Compute cb_hash = SHA-256(wire_bytes)
+3. Split wire_bytes into chunks of MAX_FRAGMENT_DATA bytes
+4. For each chunk, prepend the fragment header with incrementing frag_idx
+
+Reassembly algorithm:
+1. Parse fragment header; reject if type_tag != 0x03 or total == 0
+2. Buffer fragments by (slot, cb_hash) key
+3. When all fragments (0 to total-1) are received:
+   a. Concatenate data payloads in frag_idx order
+   b. Verify SHA-256(reassembled) == cb_hash
+   c. Parse reassembled bytes as ConsensusBlock
+4. Reject reassembly if hash verification fails
+
+Receivers MUST:
+- Accept fragments arriving out of order
+- Deduplicate fragments by (slot, cb_hash, frag_idx)
+- Evict stale incomplete fragment sets after a timeout
+- Verify cb_hash matches the reassembled ConsensusBlock
 7.6. Vote
 
 A Vote message is serialized as slot (u64), validator_index (u32), block_hash
