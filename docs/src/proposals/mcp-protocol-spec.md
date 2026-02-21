@@ -174,10 +174,9 @@ attestation. The leader
 builds an AggregateAttestation containing all valid relay entries, sorted by
 relay_index. The leader MUST compute the block commitment used as block_id
 according to the underlying ledger rules, and MUST include that commitment in
-consensus_meta or another consensus-defined field that all validators can
-verify. The leader then constructs a ConsensusBlock with the aggregate,
-consensus_meta, and delayed_bankhash, signs it, and submits it to the consensus
-protocol. If the number of relay entries in the aggregate is less
+consensus_meta (see below). The leader then constructs a ConsensusBlock with
+the aggregate, consensus_meta, and delayed_bankhash, signs it, and submits it
+to the consensus protocol. If the number of relay entries in the aggregate is less
 than ATTESTATION_THRESHOLD * NUM_RELAYS, the leader SHOULD submit an empty
 consensus result instead of a block, and validators MUST treat any block below
 this threshold as invalid.
@@ -186,8 +185,8 @@ this threshold as invalid.
 
 When a validator receives a ConsensusBlock for slot s, it MUST verify the
 leader_signature, check that the leader_index matches Leader[s], and verify
-delayed_bankhash against the local bank hash for the delayed slot defined by the
-consensus protocol. If any check fails, the validator MUST NOT vote for the
+delayed_bankhash against the local bank hash for the delayed slot carried in
+consensus_meta. If any check fails, the validator MUST NOT vote for the
 block. The validator MUST verify each relay_signature and proposer_signature in
 the AggregateAttestation and MUST ignore any relay entry that fails
 verification. The validator computes the implied blocks by examining the
@@ -423,12 +422,9 @@ serialized as version (u8), slot (u64), leader_index (u32), aggregate_len
 AggregateAttestation v1), consensus_meta_len (u32), consensus_meta
 (consensus_meta_len bytes), delayed_bankhash (32 bytes), and leader_signature
 (64 bytes). The leader_signature is computed over all preceding bytes in the
-ConsensusBlock. The consensus_meta field is an opaque payload defined by the
-consensus protocol and MUST be interpreted consistently by all validators. The
-block_id is defined as the block commitment produced by the underlying ledger
-rules and carried in consensus_meta or another consensus-defined field. It is
-the value used in consensus votes and is not computed by hashing
-aggregate_bytes.
+ConsensusBlock. The consensus_meta field is a versioned payload that MUST be
+interpreted consistently by all validators. Its internal format is defined
+below (ConsensusMeta).
 
 ConsensusBlock Wire Format (variable length)
 ```text
@@ -444,6 +440,28 @@ ConsensusBlock Wire Format (variable length)
 | consensus_meta    | consensus_meta_len           |
 | delayed_bankhash  | 32                           |
 | leader_sig        | 64                           |
++-------------------+------------------------------+
+```
+
+7.5.1. ConsensusMeta
+
+The consensus_meta field inside a ConsensusBlock is a versioned structure.
+Validators MUST reject a ConsensusBlock whose consensus_meta cannot be parsed
+or uses an unknown version.
+
+ConsensusMeta v1 carries the block_id (the block commitment produced by the
+underlying ledger rules, used in consensus votes, and not computed by hashing
+aggregate_bytes) and the delayed_slot (the slot whose bank hash is referenced
+by the ConsensusBlock delayed_bankhash field).
+
+ConsensusMeta v1 Wire Format (41 bytes)
+```text
++-------------------+------------------------------+
+| Field             | Size (bytes)                 |
++-------------------+------------------------------+
+| version           | 1  (= 0x01)                 |
+| block_id          | 32                           |
+| delayed_slot      | 8                            |
 +-------------------+------------------------------+
 ```
 

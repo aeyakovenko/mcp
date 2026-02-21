@@ -25,8 +25,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Delayed-slot bankhash source order is: `BankForks` delayed slot, then blockstore frozen bank hash.
 - Alpenglow `block_id` authority wiring: `RESOLVED` (consensus-observed slots)
   - `window_service` retries MCP consensus-block finalization until an authoritative `block_id` sidecar is locally available.
-  - consensus-block ingestion rejects non-hash-sized `consensus_meta`.
-  - replay extracts a 32-byte `consensus_meta` payload as authoritative `block_id` and defers bank completion if a cached consensus block lacks a usable sidecar.
+  - consensus-block ingestion rejects consensus blocks with unparseable `consensus_meta` (unknown version, truncated, trailing bytes).
+  - replay parses `ConsensusMeta` from `consensus_meta` bytes, extracts `block_id` and `delayed_slot`, and defers bank completion if a cached consensus block lacks a usable sidecar.
 - Proposer admission + payload policy wiring: `RESOLVED`
   - MCP-specific BankingStage admission helper wiring is active in scheduler receive-buffer and pre-graph validation paths.
   - payload construction state is isolated per owned proposer index; signature dedup and fee reservation are enforced per proposer payload.
@@ -55,7 +55,7 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - `A4` Coverage gap closure before final sign-off: `RESOLVED`
   - direct ConsensusBlock content verification is now in 5-node local-cluster integration:
     - validates leader signature
-    - validates `consensus_meta.len() == 32`
+    - validates `consensus_meta` parses as ConsensusMeta v1 (41 bytes: version + block_id + delayed_slot)
     - validates delayed bankhash matches delayed-slot bankhash
     - validates non-empty decodable execution output contains at least one submitted transaction signature
     - validates execution-output bytes are identical across validators for a shared slot
@@ -98,12 +98,13 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 - `B3` `block_id` authority:
   - `block_id` is defined by Alpenglow consensus.
   - MCP MUST treat the Alpenglow-provided `block_id` as authoritative and MUST NOT derive a local substitute hash.
-  - `consensus_meta` carries the consensus-defined data needed to recover/verify that `block_id`.
+  - `consensus_meta` is a versioned structure (ConsensusMeta) that carries `block_id` and `delayed_slot`.
+  - v1 format: version (u8 = 0x01) + block_id (32 bytes) + delayed_slot (u64) = 41 bytes.
 - `B4` delayed bankhash availability:
   - There must always be a delayed-slot bankhash before MCP progression.
   - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
   - No fallback hash value is permitted.
-  - v1 delayed-slot definition is fixed to `slot - 1` (saturating) until consensus metadata carries an explicit delayed-slot field.
+  - `delayed_slot` is carried explicitly in ConsensusMeta v1; replay reads it from the parsed consensus_meta rather than hardcoding `slot - 1`.
 
 ---
 
@@ -635,10 +636,10 @@ Reconstruction-to-execution bridge:
 
 - Policy target (B3): `block_id` is defined by Alpenglow consensus and MCP treats it as authoritative.
 - Implemented wiring:
-  - `ConsensusBlock.consensus_meta` is opaque sidecar bytes; replay interprets a 32-byte payload as authoritative `block_id`.
-  - `window_service` populates `consensus_meta` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)`, and retries finalization until available.
-  - ingestion drops consensus blocks with non-hash-sized `consensus_meta`.
-  - replay reads consensus-sidecar `block_id`, sets `bank.block_id`, and defers bank completion only when a consensus block is present but lacks a usable authoritative sidecar.
+  - `ConsensusBlock.consensus_meta` is a versioned `ConsensusMeta` structure; v1 carries `block_id` (32 bytes) and `delayed_slot` (u64).
+  - `window_service` builds `ConsensusMeta::new_v1(block_id, delayed_slot)` from `working_bank.block_id()` or blockstore `check_last_fec_set_and_get_block_id(...)`, and retries finalization until available.
+  - ingestion drops consensus blocks with unparseable `consensus_meta` (unknown version, truncated, trailing bytes).
+  - replay parses `ConsensusMeta` to extract `block_id` and `delayed_slot`, sets `bank.block_id`, and defers bank completion only when a consensus block is present but lacks a usable authoritative sidecar.
 - Current v1 strictness:
   - pre-consensus MCP-active slots may still use existing local `block_id` derivation for liveness.
   - once a consensus block is present for the slot, missing/invalid authoritative sidecar defers completion and blocks voting/finalization for that slot.
