@@ -3982,8 +3982,7 @@ impl ReplayStage {
             // happens during replay rather than banking stage.
             // Only replay the leader's own bank when alpenglow is
             // fully enabled (bankless PoH), not during migration.
-            let is_bankless_slot =
-                migration_status.should_have_alpenglow_ticks(bank.slot());
+            let is_bankless_slot = migration_status.should_have_alpenglow_ticks(bank.slot());
             if bank.collector_id() != my_pubkey || is_bankless_slot {
                 if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
                     bank.as_ref(),
@@ -5726,7 +5725,7 @@ pub(crate) mod tests {
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path, get_tmp_ledger_path_auto_delete,
             mcp_aggregate_attestation::AggregateAttestation,
-            mcp_consensus_block::{ConsensusMeta, ConsensusBlock},
+            mcp_consensus_block::{ConsensusBlock, ConsensusMeta},
             shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
         },
         solana_poh::poh_recorder::create_test_recorder,
@@ -11462,8 +11461,7 @@ pub(crate) mod tests {
             bank0.last_blockhash(),
         );
         let shreds = entries_to_test_shreds(
-            &entries,
-            1,    // slot
+            &entries, 1,    // slot
             0,    // parent_slot
             true, // is_full_slot
             0,    // version
@@ -11498,6 +11496,115 @@ pub(crate) mod tests {
         assert!(
             res.is_ok(),
             "replay_blockstore_into_bank must succeed for leader-owned bank: {res:?}"
+        );
+    }
+    #[test]
+    fn test_replay_active_bank_replays_leader_owned_bankless_slot() {
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+
+        let ReplayBlockstoreComponents {
+            blockstore,
+            validator_node_to_vote_keys,
+            vote_simulator,
+            my_pubkey,
+            leader_schedule_cache,
+            ..
+        } = replay_blockstore_components(Some(tr(0)), 1, None::<GenerateVotes>);
+        let VoteSimulator {
+            mut progress,
+            bank_forks,
+            ..
+        } = vote_simulator;
+
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        let bank1 = Bank::new_from_parent(bank0.clone(), &my_pubkey, 1);
+        assert_eq!(bank1.collector_id(), &my_pubkey);
+        bank_forks.write().unwrap().insert(bank1);
+        let bank1 = bank_forks.read().unwrap().get_with_scheduler(1).unwrap();
+
+        let hashes_per_tick = bank1.hashes_per_tick().unwrap_or(0);
+        let ticks_per_slot = bank1.ticks_per_slot();
+        let entries = solana_entry::entry::create_ticks(
+            ticks_per_slot,
+            hashes_per_tick,
+            bank0.last_blockhash(),
+        );
+        let shreds = entries_to_test_shreds(
+            &entries, 1,    // slot
+            0,    // parent_slot
+            true, // is_full_slot
+            0,    // version
+        );
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+
+        let vote_account = *validator_node_to_vote_keys
+            .get(&my_pubkey)
+            .expect("vote account must exist for test validator");
+
+        let replay_tx_thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|i| format!("solReplayGuardTest{i:02}"))
+            .build()
+            .expect("new rayon threadpool");
+
+        let verify_recyclers = VerifyRecyclers::default();
+        let prioritization_fee_cache = PrioritizationFeeCache::new(0u64);
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+
+        let mut pre_migration_timing = ReplayLoopTiming::default();
+        let pre_migration = ReplayStage::replay_active_bank(
+            &blockstore,
+            &bank_forks,
+            &replay_tx_thread_pool,
+            &my_pubkey,
+            &vote_account,
+            leader_schedule_cache.as_ref(),
+            &mcp_consensus_blocks,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+            &mut progress,
+            None,
+            None,
+            &verify_recyclers,
+            &replay_vote_sender,
+            &mut pre_migration_timing,
+            None,
+            1,
+            &prioritization_fee_cache,
+            &MigrationStatus::default(),
+        );
+        assert!(
+            pre_migration.replay_result.is_none(),
+            "leader-owned bank must be skipped before bankless migration"
+        );
+
+        let mut post_migration_timing = ReplayLoopTiming::default();
+        let post_migration = ReplayStage::replay_active_bank(
+            &blockstore,
+            &bank_forks,
+            &replay_tx_thread_pool,
+            &my_pubkey,
+            &vote_account,
+            leader_schedule_cache.as_ref(),
+            &mcp_consensus_blocks,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+            &mut progress,
+            None,
+            None,
+            &verify_recyclers,
+            &replay_vote_sender,
+            &mut post_migration_timing,
+            None,
+            1,
+            &prioritization_fee_cache,
+            &MigrationStatus::post_migration_status(),
+        );
+        assert!(
+            post_migration.replay_result.is_some(),
+            "leader-owned bankless slot must enter replay_active_bank path"
         );
     }
 }

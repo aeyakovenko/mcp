@@ -29,7 +29,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - consensus-block ingestion rejects consensus blocks with unparseable `consensus_meta` (unknown version, truncated, trailing bytes).
   - replay parses `ConsensusMeta` from `consensus_meta` bytes, extracts `block_id` and `delayed_slot`, and defers bank completion if a cached consensus block lacks a usable sidecar.
 - Proposer admission + payload policy wiring: `RESOLVED`
-  - MCP-specific BankingStage admission helper wiring is active in scheduler receive-buffer and pre-graph validation paths.
+  - MCP-specific BankingStage admission helper wiring is active in scheduler receive-buffer paths.
+  - pre-graph validation intentionally avoids fee re-reservation to prevent double-counting across repeated scheduler passes.
   - payload construction state is isolated per owned proposer index; signature dedup and fee reservation are enforced per proposer payload.
   - proposer output applies `B2` ordering before MCP payload encoding.
 - Reconstruction-to-execution bridge reader: `RESOLVED`
@@ -536,6 +537,7 @@ and verify before processing.
 - Reuse existing BankingStage admission checks (no new proposer worker/thread).
 - Proposer-side admission invariants:
   - fee payer reservation check enforces capacity for `NUM_PROPOSERS * base_fee` before acceptance into proposer payload candidates.
+  - in MCP-active slots, this conservative reservation applies to all txs (MCP latest/legacy and standard-wire); missing MCP fee components are treated as zero.
   - payload-level dedup is by signature within each proposer only.
   - MCP payload encoder accepts latest and legacy MCP tx bytes, and may carry standard Solana-wire tx bytes for compatibility.
 - MCP payload ordering at proposer output:

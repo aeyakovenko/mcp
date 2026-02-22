@@ -664,4 +664,52 @@ Targeted validation on this pass:
 
 ### Remaining open items from the PBK set
 
-- `PBK-3` and `PBK-4` remain as previously documented (not regressed by this change set).
+- superseded by the `PBK-3/PBK-4 Closure` addendum below.
+
+---
+
+## Addendum (2026-02-22): PBK-3/PBK-4 Closure
+
+Scope:
+- Remaining open findings from prior pass: `PBK-3`, `PBK-4`.
+
+### Status Summary
+
+- `PBK-3`: `RESOLVED`
+- `PBK-4`: `RESOLVED`
+- Remaining blockers from PBK set: `none`
+
+### PBK-3 resolution (`RESOLVED`)
+
+Change:
+- `check_fee_payer_unlocked_admission` now routes **all** transactions through MCP conservative admission when MCP is active for the slot (not only transactions carrying explicit MCP fee components).
+- Evidence: `core/src/banking_stage/consumer.rs:740`
+
+Why this closes the finding:
+- Standard-wire transactions in MCP-active slots now use the same conservative reservation path (`MCP_NUM_PROPOSERS` scaling), with missing MCP fee components treated as zero via existing `unwrap_or_default` in `check_fee_payer_unlocked_mcp`.
+
+Test evidence:
+- New regression test proves the behavior and the previous bypass condition:
+  - `core/src/banking_stage/consumer.rs:874` (`test_mcp_admission_applies_conservative_fee_to_standard_wire_transaction`)
+  - Asserts MCP admission rejects a low-balance standard-wire tx while legacy fee check would accept it.
+
+### PBK-4 resolution (`RESOLVED`)
+
+Change:
+- Added direct replay-guard path coverage by invoking `ReplayStage::replay_active_bank` itself (both pre/post migration), instead of only evaluating a proxy condition.
+- Evidence:
+  - Guard branch under test: `core/src/replay_stage.rs:3884`
+  - New test: `core/src/replay_stage.rs:11159`
+
+Why this closes the finding:
+- The test now exercises the exact function-level guard behavior:
+  - pre-migration: leader-owned bank is skipped (`replay_result.is_none()`)
+  - post-migration: leader-owned bankless slot is replayed (`replay_result.is_some()`)
+
+Validation run (this pass):
+- `cargo test -p solana-core --lib test_mcp_admission_applies_conservative_fee_to_standard_wire_transaction` ✅
+- `cargo test -p solana-core --lib test_replay_active_bank_replays_leader_owned_bankless_slot` ✅
+- `cargo test -p solana-core --lib test_receive_and_buffer_simple_transfer` ✅
+- `cargo test -p solana-core --lib test_mcp_fee_payer_tracker_prevents_overcommit` ✅
+- `cargo test -p solana-core --lib test_mcp_leader_owned_bank_replays_via_blockstore` ✅
+- `cargo test -p solana-core --lib --no-run` ✅

@@ -747,7 +747,7 @@ impl Consumer {
             .feature_set
             .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
             .is_some_and(|activated_slot| bank.slot() >= activated_slot);
-        if mcp_feature_active && transaction.mcp_fee_components().is_some() {
+        if mcp_feature_active {
             Self::check_fee_payer_unlocked_mcp(bank, transaction, fee_tracker, error_counters)
         } else {
             Self::check_fee_payer_unlocked(bank, transaction, error_counters)
@@ -770,7 +770,7 @@ mod tests {
         solana_bls_signatures::Signature as BLSSignature,
         solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
         solana_entry::entry::{next_entry, next_versioned_entry},
-        solana_fee_calculator::FeeCalculator,
+        solana_fee_calculator::{FeeCalculator, FeeRateGovernor},
         solana_hash::Hash,
         solana_instruction::error::InstructionError,
         solana_keypair::Keypair,
@@ -867,6 +867,60 @@ mod tests {
         assert_eq!(
             tracker.try_reserve(11, payer, 1_000, 200, 801),
             Err(TransactionError::InsufficientFundsForFee)
+        );
+    }
+
+    #[test]
+    fn test_mcp_admission_applies_conservative_fee_to_standard_wire_transaction() {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        genesis_config.fee_rate_governor = FeeRateGovernor::new(5_000, 0);
+
+        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let mcp_feature_active = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        assert!(mcp_feature_active);
+
+        let low_balance_payer = Keypair::new();
+        let low_balance_lamports = 15_000;
+        bank.store_account(
+            &low_balance_payer.pubkey(),
+            &AccountSharedData::new(low_balance_lamports, 0, &system_program::id()),
+        );
+
+        let tx = sanitize_transactions(vec![system_transaction::transfer(
+            &low_balance_payer,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        )])
+        .remove(0);
+
+        let mut tracker = McpFeePayerTracker::default();
+        let mut admission_errors = TransactionErrorMetrics::default();
+        assert_eq!(
+            Consumer::check_fee_payer_unlocked_admission(
+                &bank,
+                &tx,
+                &mut tracker,
+                &mut admission_errors
+            ),
+            Err(TransactionError::InsufficientFundsForFee)
+        );
+
+        // Legacy fee path would accept this payer; MCP admission must apply
+        // conservative NUM_PROPOSERS scaling even for standard-wire txs.
+        let mut legacy_errors = TransactionErrorMetrics::default();
+        assert_eq!(
+            Consumer::check_fee_payer_unlocked(&bank, &tx, &mut legacy_errors),
+            Ok(())
         );
     }
 
