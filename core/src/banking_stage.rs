@@ -1023,7 +1023,13 @@ mod tests {
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let entry_receiver = {
             // start a banking_stage to eat verified receiver
-            let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+            let (bank, bank_forks) = {
+                let mut bank = Bank::new_for_tests(&genesis_config);
+                // Deactivate MCP so tests exercise the legacy execution path.
+                bank.deactivate_feature(&agave_feature_set::mcp_protocol_v1::id());
+                bank.ns_per_slot = u128::MAX;
+                bank.wrap_with_bank_forks_for_tests()
+            };
             let (
                 exit,
                 poh_recorder,
