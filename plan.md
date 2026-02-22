@@ -761,8 +761,10 @@ executing bank for the slot.  Execution is deferred to replay after consensus.
 
 ### Banking Stage — `consumer.rs`
 
-`execute_and_commit_transactions_locked` checks `mcp_protocol_v1` activation.
-When active, a bankless branch (`record_transactions_bankless`) takes over:
+`execute_and_commit_transactions_locked` uses `should_use_bankless_recording`:
+MCP feature active for the slot + alpenglow genesis certificate present +
+`bank.slot() > genesis_cert.cert_type.slot()`. When true, a bankless
+branch (`record_transactions_bankless`) takes over:
 
 1. Collects all successfully-locked transactions from the batch.
 2. Acquires `bank.freeze_lock()`.

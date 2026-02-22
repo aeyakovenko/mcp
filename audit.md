@@ -256,3 +256,412 @@ Scope: exhaustive mapping of every changed file in `git diff upstream/master...m
 | `votor/src/consensus_pool_service/stats.rs` | `7.4` | consensus integration metrics |
 | `votor/src/event_handler.rs` | `7.4` | consensus event handling for MCP block_id |
 | `votor/src/voting_utils.rs` | `7.4` | vote payload + block_id |
+
+---
+
+## Addendum (2026-02-22): Bankless Plan/Implementation Audit
+
+Scope:
+- `plan.md` bankless sections (`plan.md:19-21`, `plan.md:755-786`)
+- Spec §9 (`docs/src/proposals/mcp-protocol-spec.md:593-598`)
+- Implementation paths:
+  - `core/src/banking_stage/consumer.rs`
+  - `core/src/replay_stage.rs`
+  - `core/src/block_creation_loop.rs`
+  - `poh/src/poh_recorder.rs`
+
+Summary:
+- `HIGH`: 1 (latent implementation gap on no-working-bank record path)
+- `MEDIUM`: 2 (activation-edge gating + missing direct branch coverage)
+- `LOW`: 1 (plan wording mismatch with runtime QoS behavior)
+
+### BKL-1: `record_bankless` caller path is incomplete if exercised (`HIGH`, latent)
+
+- Plan claims this blocker is resolved by wiring `PohRecorder::record_bankless` from production (`plan.md:19-21`).
+- In production caller, the returned `BanklessRecordSummary` is discarded (`core/src/block_creation_loop.rs:456-464`).
+- `record_bankless` returns `recorded_entries` but does not emit to `working_bank_sender` (`poh/src/poh_recorder.rs:500-519`).
+
+Impact:
+- If `record_with_optional_bankless` enters the `!has_bank()` branch, recorded transaction entries have no forwarding/broadcast sink and are effectively dropped.
+- Current block-creation flow usually keeps a working bank installed while draining records (`core/src/block_creation_loop.rs:530-548`), so this is likely dormant today, but it contradicts the plan’s “resolved” framing.
+
+Minimal fix direction:
+1. Either make this path explicitly unsupported for now (return deterministic error when `!has_bank()` in block-creation recording path), or
+2. Plumb `BanklessRecordSummary.recorded_entries` into the same downstream entry/broadcast flow used by normal recording.
+
+### BKL-2: Bankless-start vote bypass is checked on parent slot, not candidate leader slot (`MEDIUM`)
+
+- `allow_bankless_start` is computed from `parent_bank.slot() >= activated_slot` (`core/src/replay_stage.rs:2626-2630`).
+- For activation boundary slots, the parent may be pre-activation while `maybe_my_leader_slot` is activation slot.
+
+Impact:
+- On the first MCP-active leader slot, rooted-vote bypass can be withheld unexpectedly.
+
+Minimal fix direction:
+- Compare activation against `maybe_my_leader_slot` (the candidate produced slot), not `parent_bank.slot()`.
+
+### BKL-3: Direct coverage for bankless execution bypass is still missing (`MEDIUM`)
+
+- `consumer.rs` tests now intentionally disable MCP feature to keep legacy path behavior (`core/src/banking_stage/consumer.rs:804-813`).
+- Replay has a targeted test for common start checks (`core/src/replay_stage.rs:5775+`), but no direct test proving leader-owned MCP banks are replayed via the new `|| is_mcp_slot` branch (`core/src/replay_stage.rs:3766-3771`, `core/src/replay_stage.rs:3881-3886`).
+
+Impact:
+- The main bankless branch (`record_transactions_bankless`) can regress without deterministic unit-test detection.
+
+Minimal fix direction:
+1. Add a `consumer.rs` unit test with MCP active asserting no state transition occurs during `process_and_record_transactions`, while transactions are recorded for replay.
+2. Add a replay-stage test asserting leader-owned MCP slot enters replay path.
+
+### BKL-4: Plan wording mismatch for QoS cost behavior (`LOW`)
+
+- Plan says “QoS costs revert to estimated values” (`plan.md:772`).
+- Implementation sets synthetic committed CU to zero (`core/src/banking_stage/consumer.rs:600-607`), and QoS updates cost tracker with those actual values (`core/src/banking_stage/qos_service.rs:203-210`), which subtracts estimated execution cost (`cost-model/src/cost_tracker.rs:199-211`).
+
+Impact:
+- Documentation mismatch; runtime behavior is deterministic but wording is inaccurate.
+
+Minimal fix direction:
+- Update plan wording to “QoS actual execution units are updated to zero for bankless-recorded transactions.”
+
+### Verification Run (targeted)
+
+- `cargo test -p solana-core --lib test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote` ✅
+- `cargo test -p solana-core --lib test_mcp_fee_payer_tracker_prevents_overcommit` ✅
+- `cargo test -p solana-poh --lib test_record_bankless_without_working_bank` ✅
+
+---
+
+## Addendum (2026-02-22): Bankless Re-Audit (post `2ff01753ad`)
+
+Scope:
+- New bankless commit: `2ff01753ad`.
+- Plan sections: `plan.md:19-21`, `plan.md:524-531`, `plan.md:755-787`.
+- Spec anchor: `docs/src/proposals/mcp-protocol-spec.md:593-598` (Section 9).
+
+### Summary
+
+- Implementation correctness vs Spec §9: `PASS` for this change set (banking-stage execution bypass + replay of leader-owned MCP banks are present).
+- Remaining production blockers from this delta: `none confirmed`.
+- Remaining issues: 1 medium (weak replay regression test), 1 low (deferred/test-only helper path docs).
+
+### RBK-1: `RESOLVED` (documentation sync)
+
+Status:
+- `plan.md:19-22` now matches implementation: production block recording is fail-fast when no working bank is installed, and `record_bankless` remains a guarded helper API.
+
+### RBK-2 (MEDIUM): New replay test is not coupled to production code path
+
+Evidence:
+- `test_mcp_leader_owned_bank_enters_replay` only evaluates a local boolean expression (`core/src/replay_stage.rs:11068-11105`).
+- It does not execute `replay_active_bank` or `replay_active_banks_concurrently` and therefore cannot catch regressions in those functions.
+
+Why it matters:
+- Intended regression coverage exists in name but not in effect.
+
+Minimal correction:
+- Add a unit test that exercises one real replay function and asserts leader-owned MCP bank is not skipped.
+
+### RBK-3 (LOW): `record_bankless` is currently test-only code
+
+Evidence:
+- No production call sites for `.record_bankless(`; occurrences are in `poh_recorder` tests only.
+
+Why it matters:
+- Current state is valid if intentional, but should be documented as deferred wiring to avoid confusion.
+
+Minimal correction:
+- Document in plan/audit that `record_bankless` remains a guarded helper pending explicit entry-forwarding plumbing, and production uses fail-fast for no-bank record attempts.
+
+### RBK-4: `RESOLVED` (comment wording sync)
+
+Status:
+- `core/src/banking_stage/consumer.rs` comment now matches `plan.md` wording: QoS actual execution units are updated to zero for bankless-recorded transactions.
+
+### Revalidated on this pass
+
+- `cargo test -p solana-core --lib test_mcp_bankless_records_without_execution` ✅
+- `cargo test -p solana-core --lib test_mcp_leader_owned_bank_enters_replay` ✅
+- `cargo test -p solana-core --lib test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote` ✅
+
+
+---
+
+## Addendum (2026-02-22): Bankless Re-Audit 2 (post `4c73f74689`)
+
+Scope:
+- Delta audited: `4c73f74689` + current workspace state.
+- Spec anchor: `docs/src/proposals/mcp-protocol-spec.md:593-598` (Section 9).
+- Plan anchors: `plan.md:19-22`, `plan.md:525-532`, `plan.md:757-799`.
+
+### Summary
+
+- Bankless implementation vs spec/plan: `CONSISTENT` for current behavior.
+- Production blockers found in this pass: `none`.
+- Open item: 1 low-priority deferred helper-path/documentation item.
+
+### RBK-2 follow-up: `RESOLVED`
+
+Previous concern:
+- Replay regression test only validated a boolean expression.
+
+Current status:
+- Replaced with real replay-path test that invokes `ReplayStage::replay_blockstore_into_bank` on a leader-owned MCP bank and asserts success.
+- Evidence: `core/src/replay_stage.rs:11068-11157` (`test_mcp_leader_owned_bank_replays_via_blockstore`).
+
+### Current low-priority item
+
+#### RBK-5 (LOW): `record_bankless` remains a deferred helper path
+
+Evidence:
+- Production block creation fail-fast rejects no-working-bank recording (`core/src/block_creation_loop.rs:455-466`).
+- `record_bankless` remains available and tested in `poh_recorder` tests, but not used by production record path.
+- Plan now documents this explicitly (`plan.md:791-799`).
+
+Assessment:
+- Not a release blocker for current bankless design.
+- This is only a deferred enhancement if future design needs no-working-bank entry forwarding instead of fail-fast.
+
+### Validation rerun in this pass
+
+- `cargo test -p solana-core --lib test_mcp_leader_owned_bank_replays_via_blockstore` ✅
+- `cargo test -p solana-core --lib test_mcp_bankless_records_without_execution` ✅
+- `cargo test -p solana-core --lib test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote` ✅
+- `cargo test -p solana-poh --lib test_record_bankless_without_working_bank` ✅
+
+
+---
+
+## Addendum (2026-02-22): Focused Failure Triage — bankless regressions
+
+Scope requested:
+- `test_1_node_alpenglow`: `PubsubError` / timeout while waiting for roots.
+- `test_local_cluster_mcp_produces_blockstore_artifacts`: `consensus_meta` size mismatch (`41 vs 32`).
+
+### F1) `test_1_node_alpenglow` (`UNVERIFIED exact panic text`, high-confidence call-path diagnosis)
+
+Observed locally on this pass:
+- The single-node cluster keeps finalizing and advancing roots continuously (root moves 4 -> 5 -> ... in runtime logs).
+- Test flow did not terminate promptly under `--nocapture`; repeated transaction retry warnings appeared in local-cluster helpers.
+
+Call path:
+1. `local-cluster/tests/local_cluster.rs:224` (`test_1_node_alpenglow`)
+2. `local-cluster/tests/local_cluster.rs:193` (`test_alpenglow_nodes_basic`)
+3. `local-cluster/src/cluster_tests.rs:68` (`spend_and_verify_all_nodes`)
+4. `local-cluster/src/local_cluster.rs:985` (`poll_for_processed_transaction` loop)
+5. `local-cluster/src/cluster_tests.rs:458` (`check_for_new_commitment_slots` root polling)
+6. `local-cluster/src/cluster_tests.rs:865` (`new_tpu_quic_client`)
+
+Key issue in harness path:
+- Root polling and spend verification repeatedly instantiate `TpuClient` via `new_tpu_quic_client(...)`, which requires `rpc_pubsub` websocket setup each time (`cluster_tests.rs:865-883`, `cluster_tests.rs:475`, `cluster_tests.rs:117`).
+- This couples simple root/processed checks to pubsub transport health and connection churn; when pubsub is flaky, tests can fail as `PubsubError`/timeouts even while consensus/rooting is healthy.
+
+Why this maps to your reported symptom:
+- Root progress can be healthy, but the test still times out/fails because the checker path depends on pubsub-backed `TpuClient` creation, not a stable plain `RpcClient` root check.
+
+Minimal fix direction:
+- For root/processed polling in local-cluster tests, use direct `RpcClient` from `contact_info.rpc()` instead of `TpuClient`.
+- Keep `TpuClient` only for send paths. This removes pubsub as a false-negative source for root liveness checks.
+
+### F2) `test_local_cluster_mcp_produces_blockstore_artifacts` (`CONFIRMED`)
+
+#### F2.a) Stale assertion (fixed in this workspace)
+
+Cause:
+- Test asserted `consensus_meta.len() == HASH_BYTES (32)`.
+- Implementation defines versioned `ConsensusMeta::V1` wire size as `1 + 32 + 8 = 41` bytes.
+
+Evidence:
+- Wire size constant: `ledger/src/mcp_consensus_block.rs:18-19`
+- Producer writes v1 metadata: `core/src/window_service.rs:196`
+- Replay parses v1 metadata: `core/src/mcp_replay.rs:290-314`
+- Test assertion site (updated): `local-cluster/tests/local_cluster.rs:7927-7937`
+
+Fix applied:
+- Test now parses `consensus_meta` via `consensus_meta_parsed()` and asserts v1 wire size via `CONSENSUS_META_V1_WIRE_BYTES`.
+- Test now derives delayed-slot from parsed metadata (`delayed_slot()`) instead of hardcoding `slot - 1`.
+
+#### F2.b) Additional blocker seen during rerun (likely bankless path)
+
+Observed repeatedly during rerun:
+- `BlockComponentProcessor(MissingBlockFooter)` dead-slot marks.
+- Repeated slot-meta corruption signals: `consumed: 128 > last_index + 1: Some(96)`.
+
+Relevant bankless path:
+1. Leader bankless setup: `core/src/block_creation_loop.rs:738-743`
+2. Block completion calls `tick_alpenglow(..., footer)`: `core/src/block_creation_loop.rs:552-560`
+3. PoH bankless flush emits footer marker in `flush_cache`: `poh/src/poh_recorder.rs:816-833`
+4. Replay of leader-owned bankless slots is forced in replay stage: `core/src/replay_stage.rs:3768-3771`, `core/src/replay_stage.rs:3883-3886`
+
+Risk hypothesis:
+- Marker/tick sequencing or multiplicity in bankless footer emission is producing malformed/partial block-component streams for some slots, which then fail block-component validation at replay finalization.
+- This is consistent with `MissingBlockFooter` plus slot-meta over-consumption on the same slots.
+
+Minimal verification/fix plan:
+1. Add temporary counters/logs around footer-marker enqueue in `PohRecorder::flush_cache` (bankless branch) to prove exactly one footer per slot and its position relative to final tick.
+2. Add a focused unit/integration assertion in local-cluster MCP test path: each executed MCP slot must have exactly one footer marker before replay finalization.
+3. Fail test early with slot-level diagnostics when `MissingBlockFooter` appears, instead of waiting for global timeout.
+
+Status after this pass:
+- The explicit `41 vs 32` assertion mismatch is fixed.
+- Remaining instability is dominated by `MissingBlockFooter` / slot-meta errors in bankless execution path; this is now the primary blocker for deterministic local-cluster MCP test completion.
+
+---
+
+## Addendum (2026-02-22): Principal Bankless Audit (fresh pass)
+
+Scope:
+- Bankless implementation surfaces:
+  - `core/src/banking_stage/consumer.rs`
+  - `core/src/block_creation_loop.rs`
+  - `core/src/replay_stage.rs`
+  - `poh/src/poh_recorder.rs`
+- Spec anchors:
+  - `docs/src/proposals/mcp-protocol-spec.md:581-591` (fee-payer DoS constraints)
+  - `docs/src/proposals/mcp-protocol-spec.md:593-598` (bankless requirement)
+
+### Summary
+
+- Bankless core flow (`record only in banking stage, execute in replay`) is implemented and unit-tested.
+- No immediate crash-level defect found in the new bankless PoH/replay wiring itself.
+- 2 high-risk correctness/spec gaps remain in admission gating/accounting.
+
+### Findings
+
+#### PBK-1 (`HIGH`, `UNVERIFIED` reachability): bankless execution gate in BankingStage is feature-slot based, not migration-phase based
+
+Evidence:
+- BankingStage bankless branch activates when MCP feature slot is active:
+  - `core/src/banking_stage/consumer.rs:348-353`
+- Block creation bankless PoH mode is gated by alpenglow runtime state:
+  - `core/src/block_creation_loop.rs:738-744`
+- Replay leader-owned-bank execution bypass is gated by alpenglow slot classification:
+  - `core/src/replay_stage.rs:3768-3770`
+
+Why this matters:
+- If there exists any phase where `mcp_protocol_v1` is active but `should_have_alpenglow_ticks(slot)` is false, BankingStage can skip execution while replay/broadcast still follow non-bankless assumptions.
+
+Minimal fix:
+1. Align BankingStage bankless predicate with migration/alpenglow slot predicate (same semantic source used by replay/block creation), not feature activation alone.
+2. Add a regression test for the activation/migration boundary slot behavior.
+
+Verification needed:
+- Prove from migration state transitions whether the mixed condition is reachable in production.
+
+#### PBK-2 (`HIGH`): per-slot cumulative fee commitments are not persisted across scheduler passes
+
+Evidence:
+- Spec requires per-slot cumulative fee commitments:
+  - `docs/src/proposals/mcp-protocol-spec.md:587-588`
+- Admission tracker is instantiated per pass (ephemeral) in multiple paths:
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:263`
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:520`
+  - `core/src/banking_stage/transaction_scheduler/scheduler_controller.rs:202-203`
+
+Why this matters:
+- A payer can pass conservative fee checks in multiple independent passes within the same slot, violating cumulative per-slot reservation semantics.
+
+Minimal fix:
+1. Store `McpFeePayerTracker` in scheduler state keyed by slot and reuse it across receive/filter passes.
+2. Reset tracker only when working slot advances.
+
+#### PBK-3 (`MEDIUM`): MCP conservative fee check is conditional on `mcp_fee_components().is_some()`
+
+Evidence:
+- Admission route condition:
+  - `core/src/banking_stage/consumer.rs:737-744`
+
+Why this matters:
+- Standard-wire transactions in MCP-active slots can bypass MCP conservative reservation logic if they carry no MCP fee metadata, conflicting with spec language for standard transactions.
+
+Minimal fix:
+1. For MCP-active slots, route all transactions through MCP fee admission.
+2. Treat missing MCP fee components as `(inclusion=0, ordering=0)` but still apply the scaled reservation rule.
+
+#### PBK-4 (`MEDIUM`): replay guard regression test still does not execute the exact guard path
+
+Evidence:
+- Test asserts the guard expression manually and calls `replay_blockstore_into_bank`, but does not exercise `replay_active_bank*` guard branches directly:
+  - `core/src/replay_stage.rs:11097-11109`
+  - Guard branches under test intent:
+  - `core/src/replay_stage.rs:3768-3771`
+  - `core/src/replay_stage.rs:3883-3886`
+
+Why this matters:
+- Guard regressions in those functions can slip through despite the current test passing.
+
+Minimal fix:
+1. Add a focused test that drives `replay_active_bank` (or `replay_active_banks_concurrently`) with a leader-owned MCP slot and asserts replay entry.
+
+### Validation rerun (this pass)
+
+- `cargo test -p solana-core --lib test_mcp_bankless_records_without_execution` ✅
+- `cargo test -p solana-core --lib test_common_maybe_start_leader_checks_allows_mcp_bankless_start_without_rooted_vote` ✅
+- `cargo test -p solana-core --lib test_mcp_leader_owned_bank_replays_via_blockstore` ✅
+- `cargo test -p solana-poh --lib test_record_bankless_without_working_bank` ✅
+- `cargo test -p solana-local-cluster --test local_cluster test_local_cluster_mcp_produces_blockstore_artifacts -- --test-threads=1` ✅ (pass; observed non-fatal replay/bankless noise remains)
+
+---
+
+## Addendum (2026-02-22): PBK-1/PBK-2 Closure
+
+Scope:
+- Prior open items from this same file:
+  - `PBK-1` (bankless activation gate alignment)
+  - `PBK-2` (per-slot cumulative MCP fee reservation persistence)
+- Files changed in this closure:
+  - `core/src/banking_stage/consumer.rs`
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs`
+  - `core/src/banking_stage/transaction_scheduler/scheduler_controller.rs`
+  - `core/src/banking_stage.rs`
+
+### Status Summary
+
+- `PBK-1`: `RESOLVED`
+- `PBK-2`: `RESOLVED`
+- `PBK-3/PBK-4`: unchanged by this delta
+
+### PBK-1 resolution details (`RESOLVED`)
+
+What changed:
+- BankingStage bankless path now uses an explicit migration-aware predicate instead of feature-slot-only gating:
+  - `core/src/banking_stage/consumer.rs:138` (`should_use_bankless_recording`)
+  - `core/src/banking_stage/consumer.rs:361` (call site)
+
+Predicate now requires:
+1. MCP feature active for the slot, and
+2. alpenglow genesis certificate present, and
+3. `bank.slot() > genesis_cert.cert_type.slot()`.
+
+Why this resolves the finding:
+- Aligns BankingStage execution bypass with migration/alpenglow semantics used elsewhere, eliminating feature-only activation drift risk at transition boundaries.
+
+Test evidence:
+- `test_mcp_bankless_records_without_execution` verifies post-genesis MCP slot takes bankless record-only path (`core/src/banking_stage/consumer.rs:1861`).
+- `test_mcp_feature_active_without_alpenglow_cert_uses_legacy_execution` verifies MCP-active without cert remains legacy execute path (`core/src/banking_stage/consumer.rs:1951`).
+
+### PBK-2 resolution details (`RESOLVED`)
+
+What changed:
+- MCP fee tracker is now persistent scheduler state (instead of per-pass local temporary):
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:114`
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:370`
+- Both receive/buffer paths now reuse `self.mcp_fee_payer_tracker` when calling fee admission:
+  - sanitized path: `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:333`
+  - view path: `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:574`
+- View-mode constructor introduced and wired at call sites to initialize state cleanly:
+  - `core/src/banking_stage/transaction_scheduler/receive_and_buffer.rs:373`
+  - `core/src/banking_stage.rs:477`
+- Pre-graph filter no longer re-runs fee reservation (avoids double-reserve in repeat filters):
+  - `core/src/banking_stage/transaction_scheduler/scheduler_controller.rs:201`
+
+Why this resolves the finding:
+- Conservative fee commitments are now retained across repeated scheduler receive/filter passes for the same controller instance, matching per-slot cumulative reservation intent and preventing per-pass reset bypass.
+
+Targeted validation on this pass:
+- `cargo test -p solana-core --lib test_mcp_fee_payer_tracker_prevents_overcommit` ✅
+- `cargo test -p solana-core --lib test_receive_and_buffer_simple_transfer` ✅
+- `cargo test -p solana-core --lib test_schedule_consume_single_threaded_no_conflicts` ✅
+
+### Remaining open items from the PBK set
+
+- `PBK-3` and `PBK-4` remain as previously documented (not regressed by this change set).

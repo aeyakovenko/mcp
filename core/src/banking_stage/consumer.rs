@@ -24,9 +24,7 @@ use {
         bank::{Bank, LoadAndExecuteTransactionsOutput},
         transaction_batch::TransactionBatch,
     },
-    solana_runtime_transaction::{
-        transaction_with_meta::TransactionWithMeta,
-    },
+    solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_svm::{
         account_loader::{validate_fee_payer, validate_fee_payer_for_mcp},
         transaction_error_metrics::TransactionErrorMetrics,
@@ -137,6 +135,21 @@ impl From<&TransactionRecorder> for Consumer {
 }
 
 impl Consumer {
+    fn should_use_bankless_recording(bank: &Bank) -> bool {
+        let mcp_feature_active = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if !mcp_feature_active {
+            return false;
+        }
+
+        // Align with migration/alpenglow slot semantics:
+        // bankless execution starts only for slots after the alpenglow genesis cert slot.
+        bank.get_alpenglow_genesis_certificate()
+            .is_some_and(|genesis_cert| bank.slot() > genesis_cert.cert_type.slot())
+    }
+
     pub fn new(
         committer: Committer,
         transaction_recorder: TransactionRecorder,
@@ -345,11 +358,7 @@ impl Consumer {
 
         // MCP bankless leader: skip execution, record validated transactions
         // directly to PoH, and let replay handle execution.
-        let is_mcp_slot = bank
-            .feature_set
-            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
-        if is_mcp_slot {
+        if Self::should_use_bankless_recording(bank) {
             return self.record_transactions_bankless(
                 bank,
                 batch,
@@ -758,6 +767,7 @@ mod tests {
             self as address_lookup_table,
             state::{AddressLookupTable, LookupTableMeta},
         },
+        solana_bls_signatures::Signature as BLSSignature,
         solana_cost_model::{cost_model::CostModel, transaction_cost::TransactionCost},
         solana_entry::entry::{next_entry, next_versioned_entry},
         solana_fee_calculator::FeeCalculator,
@@ -791,6 +801,10 @@ mod tests {
             sanitized::MessageHash, versioned::VersionedTransaction, Transaction,
         },
         solana_transaction_status::{TransactionStatusMeta, VersionedTransactionWithStatusMeta},
+        solana_votor_messages::{
+            consensus_message::{Certificate, CertificateType},
+            migration::GENESIS_CERTIFICATE_ACCOUNT,
+        },
         std::{
             borrow::Cow,
             sync::{
@@ -805,7 +819,10 @@ mod tests {
     /// legacy execution path (not bankless leader) is exercised.
     fn new_bank_without_mcp_for_tests(
         genesis_config: &solana_genesis_config::GenesisConfig,
-    ) -> (Arc<Bank>, Arc<std::sync::RwLock<solana_runtime::bank_forks::BankForks>>) {
+    ) -> (
+        Arc<Bank>,
+        Arc<std::sync::RwLock<solana_runtime::bank_forks::BankForks>>,
+    ) {
         let mut bank = Bank::new_for_tests(genesis_config);
         bank.deactivate_feature(&agave_feature_set::mcp_protocol_v1::id());
         bank.ns_per_slot = u128::MAX;
@@ -1860,15 +1877,23 @@ mod tests {
             &Pubkey::new_unique(),
             bootstrap_validator_stake_lamports(),
         );
-        // Use a bank WITH MCP active (default) to exercise the bankless path.
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        // Use a post-genesis slot (slot 1) so it is an alpenglow block
+        // and must take the bankless path when MCP is active.
+        let (parent_bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let genesis_cert = Certificate {
+            cert_type: CertificateType::Genesis(0, Hash::default()),
+            signature: BLSSignature::default(),
+            bitmap: Vec::default(),
+        };
+        parent_bank.set_alpenglow_genesis_certificate(&genesis_cert);
+        let bank = Arc::new(Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1));
         let pubkey = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![system_transaction::transfer(
             &mint_keypair,
             &pubkey,
             1,
-            genesis_config.hash(),
+            bank.last_blockhash(),
         )]);
 
         let (record_sender, mut record_receiver) = record_channels(false);
@@ -1920,5 +1945,59 @@ mod tests {
         assert_eq!(record.slot, bank.slot());
         assert_eq!(record.transaction_batches.len(), 1);
         assert_eq!(record.transaction_batches[0].len(), 1);
+    }
+
+    #[test]
+    fn test_mcp_feature_active_without_alpenglow_cert_uses_legacy_execution() {
+        agave_logger::setup();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        // Simulate pre-alpenglow-migration behavior where MCP feature may be present
+        // but no genesis certificate has been committed yet.
+        genesis_config
+            .accounts
+            .remove(&*GENESIS_CERTIFICATE_ACCOUNT);
+
+        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let pubkey = solana_pubkey::new_rand();
+        let transactions = sanitize_transactions(vec![system_transaction::transfer(
+            &mint_keypair,
+            &pubkey,
+            1,
+            bank.last_blockhash(),
+        )]);
+
+        let (record_sender, mut record_receiver) = record_channels(false);
+        let recorder = TransactionRecorder::new(record_sender);
+        record_receiver.restart(bank.slot());
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+
+        let output = consumer.process_and_record_transactions(&bank, &transactions);
+        let commit_statuses = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .unwrap();
+        assert_eq!(commit_statuses.len(), 1);
+        assert!(matches!(
+            commit_statuses[0],
+            CommitTransactionDetails::Committed { .. }
+        ));
+
+        // Legacy execution path should execute immediately in banking stage.
+        assert_eq!(bank.get_balance(&pubkey), 1);
     }
 }

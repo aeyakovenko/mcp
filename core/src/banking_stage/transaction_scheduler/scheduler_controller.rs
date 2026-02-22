@@ -10,7 +10,6 @@ use {
     },
     crate::banking_stage::{
         consume_worker::ConsumeWorkerMetrics,
-        consumer::Consumer,
         decision_maker::{BufferedPacketsDecision, DecisionMaker},
         transaction_scheduler::{
             receive_and_buffer::ReceivingStats, transaction_state_container::StateContainer,
@@ -199,21 +198,12 @@ where
             max_age,
             &mut error_counters,
         );
-        let mut mcp_fee_payer_tracker =
-            crate::banking_stage::consumer::McpFeePayerTracker::default();
-
-        for ((check_result, tx), result) in check_results
-            .into_iter()
-            .zip(transactions)
-            .zip(results.iter_mut())
-        {
-            let fee_check_result = Consumer::check_fee_payer_unlocked_admission(
-                bank,
-                *tx,
-                &mut mcp_fee_payer_tracker,
-                &mut error_counters,
-            );
-            *result = check_result.and(fee_check_result).is_ok();
+        // Fee-payer admission is enforced at ingress buffering, where MCP
+        // per-slot reservations are persisted across scheduler passes.
+        // Keep pre-graph filtering focused on age/status checks to avoid
+        // double-reserving the same transaction across repeated filters.
+        for (check_result, result) in check_results.into_iter().zip(results.iter_mut()) {
+            *result = check_result.is_ok();
         }
     }
 
@@ -421,10 +411,7 @@ mod tests {
         receiver: BankingPacketReceiver,
         bank_forks: Arc<RwLock<BankForks>>,
     ) -> TransactionViewReceiveAndBuffer {
-        TransactionViewReceiveAndBuffer {
-            receiver,
-            bank_forks,
-        }
+        TransactionViewReceiveAndBuffer::new(receiver, bank_forks)
     }
 
     #[allow(clippy::type_complexity)]

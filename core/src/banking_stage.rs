@@ -474,10 +474,10 @@ impl BankingStage {
                 )
             }
             TransactionStructure::View => {
-                let receive_and_buffer = TransactionViewReceiveAndBuffer {
-                    receiver: context.non_vote_receiver.clone(),
-                    bank_forks: context.bank_forks.clone(),
-                };
+                let receive_and_buffer = TransactionViewReceiveAndBuffer::new(
+                    context.non_vote_receiver.clone(),
+                    context.bank_forks.clone(),
+                );
                 Self::spawn_scheduler_and_workers(
                     non_vote_thread_hdls,
                     receive_and_buffer,
