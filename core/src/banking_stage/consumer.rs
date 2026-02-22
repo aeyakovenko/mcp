@@ -343,6 +343,24 @@ impl Consumer {
             })
             .collect();
 
+        // MCP bankless leader: skip execution, record validated transactions
+        // directly to PoH, and let replay handle execution.
+        let is_mcp_slot = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+        if is_mcp_slot {
+            return self.record_transactions_bankless(
+                bank,
+                batch,
+                retryable_transaction_indexes,
+                execute_and_commit_timings,
+                error_counters,
+                min_prioritization_fees,
+                max_prioritization_fees,
+            );
+        }
+
         let (load_and_execute_transactions_output, load_execute_us) = measure_us!(bank
             .load_and_execute_transactions(
                 batch,
@@ -490,6 +508,116 @@ impl Consumer {
         debug_assert_eq!(
             transaction_counts.attempted_processing_count,
             commit_transaction_statuses.len() as u64,
+        );
+
+        ExecuteAndCommitTransactionsOutput {
+            transaction_counts,
+            retryable_transaction_indexes,
+            commit_transactions_result: Ok(commit_transaction_statuses),
+            execute_and_commit_timings,
+            error_counters,
+            min_prioritization_fees,
+            max_prioritization_fees,
+        }
+    }
+
+    /// MCP bankless leader path: record successfully-locked transactions to PoH
+    /// without executing them. Execution is deferred to replay stage.
+    fn record_transactions_bankless(
+        &self,
+        bank: &Bank,
+        batch: &TransactionBatch<impl TransactionWithMeta>,
+        mut retryable_transaction_indexes: Vec<usize>,
+        mut execute_and_commit_timings: LeaderExecuteAndCommitTimings,
+        error_counters: TransactionErrorMetrics,
+        min_prioritization_fees: u64,
+        max_prioritization_fees: u64,
+    ) -> ExecuteAndCommitTransactionsOutput {
+        let lock_results = batch.lock_results();
+        let num_txs = lock_results.len();
+
+        // Collect all successfully-locked transactions for recording.
+        let (validated_transactions, processing_results_to_transactions_us) =
+            measure_us!(lock_results
+                .iter()
+                .zip(batch.sanitized_transactions())
+                .filter_map(|(lock_result, tx)| {
+                    lock_result.is_ok().then(|| tx.to_versioned_transaction())
+                })
+                .collect_vec());
+
+        let validated_count = validated_transactions.len() as u64;
+
+        let transaction_counts = LeaderProcessedTransactionCounts {
+            processed_count: validated_count,
+            processed_with_successful_result_count: validated_count,
+            attempted_processing_count: num_txs as u64,
+        };
+
+        let (freeze_lock, freeze_lock_us) = measure_us!(bank.freeze_lock());
+        execute_and_commit_timings.freeze_lock_us = freeze_lock_us;
+
+        let (record_transactions_summary, record_us) = measure_us!(self
+            .transaction_recorder
+            .record_transactions(bank.slot(), validated_transactions));
+        execute_and_commit_timings.record_us = record_us;
+
+        let RecordTransactionsSummary {
+            result: record_transactions_result,
+            record_transactions_timings,
+            ..
+        } = record_transactions_summary;
+        execute_and_commit_timings.record_transactions_timings = RecordTransactionsTimings {
+            processing_results_to_transactions_us: Saturating(
+                processing_results_to_transactions_us,
+            ),
+            ..record_transactions_timings
+        };
+
+        if let Err(recorder_err) = record_transactions_result {
+            // All validated transactions are retryable on record failure.
+            retryable_transaction_indexes.extend(
+                lock_results
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| r.is_ok().then_some(i)),
+            );
+            retryable_transaction_indexes.sort_unstable();
+
+            return ExecuteAndCommitTransactionsOutput {
+                transaction_counts,
+                retryable_transaction_indexes,
+                commit_transactions_result: Err(recorder_err),
+                execute_and_commit_timings,
+                error_counters,
+                min_prioritization_fees,
+                max_prioritization_fees,
+            };
+        }
+
+        drop(freeze_lock);
+
+        // Synthetic commit statuses: all locked txs are "committed" with zero
+        // compute units. QoS costs revert to estimated values.
+        let commit_transaction_statuses: Vec<CommitTransactionDetails> = lock_results
+            .iter()
+            .map(|lock_result| match lock_result {
+                Ok(()) => CommitTransactionDetails::Committed {
+                    compute_units: 0,
+                    loaded_accounts_data_size: 0,
+                    fee_payer_post_balance: 0,
+                    result: Ok(()),
+                },
+                Err(err) => CommitTransactionDetails::NotCommitted(err.clone()),
+            })
+            .collect();
+
+        debug!(
+            "bank: {} mcp_bankless record: {}us txs_len: {} validated: {}",
+            bank.slot(),
+            record_us,
+            num_txs,
+            validated_count,
         );
 
         ExecuteAndCommitTransactionsOutput {
@@ -673,6 +801,17 @@ mod tests {
         test_case::test_case,
     };
 
+    /// Create a test bank with `mcp_protocol_v1` deactivated so that the
+    /// legacy execution path (not bankless leader) is exercised.
+    fn new_bank_without_mcp_for_tests(
+        genesis_config: &solana_genesis_config::GenesisConfig,
+    ) -> (Arc<Bank>, Arc<std::sync::RwLock<solana_runtime::bank_forks::BankForks>>) {
+        let mut bank = Bank::new_for_tests(genesis_config);
+        bank.deactivate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        bank.ns_per_slot = u128::MAX;
+        bank.wrap_with_bank_forks_for_tests()
+    }
+
     fn execute_transactions_for_test(
         bank: Arc<Bank>,
         transactions: Vec<Transaction>,
@@ -770,7 +909,7 @@ mod tests {
             &Pubkey::new_unique(),
             bootstrap_validator_stake_lamports(),
         );
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = new_bank_without_mcp_for_tests(&genesis_config);
         let pubkey = solana_pubkey::new_rand();
 
         let transactions = sanitize_transactions(vec![system_transaction::transfer(
@@ -866,7 +1005,7 @@ mod tests {
             &Pubkey::new_unique(),
             bootstrap_validator_stake_lamports(),
         );
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = new_bank_without_mcp_for_tests(&genesis_config);
         let pubkey = Pubkey::new_unique();
 
         // setup nonce account with a durable nonce different from the current
@@ -1246,7 +1385,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_slow_genesis_config(lamports);
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = new_bank_without_mcp_for_tests(&genesis_config);
         // set cost tracker limits to MAX so it will not filter out TXs
         bank.write_cost_tracker()
             .unwrap()
@@ -1468,7 +1607,7 @@ mod tests {
         } = create_slow_genesis_config(solana_native_token::LAMPORTS_PER_SOL * 1000);
         genesis_config.rent.lamports_per_byte_year = 50;
         genesis_config.rent.exemption_threshold = 2.0;
-        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, _bank_forks) = new_bank_without_mcp_for_tests(&genesis_config);
         let pubkey = solana_pubkey::new_rand();
         let pubkey1 = solana_pubkey::new_rand();
         let keypair1 = Keypair::new();
@@ -1574,7 +1713,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_slow_genesis_config(10_000);
-        let (bank, bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let (bank, bank_forks) = new_bank_without_mcp_for_tests(&genesis_config);
         let keypair = Keypair::new();
 
         let address_table_key = Pubkey::new_unique();
@@ -1707,5 +1846,79 @@ mod tests {
                 ..TransactionStatusMeta::default()
             }
         );
+    }
+
+    #[test]
+    fn test_mcp_bankless_records_without_execution() {
+        agave_logger::setup();
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        // Use a bank WITH MCP active (default) to exercise the bankless path.
+        let (bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let pubkey = solana_pubkey::new_rand();
+
+        let transactions = sanitize_transactions(vec![system_transaction::transfer(
+            &mint_keypair,
+            &pubkey,
+            1,
+            genesis_config.hash(),
+        )]);
+
+        let (record_sender, mut record_receiver) = record_channels(false);
+        let recorder = TransactionRecorder::new(record_sender);
+        record_receiver.restart(bank.slot());
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+
+        let process_transactions_batch_output =
+            consumer.process_and_record_transactions(&bank, &transactions);
+
+        let ExecuteAndCommitTransactionsOutput {
+            transaction_counts,
+            commit_transactions_result,
+            ..
+        } = process_transactions_batch_output.execute_and_commit_transactions_output;
+
+        // Transaction should be counted as processed and committed.
+        assert_eq!(
+            transaction_counts,
+            LeaderProcessedTransactionCounts {
+                attempted_processing_count: 1,
+                processed_count: 1,
+                processed_with_successful_result_count: 1,
+            }
+        );
+        let commit_statuses = commit_transactions_result.unwrap();
+        assert_eq!(commit_statuses.len(), 1);
+        assert!(matches!(
+            commit_statuses[0],
+            CommitTransactionDetails::Committed {
+                compute_units: 0,
+                ..
+            }
+        ));
+
+        // Bank state must NOT have changed — no execution in bankless mode.
+        assert_eq!(bank.get_balance(&pubkey), 0);
+
+        // Transaction was recorded to PoH for replay.
+        record_receiver.shutdown();
+        let record = record_receiver.drain().next().unwrap();
+        assert_eq!(record.slot, bank.slot());
+        assert_eq!(record.transaction_batches.len(), 1);
+        assert_eq!(record.transaction_batches[0].len(), 1);
     }
 }

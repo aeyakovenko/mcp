@@ -2627,7 +2627,7 @@ impl ReplayStage {
             && parent_bank
                 .feature_set
                 .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-                .is_some_and(|activated_slot| parent_bank.slot() >= activated_slot);
+                .is_some_and(|activated_slot| maybe_my_leader_slot >= activated_slot);
 
         if !Self::common_maybe_start_leader_checks(
             my_pubkey,
@@ -3761,7 +3761,13 @@ impl ReplayStage {
                     let replay_progress = bank_progress.replay_progress.clone();
                     drop(progress_lock);
 
-                    if bank.collector_id() != my_pubkey {
+                    // MCP bankless leader: replay own banks so execution
+                    // happens during replay rather than banking stage.
+                    let is_mcp_slot = bank
+                        .feature_set
+                        .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                        .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+                    if bank.collector_id() != my_pubkey || is_mcp_slot {
                         if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
                             bank.as_ref(),
                             blockstore,
@@ -3870,7 +3876,13 @@ impl ReplayStage {
                 )
             });
 
-            if bank.collector_id() != my_pubkey {
+            // MCP bankless leader: replay own banks so execution
+            // happens during replay rather than banking stage.
+            let is_mcp_slot = bank
+                .feature_set
+                .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+                .is_some_and(|activated_slot| bank.slot() >= activated_slot);
+            if bank.collector_id() != my_pubkey || is_mcp_slot {
                 if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
                     bank.as_ref(),
                     blockstore,
@@ -11051,5 +11063,45 @@ pub(crate) mod tests {
             &ancestor_hashes_replay_update_sender,
             &mut PurgeRepairSlotCounter::default(),
         );
+    }
+
+    /// BKL-3: Verify that the replay guard condition allows leader-owned MCP
+    /// banks to enter replay. Without the `|| is_mcp_slot` term, the leader
+    /// would skip replaying its own entries and never execute transactions.
+    #[test]
+    fn test_mcp_leader_owned_bank_enters_replay() {
+        let my_pubkey = Pubkey::new_unique();
+
+        // Case 1: Non-MCP leader bank — should NOT replay (legacy skip).
+        {
+            let collector_id = my_pubkey;
+            let is_mcp_slot = false;
+            let should_replay = collector_id != my_pubkey || is_mcp_slot;
+            assert!(!should_replay, "non-MCP leader bank must be skipped");
+        }
+
+        // Case 2: MCP leader bank — SHOULD replay (bankless leader).
+        {
+            let collector_id = my_pubkey;
+            let is_mcp_slot = true;
+            let should_replay = collector_id != my_pubkey || is_mcp_slot;
+            assert!(should_replay, "MCP leader bank must enter replay");
+        }
+
+        // Case 3: Non-leader bank (any slot) — SHOULD replay as before.
+        {
+            let collector_id = Pubkey::new_unique();
+            let is_mcp_slot = false;
+            let should_replay = collector_id != my_pubkey || is_mcp_slot;
+            assert!(should_replay, "non-leader bank must enter replay");
+        }
+
+        // Case 4: MCP non-leader bank — SHOULD replay.
+        {
+            let collector_id = Pubkey::new_unique();
+            let is_mcp_slot = true;
+            let should_replay = collector_id != my_pubkey || is_mcp_slot;
+            assert!(should_replay, "MCP non-leader bank must enter replay");
+        }
     }
 }

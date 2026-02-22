@@ -452,15 +452,17 @@ fn record_with_optional_bankless(
             .record(slot, mixins, transaction_batches)
             .map(|_| ())
     } else {
-        poh_recorder
-            .record_bankless(
-                // `has_bank() == false` means this slot is using the bankless path.
-                true,
-                slot,
-                mixins,
-                transaction_batches,
-            )
-            .map(|_| ())
+        // BKL-1: record_bankless returns entries that are NOT forwarded to
+        // working_bank_sender and would be silently dropped. Until this
+        // path is plumbed into the broadcast pipeline, reject recording
+        // without a working bank so entries are never lost.
+        error!(
+            "record_with_optional_bankless: no working bank for slot {}, \
+             rejecting {} transaction batches to avoid silent entry loss",
+            slot,
+            transaction_batches.len(),
+        );
+        Err(PohRecorderError::MaxHeightReached)
     }
 }
 

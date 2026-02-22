@@ -838,6 +838,8 @@ mod tests {
         if !relax_intrabatch_account_locks {
             bank.deactivate_feature(&agave_feature_set::relax_intrabatch_account_locks::id());
         }
+        // Deactivate MCP so tests exercise the legacy execution path.
+        bank.deactivate_feature(&agave_feature_set::mcp_protocol_v1::id());
         let bank = Arc::new(bank);
 
         let (record_sender, record_receiver) = record_channels(false);

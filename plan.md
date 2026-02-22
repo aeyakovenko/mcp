@@ -752,6 +752,42 @@ Reconstruction-to-execution bridge:
 
 ---
 
+## Bankless Leader (Spec §9)
+
+The leader and proposers MUST produce and broadcast shreds without a fully
+executing bank for the slot.  Execution is deferred to replay after consensus.
+
+### Banking Stage — `consumer.rs`
+
+`execute_and_commit_transactions_locked` checks `mcp_protocol_v1` activation.
+When active, a bankless branch (`record_transactions_bankless`) takes over:
+
+1. Collects all successfully-locked transactions from the batch.
+2. Acquires `bank.freeze_lock()`.
+3. Records validated transactions to PoH via `TransactionRecorder::record_transactions`.
+4. Returns synthetic `CommitTransactionDetails::Committed { compute_units: 0, … }`
+   for each locked transaction — no `load_and_execute_transactions`, no
+   `committer.commit_transactions`.
+
+QoS actual execution units are updated to zero for bankless-recorded
+transactions.
+
+### Replay Stage — `replay_stage.rs`
+
+Two guards (`replay_active_banks_concurrently` and `replay_active_bank`) that
+previously skipped the leader's own banks (`bank.collector_id() != my_pubkey`)
+now also enter replay when the slot is MCP-active:
+
+```
+if bank.collector_id() != my_pubkey || is_mcp_slot { … replay … }
+```
+
+This ensures the leader's entries are executed during replay with proper
+MCP two-pass fee semantics (`should_use_mcp_two_pass_fees` in
+`blockstore_processor.rs`).
+
+---
+
 ## Modified Files (expected)
 
 New files:
