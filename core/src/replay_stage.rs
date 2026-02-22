@@ -11065,43 +11065,94 @@ pub(crate) mod tests {
         );
     }
 
-    /// BKL-3: Verify that the replay guard condition allows leader-owned MCP
-    /// banks to enter replay. Without the `|| is_mcp_slot` term, the leader
-    /// would skip replaying its own entries and never execute transactions.
+    /// RBK-2: Verify that `replay_blockstore_into_bank` succeeds for a
+    /// leader-owned MCP bank. This exercises the real replay function (not
+    /// just the guard boolean) to catch regressions in the replay path.
     #[test]
-    fn test_mcp_leader_owned_bank_enters_replay() {
-        let my_pubkey = Pubkey::new_unique();
+    fn test_mcp_leader_owned_bank_replays_via_blockstore() {
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
 
-        // Case 1: Non-MCP leader bank — should NOT replay (legacy skip).
-        {
-            let collector_id = my_pubkey;
-            let is_mcp_slot = false;
-            let should_replay = collector_id != my_pubkey || is_mcp_slot;
-            assert!(!should_replay, "non-MCP leader bank must be skipped");
-        }
+        let ReplayBlockstoreComponents {
+            blockstore,
+            vote_simulator,
+            my_pubkey,
+            ..
+        } = replay_blockstore_components(Some(tr(0)), 1, None);
+        let VoteSimulator {
+            mut progress,
+            bank_forks,
+            ..
+        } = vote_simulator;
 
-        // Case 2: MCP leader bank — SHOULD replay (bankless leader).
-        {
-            let collector_id = my_pubkey;
-            let is_mcp_slot = true;
-            let should_replay = collector_id != my_pubkey || is_mcp_slot;
-            assert!(should_replay, "MCP leader bank must enter replay");
-        }
+        let bank0 = bank_forks.read().unwrap().get(0).unwrap();
+        assert!(bank0.is_frozen());
 
-        // Case 3: Non-leader bank (any slot) — SHOULD replay as before.
-        {
-            let collector_id = Pubkey::new_unique();
-            let is_mcp_slot = false;
-            let should_replay = collector_id != my_pubkey || is_mcp_slot;
-            assert!(should_replay, "non-leader bank must enter replay");
-        }
+        // Create bank1 with collector_id = my_pubkey (leader's own bank).
+        let bank1 = Bank::new_from_parent(bank0.clone(), &my_pubkey, 1);
+        assert_eq!(bank1.collector_id(), &my_pubkey);
+        bank_forks.write().unwrap().insert(bank1);
+        let bank1 = bank_forks.read().unwrap().get_with_scheduler(1).unwrap();
 
-        // Case 4: MCP non-leader bank — SHOULD replay.
-        {
-            let collector_id = Pubkey::new_unique();
-            let is_mcp_slot = true;
-            let should_replay = collector_id != my_pubkey || is_mcp_slot;
-            assert!(should_replay, "MCP non-leader bank must enter replay");
-        }
+        // Verify MCP is active (all features enabled in test banks).
+        let is_mcp_slot = bank1
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+            .is_some_and(|activated_slot| bank1.slot() >= activated_slot);
+        assert!(is_mcp_slot, "MCP must be active for this test");
+
+        // Guard condition: leader-owned MCP bank should enter replay.
+        assert!(
+            bank1.collector_id() != &my_pubkey || is_mcp_slot,
+            "guard must allow leader-owned MCP bank into replay"
+        );
+
+        // Fill blockstore with tick entries for slot 1, matching the
+        // bank's hashes_per_tick so verify_tick_hash_count passes.
+        let hashes_per_tick = bank1.hashes_per_tick().unwrap_or(0);
+        let ticks_per_slot = bank1.ticks_per_slot();
+        let entries = solana_entry::entry::create_ticks(
+            ticks_per_slot,
+            hashes_per_tick,
+            bank0.last_blockhash(),
+        );
+        let shreds = entries_to_test_shreds(
+            &entries,
+            1,    // slot
+            0,    // parent_slot
+            true, // is_full_slot
+            0,    // version
+        );
+        blockstore.insert_shreds(shreds, None, false).unwrap();
+
+        let bank1_progress = progress
+            .entry(bank1.slot())
+            .or_insert_with(|| ForkProgress::new(bank1.last_blockhash(), None, None, 0, 0));
+
+        let replay_tx_thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|i| format!("solReplayTest{i:02}"))
+            .build()
+            .expect("new rayon threadpool");
+
+        // Call the real replay function on a leader-owned MCP bank.
+        let res = ReplayStage::replay_blockstore_into_bank(
+            &bank1,
+            &blockstore,
+            &replay_tx_thread_pool,
+            &bank1_progress.replay_stats,
+            &bank1_progress.replay_progress,
+            None,
+            None,
+            &replay_vote_sender,
+            &VerifyRecyclers::default(),
+            None,
+            &PrioritizationFeeCache::new(0u64),
+            &MigrationStatus::default(),
+        );
+
+        assert!(
+            res.is_ok(),
+            "replay_blockstore_into_bank must succeed for leader-owned MCP bank: {res:?}"
+        );
     }
 }
