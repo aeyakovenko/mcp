@@ -145,6 +145,10 @@ pub struct WorkingBank {
     pub start: Arc<SystemTime>,
     pub min_tick_height: u64,
     pub max_tick_height: u64,
+    /// MCP bankless mode: PoH must NOT modify the bank's tick_height
+    /// (skip `register_tick`) because replay will process the entries
+    /// and register ticks on the bank later.
+    pub bankless: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -595,6 +599,14 @@ impl PohRecorder {
     }
 
     pub fn set_bank(&mut self, bank: BankWithScheduler) {
+        self.set_bank_inner(bank, false);
+    }
+
+    pub fn set_bank_bankless(&mut self, bank: BankWithScheduler) {
+        self.set_bank_inner(bank, true);
+    }
+
+    fn set_bank_inner(&mut self, bank: BankWithScheduler, bankless: bool) {
         assert!(self.working_bank.is_none());
 
         let working_bank = WorkingBank {
@@ -602,6 +614,7 @@ impl PohRecorder {
             max_tick_height: bank.max_tick_height(),
             bank,
             start: Arc::new(SystemTime::now()),
+            bankless,
         };
         trace!("new working bank");
         assert_eq!(working_bank.bank.ticks_per_slot(), self.ticks_per_slot());
@@ -775,11 +788,17 @@ impl PohRecorder {
             .working_bank
             .as_ref()
             .ok_or(PohRecorderError::MaxHeightReached)?;
-        if self.tick_height() < working_bank.min_tick_height {
-            return Err(PohRecorderError::MinHeightNotReached);
-        }
-        if tick && self.tick_height() == working_bank.min_tick_height {
-            return Err(PohRecorderError::MinHeightNotReached);
+
+        // Bankless banks (MCP) skip the min-tick-height gate because
+        // set_alpenglow_ticks advances the bank's tick_height ahead of
+        // the PoH recorder's tick_height.
+        if !working_bank.bankless {
+            if self.tick_height() < working_bank.min_tick_height {
+                return Err(PohRecorderError::MinHeightNotReached);
+            }
+            if tick && self.tick_height() == working_bank.min_tick_height {
+                return Err(PohRecorderError::MinHeightNotReached);
+            }
         }
 
         let entry_count = self
@@ -799,16 +818,38 @@ impl PohRecorder {
             );
 
             for (entry, tick_height) in &self.tick_cache[..entry_count] {
-                working_bank.bank.register_tick(&entry.hash);
+                // Bankless banks: do NOT register ticks on the bank.
+                // Replay will process entries and register ticks later.
+                if !working_bank.bankless {
+                    working_bank.bank.register_tick(&entry.hash);
+                }
 
                 if let Some(footer) = footer.as_ref() {
-                    match self.wait_for_freeze_and_send_footer(footer, working_bank) {
-                        Ok(()) => {}        // Continue processing
-                        Err(None) => break, // Timeout - break without updating send_result
-                        Err(Some(e)) => {
-                            // Send failed - update send_result and break
-                            send_result = Err(e);
+                    if working_bank.bankless {
+                        // Bankless: send footer immediately with default hash.
+                        // The real bank_hash is computed by replay after freeze.
+                        let mut footer = footer.clone();
+                        footer.bank_hash = Hash::default();
+                        let footer_marker = VersionedBlockMarker::new_block_footer(footer);
+                        let footer_entry_marker = (
+                            EntryMarker::Marker(footer_marker),
+                            working_bank.max_tick_height - 1,
+                        );
+                        send_result = self
+                            .working_bank_sender
+                            .send((working_bank.bank.clone(), footer_entry_marker));
+                        if send_result.is_err() {
                             break;
+                        }
+                    } else {
+                        match self.wait_for_freeze_and_send_footer(footer, working_bank) {
+                            Ok(()) => {}        // Continue processing
+                            Err(None) => break, // Timeout - break without updating send_result
+                            Err(Some(e)) => {
+                                // Send failed - update send_result and break
+                                send_result = Err(e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1172,6 +1213,10 @@ impl PohRecorder {
                 measure_us!(self.flush_cache(true, Some(footer)));
             self.metrics.flush_cache_tick_us += flush_cache_and_tick_us;
         }
+    }
+
+    pub fn is_alpenglow_enabled(&self) -> bool {
+        self.alpenglow_enabled
     }
 
     pub fn enable_alpenglow(&mut self) {

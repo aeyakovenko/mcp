@@ -870,8 +870,16 @@ fn maybe_start_leader(
 }
 
 /// Creates and inserts the leader bank `slot` of this window with
-/// parent `parent_bank`
-fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut LeaderContext) {
+/// parent `parent_bank`.
+///
+/// For MCP slots, the bank is set in bankless mode: PoH will NOT
+/// register ticks on the bank — replay handles tick registration,
+/// execution, and freezing.
+fn create_and_insert_leader_bank(
+    slot: Slot,
+    parent_bank: Arc<Bank>,
+    ctx: &mut LeaderContext,
+) {
     let parent_slot = parent_bank.slot();
     let root_slot = ctx.bank_forks.read().unwrap().root();
     trace!(
@@ -913,9 +921,18 @@ fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut L
         &parent_bank.hash(),
     );
 
-    // Insert the bank
     let tpu_bank = ctx.bank_forks.write().unwrap().insert(tpu_bank);
-    ctx.poh_recorder.write().unwrap().set_bank(tpu_bank);
+    {
+        let mut poh = ctx.poh_recorder.write().unwrap();
+        if poh.is_alpenglow_enabled() {
+            // Bankless mode: PoH is in low-power mode (no regular ticks).
+            // Only the alpentick will advance the slot. Replay processes
+            // the entries and calls register_tick.
+            poh.set_bank_bankless(tpu_bank);
+        } else {
+            poh.set_bank(tpu_bank);
+        }
+    }
 
     // If this is the first alpenglow block, emit the genesis certificate marker
     maybe_include_genesis_certificate(parent_slot, ctx);

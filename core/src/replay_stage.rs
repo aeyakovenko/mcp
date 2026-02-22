@@ -3863,11 +3863,11 @@ impl ReplayStage {
 
                     // MCP bankless leader: replay own banks so execution
                     // happens during replay rather than banking stage.
-                    let is_mcp_slot = bank
-                        .feature_set
-                        .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-                        .is_some_and(|activated_slot| bank.slot() >= activated_slot);
-                    if bank.collector_id() != my_pubkey || is_mcp_slot {
+                    // Only replay the leader's own bank when alpenglow is
+                    // fully enabled (bankless PoH), not during migration.
+                    let is_bankless_slot =
+                        migration_status.should_have_alpenglow_ticks(bank.slot());
+                    if bank.collector_id() != my_pubkey || is_bankless_slot {
                         if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
                             bank.as_ref(),
                             blockstore,
@@ -3980,11 +3980,11 @@ impl ReplayStage {
 
             // MCP bankless leader: replay own banks so execution
             // happens during replay rather than banking stage.
-            let is_mcp_slot = bank
-                .feature_set
-                .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-                .is_some_and(|activated_slot| bank.slot() >= activated_slot);
-            if bank.collector_id() != my_pubkey || is_mcp_slot {
+            // Only replay the leader's own bank when alpenglow is
+            // fully enabled (bankless PoH), not during migration.
+            let is_bankless_slot =
+                migration_status.should_have_alpenglow_ticks(bank.slot());
+            if bank.collector_id() != my_pubkey || is_bankless_slot {
                 if !Self::maybe_prepare_mcp_execution_output_for_replay_slot(
                     bank.as_ref(),
                     blockstore,
@@ -11408,9 +11408,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// RBK-2: Verify that `replay_blockstore_into_bank` succeeds for a
-    /// leader-owned MCP bank. This exercises the real replay function (not
-    /// just the guard boolean) to catch regressions in the replay path.
+    /// RBK-2: Verify that the replay guard allows leader-owned bankless banks
+    /// into replay, and that `replay_blockstore_into_bank` succeeds for a
+    /// leader-owned bank. The full MCP replay path (with block components) is
+    /// covered by the integration test `test_local_cluster_mcp_produces_blockstore_artifacts`.
     #[test]
     fn test_mcp_leader_owned_bank_replays_via_blockstore() {
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
@@ -11436,21 +11437,23 @@ pub(crate) mod tests {
         bank_forks.write().unwrap().insert(bank1);
         let bank1 = bank_forks.read().unwrap().get_with_scheduler(1).unwrap();
 
-        // Verify MCP is active (all features enabled in test banks).
-        let is_mcp_slot = bank1
-            .feature_set
-            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
-            .is_some_and(|activated_slot| bank1.slot() >= activated_slot);
-        assert!(is_mcp_slot, "MCP must be active for this test");
-
-        // Guard condition: leader-owned MCP bank should enter replay.
+        // Verify the guard logic: when alpenglow is fully enabled (bankless
+        // mode), leader-owned banks must enter replay so that execution
+        // happens during replay rather than banking stage.
+        // Guard: `bank.collector_id() != my_pubkey || is_bankless_slot`
+        // For leader-owned banks (collector_id == my_pubkey), is_bankless_slot
+        // must be true to allow replay.
+        let post_migration = MigrationStatus::post_migration_status();
+        let is_bankless_slot = post_migration.should_have_alpenglow_ticks(bank1.slot());
+        assert!(is_bankless_slot, "alpenglow ticks must be active");
         assert!(
-            bank1.collector_id() != &my_pubkey || is_mcp_slot,
-            "guard must allow leader-owned MCP bank into replay"
+            bank1.collector_id() != &my_pubkey || is_bankless_slot,
+            "guard must allow leader-owned bankless bank into replay"
         );
 
-        // Fill blockstore with tick entries for slot 1, matching the
-        // bank's hashes_per_tick so verify_tick_hash_count passes.
+        // Exercise the real replay function on a leader-owned bank.
+        // Use default (pre-migration) status for the replay call since our
+        // test entries are standard ticks without MCP block components.
         let hashes_per_tick = bank1.hashes_per_tick().unwrap_or(0);
         let ticks_per_slot = bank1.ticks_per_slot();
         let entries = solana_entry::entry::create_ticks(
@@ -11477,7 +11480,6 @@ pub(crate) mod tests {
             .build()
             .expect("new rayon threadpool");
 
-        // Call the real replay function on a leader-owned MCP bank.
         let res = ReplayStage::replay_blockstore_into_bank(
             &bank1,
             &blockstore,
@@ -11495,7 +11497,7 @@ pub(crate) mod tests {
 
         assert!(
             res.is_ok(),
-            "replay_blockstore_into_bank must succeed for leader-owned MCP bank: {res:?}"
+            "replay_blockstore_into_bank must succeed for leader-owned bank: {res:?}"
         );
     }
 }
