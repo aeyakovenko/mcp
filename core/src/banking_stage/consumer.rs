@@ -598,7 +598,7 @@ impl Consumer {
         drop(freeze_lock);
 
         // Synthetic commit statuses: all locked txs are "committed" with zero
-        // compute units. QoS costs revert to estimated values.
+        // compute units. QoS actual execution units are updated to zero.
         let commit_transaction_statuses: Vec<CommitTransactionDetails> = lock_results
             .iter()
             .map(|lock_result| match lock_result {

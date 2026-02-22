@@ -17,7 +17,8 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Per-slot `VoteGateInput` is populated from ingested `ConsensusBlock` state and refreshed in replay before MCP vote-gate evaluation.
   - Wiring points: `core/src/window_service.rs`, `core/src/mcp_replay.rs`, `core/src/replay_stage.rs`.
 - Bankless recording caller wiring: `RESOLVED`
-  - `PohRecorder::record_bankless` is called from production block recording when no working bank is installed.
+  - Production block recording is fail-fast when no working bank is installed, to prevent silent entry loss from unforwarded bankless PoH entries.
+  - `PohRecorder::record_bankless` remains a guarded helper API; it is not used by production block recording yet.
   - Wiring point: `core/src/block_creation_loop.rs`.
 - Deterministic pending-slot retry + delayed bankhash sourcing: `RESOLVED`
   - Leader finalization keeps retrying pending slots when prerequisites are temporarily unavailable (especially delayed bankhash).
@@ -524,7 +525,8 @@ and verify before processing.
 ### 5.2 Bankless recording guardrails
 
 - Bankless recording guardrails:
-  - record path is explicit opt-in from replay-stage call sites
+  - production record path rejects missing working-bank state (fail-fast, no silent drop)
+  - `record_bankless` helper path is explicit opt-in for guarded/test call sites only
   - reject if a working bank is installed
   - reject slot-mismatch vs PoH recorder start slot
   - reject malformed inputs (`mixins.len() != transaction_batches.len()` or any empty transaction batch)
@@ -785,6 +787,16 @@ if bank.collector_id() != my_pubkey || is_mcp_slot { … replay … }
 This ensures the leader's entries are executed during replay with proper
 MCP two-pass fee semantics (`should_use_mcp_two_pass_fees` in
 `blockstore_processor.rs`).
+
+### `PohRecorder::record_bankless` — deferred helper
+
+`record_bankless` (`poh/src/poh_recorder.rs`) remains a guarded helper API
+used only in tests. Production recording uses `record()` via
+`TransactionRecorder::record_transactions`, which requires a working bank
+and emits entries to `working_bank_sender` for broadcast. The
+`block_creation_loop.rs` `record_with_optional_bankless` function returns a
+fail-fast error when no working bank is installed, preventing silent entry
+loss. Full entry-forwarding plumbing for `record_bankless` is deferred.
 
 ---
 
