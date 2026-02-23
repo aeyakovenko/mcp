@@ -120,10 +120,14 @@ fn first_err(results: &[Result<()>]) -> Result<()> {
 fn do_get_first_error<T, Tx: SVMTransaction>(
     batch: &TransactionBatch<Tx>,
     results: &[Result<T>],
+    mut should_ignore: impl FnMut(&TransactionError) -> bool,
 ) -> Option<(Result<()>, Signature)> {
     let mut first_err = None;
     for (result, transaction) in results.iter().zip(batch.sanitized_transactions()) {
         if let Err(err) = result {
+            if should_ignore(err) {
+                continue;
+            }
             if first_err.is_none() {
                 first_err = Some((Err(err.clone()), *transaction.signature()));
             }
@@ -141,13 +145,16 @@ fn do_get_first_error<T, Tx: SVMTransaction>(
     first_err
 }
 
-fn get_first_error<T, Tx: SVMTransaction>(
+fn get_first_error_for_block_verification<T, Tx: SVMTransaction>(
     batch: &TransactionBatch<Tx>,
     commit_results: &[Result<T>],
+    allow_already_processed: bool,
 ) -> Result<()> {
-    do_get_first_error(batch, commit_results)
-        .map(|(error, _signature)| error)
-        .unwrap_or(Ok(()))
+    do_get_first_error(batch, commit_results, |err| {
+        allow_already_processed && matches!(err, TransactionError::AlreadyProcessed)
+    })
+    .map(|(error, _signature)| error)
+    .unwrap_or(Ok(()))
 }
 
 fn create_thread_pool(num_threads: usize) -> ThreadPool {
@@ -182,12 +189,17 @@ pub fn execute_batch<'a>(
     let block_verification = extra_pre_commit_callback.is_none();
     let record_transaction_meta = transaction_status_sender.is_some();
     let mut transaction_indexes = Cow::from(transaction_indexes);
+    let mcp_two_pass_fees = should_use_mcp_two_pass_fees(block_verification, bank);
 
     let pre_commit_callback = |_timings: &mut _, processing_results: &_| -> PreCommitResult {
         match extra_pre_commit_callback {
             None => {
                 // We're entering into one of the block-verification methods.
-                get_first_error(batch, processing_results)?;
+                get_first_error_for_block_verification(
+                    batch,
+                    processing_results,
+                    mcp_two_pass_fees,
+                )?;
                 Ok(None)
             }
             Some(extra_pre_commit_callback) => {
@@ -230,8 +242,6 @@ pub fn execute_batch<'a>(
             }
         }
     };
-
-    let mcp_two_pass_fees = should_use_mcp_two_pass_fees(block_verification, bank);
     let (commit_results, balance_collector) = if mcp_two_pass_fees {
         let mut fee_error_counters = TransactionErrorMetrics::default();
         let fee_collection_results = bank.collect_fees_only_for_transactions(
@@ -3634,6 +3644,38 @@ pub mod tests {
     }
 
     #[test]
+    fn test_get_first_error_for_block_verification_allows_mcp_already_processed() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config(10_000);
+        let (bank, _bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        ));
+        let mut batch = TransactionBatch::new(
+            vec![Ok(())],
+            &bank,
+            OwnedOrBorrowed::Borrowed(slice::from_ref(&tx)),
+        );
+        batch.set_needs_unlock(false);
+
+        let commit_results: Vec<Result<()>> = vec![Err(TransactionError::AlreadyProcessed)];
+        assert_eq!(
+            get_first_error_for_block_verification(&batch, &commit_results, true),
+            Ok(())
+        );
+        assert_eq!(
+            get_first_error_for_block_verification(&batch, &commit_results, false),
+            Err(TransactionError::AlreadyProcessed)
+        );
+    }
+
+    #[test]
     fn test_process_empty_entry_is_registered() {
         agave_logger::setup();
 
@@ -5049,7 +5091,7 @@ pub mod tests {
             &mut ExecuteTimings::default(),
             None,
         );
-        let (err, signature) = do_get_first_error(&batch, &commit_results).unwrap();
+        let (err, signature) = do_get_first_error(&batch, &commit_results, |_| false).unwrap();
         assert_eq!(err.unwrap_err(), TransactionError::AccountNotFound);
         assert_eq!(signature, account_not_found_sig);
     }
@@ -5878,6 +5920,78 @@ pub mod tests {
             two_occurrence_fee,
             one_occurrence_fee.saturating_mul(2),
             "MCP two-pass fee path must charge once per transaction occurrence",
+        );
+    }
+
+    #[test]
+    fn test_execute_batch_mcp_two_pass_allows_already_processed_and_charges_again() {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(100_000, &dummy_leader_pubkey, 100);
+        genesis_config.fee_rate_governor.lamports_per_signature = 5_000;
+        genesis_config
+            .fee_rate_governor
+            .target_lamports_per_signature = 5_000;
+
+        let run_case = |tx_count: usize| -> (Result<()>, u64) {
+            let mut bank = Bank::new_for_tests(&genesis_config);
+            bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+            bank.activate_feature(&feature_set::relax_intrabatch_account_locks::id());
+            let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
+            let bank = Arc::new(bank);
+
+            let payer = mint_keypair.pubkey();
+            let before_balance = bank.get_balance(&payer);
+            let recipient = Pubkey::new_unique();
+            let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+                &mint_keypair,
+                &recipient,
+                0,
+                bank.last_blockhash(),
+            ));
+            let txs = (0..tx_count).map(|_| tx.clone()).collect::<Vec<_>>();
+
+            let mut batch = TransactionBatch::new(
+                vec![Ok(()); txs.len()],
+                &bank,
+                OwnedOrBorrowed::Borrowed(&txs),
+            );
+            batch.set_needs_unlock(false);
+            let batch = TransactionBatchWithIndexes {
+                batch,
+                transaction_indexes: vec![],
+            };
+
+            let prioritization_fee_cache = PrioritizationFeeCache::default();
+            let mut timing = ExecuteTimings::default();
+            let result = execute_batch(
+                &batch,
+                &bank,
+                None,
+                None,
+                &mut timing,
+                None,
+                &prioritization_fee_cache,
+                None::<fn(&Result<ProcessedTransaction>) -> Result<Option<usize>>>,
+            );
+            let charged = before_balance.saturating_sub(bank.get_balance(&payer));
+            (result, charged)
+        };
+
+        let (single_result, one_occurrence_fee) = run_case(1);
+        assert_eq!(single_result, Ok(()));
+        assert!(one_occurrence_fee > 0);
+
+        // Same message/signature repeated: second occurrence becomes AlreadyProcessed in phase-B.
+        let (duplicate_result, duplicate_fee) = run_case(2);
+        assert_eq!(duplicate_result, Ok(()));
+        assert_eq!(
+            duplicate_fee,
+            one_occurrence_fee.saturating_mul(2),
+            "duplicate signature occurrences must still charge per occurrence in MCP two-pass",
         );
     }
 
