@@ -468,7 +468,11 @@ mod tests {
         invalid_shreds[0][0] ^= 1;
 
         let mut state = McpReconstructionState::new(31, 2, payload.len(), root).unwrap();
-        for (i, shred) in invalid_shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS) {
+        for (i, shred) in invalid_shreds
+            .iter()
+            .enumerate()
+            .take(MCP_RECON_DATA_SHREDS)
+        {
             state.insert_shard(i, *shred).unwrap();
         }
 
@@ -484,7 +488,12 @@ mod tests {
         // First insert after poisoning clears stale shards and restarts accumulation.
         state.insert_shard(0, valid_shreds[0]).unwrap();
         assert_eq!(state.present_shards(), 1);
-        for (i, shred) in valid_shreds.iter().enumerate().take(MCP_RECON_DATA_SHREDS).skip(1) {
+        for (i, shred) in valid_shreds
+            .iter()
+            .enumerate()
+            .take(MCP_RECON_DATA_SHREDS)
+            .skip(1)
+        {
             state.insert_shard(i, *shred).unwrap();
         }
         assert_eq!(

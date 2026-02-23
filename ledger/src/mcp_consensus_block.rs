@@ -449,10 +449,7 @@ pub fn fragment_consensus_block(slot: Slot, consensus_wire_bytes: &[u8]) -> Vec<
     let total = total_fragments as u16;
 
     let mut fragments = Vec::with_capacity(total_fragments);
-    for (frag_idx, chunk) in consensus_wire_bytes
-        .chunks(MAX_FRAGMENT_DATA)
-        .enumerate()
-    {
+    for (frag_idx, chunk) in consensus_wire_bytes.chunks(MAX_FRAGMENT_DATA).enumerate() {
         let mut buf = Vec::with_capacity(FRAGMENT_OVERHEAD + chunk.len());
         buf.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT);
         buf.extend_from_slice(&slot.to_le_bytes());
@@ -866,20 +863,15 @@ mod tests {
             ConsensusBlockError::InvalidConsensusMeta(_)
         ));
     }
-    
+
     // ── Fragment tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_fragment_roundtrip() {
         let leader = Keypair::new();
-        let mut block = ConsensusBlock::new_unsigned(
-            42,
-            5,
-            vec![1u8; 5000],
-            vec![2u8; 32],
-            Hash::new_unique(),
-        )
-        .unwrap();
+        let mut block =
+            ConsensusBlock::new_unsigned(42, 5, vec![1u8; 5000], vec![2u8; 32], Hash::new_unique())
+                .unwrap();
         block.sign_leader(&leader).unwrap();
         let wire_bytes = block.to_wire_bytes().unwrap();
 
@@ -1083,7 +1075,11 @@ mod tests {
 
         // Third distinct cb_hash for the same slot must be silently dropped.
         assert!(collector.ingest(&frag3).is_none());
-        assert_eq!(collector.pending.len(), 2, "third hash should not create a new entry");
+        assert_eq!(
+            collector.pending.len(),
+            2,
+            "third hash should not create a new entry"
+        );
 
         // A fragment for a different slot is unaffected by the per-slot cap.
         let frag_other = make_fragment(slot + 1, 0, 2, [0xCCu8; 32]);

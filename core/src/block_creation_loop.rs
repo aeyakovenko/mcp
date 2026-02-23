@@ -875,11 +875,7 @@ fn maybe_start_leader(
 /// For MCP slots, the bank is set in bankless mode: PoH will NOT
 /// register ticks on the bank — replay handles tick registration,
 /// execution, and freezing.
-fn create_and_insert_leader_bank(
-    slot: Slot,
-    parent_bank: Arc<Bank>,
-    ctx: &mut LeaderContext,
-) {
+fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut LeaderContext) {
     let parent_slot = parent_bank.slot();
     let root_slot = ctx.bank_forks.read().unwrap().root();
     trace!(

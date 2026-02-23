@@ -61,7 +61,7 @@ use {
         leader_schedule::{FixedSchedule, IdentityKeyedLeaderSchedule},
         leader_schedule_utils::first_of_consecutive_leader_slots,
         mcp_aggregate_attestation::AggregateAttestation,
-        mcp_consensus_block::ConsensusBlock,
+        mcp_consensus_block::{ConsensusBlock, CONSENSUS_META_V1_WIRE_BYTES},
         mcp_reconstruction::{
             decode_reconstructed_payload, reconstruct_payload, MCP_RECON_MAX_PAYLOAD_BYTES,
             MCP_RECON_NUM_SHREDS, MCP_RECON_SHRED_BYTES,
@@ -7373,13 +7373,12 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     // Avoid activating at genesis so bootstrap voting can establish steady slot
     // progress before MCP vote-gate checks are enforced.
     let mcp_activation_slot = 8;
-    let mcp_feature_account =
-        solana_feature_gate_interface::create_account(
-            &solana_feature_gate_interface::Feature {
-                activated_at: Some(mcp_activation_slot),
-            },
-            mcp_feature_lamports,
-        );
+    let mcp_feature_account = solana_feature_gate_interface::create_account(
+        &solana_feature_gate_interface::Feature {
+            activated_at: Some(mcp_activation_slot),
+        },
+        mcp_feature_lamports,
+    );
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
     let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
@@ -7993,14 +7992,17 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         "observed consensus block failed leader signature verification at slot {}",
         consensus_slot
     );
+    let parsed_consensus_meta = consensus_block
+        .consensus_meta_parsed()
+        .expect("consensus_meta must decode as v1 in local-cluster MCP test");
     assert_eq!(
         consensus_block.consensus_meta.len(),
-        HASH_BYTES,
+        CONSENSUS_META_V1_WIRE_BYTES,
         "consensus_meta must be {} bytes at slot {}",
-        HASH_BYTES,
+        CONSENSUS_META_V1_WIRE_BYTES,
         consensus_slot
     );
-    let delayed_slot = consensus_slot.saturating_sub(1);
+    let delayed_slot = parsed_consensus_meta.delayed_slot();
     let delayed_bankhash = blockstores
         .iter()
         .find_map(|(pubkey, blockstore)| {
@@ -8083,8 +8085,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 .take(128)
                 .find_map(|slot| {
                     blockstores.iter().find_map(|(pubkey, blockstore)| {
-                        let encoded_output =
-                            blockstore.get_mcp_execution_output(slot).unwrap()?;
+                        let encoded_output = blockstore.get_mcp_execution_output(slot).unwrap()?;
                         let transactions =
                             decode_execution_output_wire_transactions(&encoded_output)?;
                         if transactions.is_empty() {

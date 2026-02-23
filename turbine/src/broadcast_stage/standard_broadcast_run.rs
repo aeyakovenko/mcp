@@ -107,7 +107,6 @@ const MCP_DISPATCH_STATE_SLOT_RETENTION: Slot = 512;
 const MCP_PAYLOAD_COUNT_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 const MCP_PAYLOAD_LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 
-
 impl Default for McpProposerDispatchState {
     fn default() -> Self {
         Self {

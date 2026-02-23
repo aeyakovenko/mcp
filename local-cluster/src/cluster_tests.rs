@@ -350,20 +350,27 @@ pub fn apply_votes_to_tower(node_keypair: &Keypair, votes: Vec<(Slot, Hash)>, to
     tower_storage.store(&saved_tower).unwrap();
 }
 
+fn new_rpc_client(contact_info: &ContactInfo) -> RpcClient {
+    RpcClient::new_with_timeout_and_commitment(
+        format!("http://{}", contact_info.rpc().unwrap()),
+        Duration::from_secs(2),
+        CommitmentConfig::processed(),
+    )
+}
+
 pub fn check_min_slot_is_rooted(
     min_slot: Slot,
     contact_infos: &[ContactInfo],
-    connection_cache: &Arc<ConnectionCache>,
+    _connection_cache: &Arc<ConnectionCache>,
     test_name: &str,
 ) {
     let mut last_print = Instant::now();
     let loop_start = Instant::now();
     let loop_timeout = Duration::from_secs(180);
     for ingress_node in contact_infos.iter() {
-        let client = new_tpu_quic_client(ingress_node, connection_cache.clone()).unwrap();
+        let client = new_rpc_client(ingress_node);
         loop {
             let root_slot = client
-                .rpc_client()
                 .get_slot_with_commitment(CommitmentConfig::finalized())
                 .unwrap_or(0);
             if root_slot >= min_slot || last_print.elapsed().as_secs() > 3 {
@@ -493,10 +500,45 @@ pub fn start_quic_streamer_to_listen_for_votes_and_certs(
     (cancel, quic_server_thread, receiver)
 }
 
+fn check_for_new_commitment_slots(
+    num_new_slots: usize,
+    contact_infos: &[ContactInfo],
+    _connection_cache: &Arc<ConnectionCache>,
+    test_name: &str,
+    commitment: CommitmentConfig,
+) {
+    let mut slots = vec![HashSet::new(); contact_infos.len()];
+    let mut done = false;
+    let mut last_print = Instant::now();
+    let loop_start = Instant::now();
+    let loop_timeout = Duration::from_secs(180);
+    let mut num_slots_map = HashMap::new();
+    while !done {
+        assert!(loop_start.elapsed() < loop_timeout);
+
+        for (i, ingress_node) in contact_infos.iter().enumerate() {
+            let client = new_rpc_client(ingress_node);
+            let root_slot = client.get_slot_with_commitment(commitment).unwrap_or(0);
+            slots[i].insert(root_slot);
+            num_slots_map.insert(*ingress_node.pubkey(), slots[i].len());
+            let num_slots = slots.iter().map(|r| r.len()).min().unwrap();
+            done = num_slots >= num_new_slots;
+            if done || last_print.elapsed().as_secs() > 3 {
+                info!(
+                    "{} waiting for {} new {:?} slots.. observed: {:?}",
+                    test_name, num_new_slots, commitment.commitment, num_slots_map
+                );
+                last_print = Instant::now();
+            }
+        }
+        sleep(Duration::from_millis(clock::DEFAULT_MS_PER_SLOT / 2));
+    }
+}
+
 pub fn check_no_new_roots(
     num_slots_to_wait: usize,
     contact_infos: &[&ContactInfo],
-    connection_cache: &Arc<ConnectionCache>,
+    _connection_cache: &Arc<ConnectionCache>,
     test_name: &str,
 ) {
     assert!(!contact_infos.is_empty());
@@ -505,14 +547,12 @@ pub fn check_no_new_roots(
         .iter()
         .enumerate()
         .map(|(i, ingress_node)| {
-            let client = new_tpu_quic_client(ingress_node, connection_cache.clone()).unwrap();
+            let client = new_rpc_client(ingress_node);
             let initial_root = client
-                .rpc_client()
                 .get_slot()
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", ingress_node.pubkey()));
             roots[i] = initial_root;
             client
-                .rpc_client()
                 .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", ingress_node.pubkey()))
         })
@@ -525,9 +565,8 @@ pub fn check_no_new_roots(
     let mut reached_end_slot = false;
     loop {
         for contact_info in contact_infos {
-            let client = new_tpu_quic_client(contact_info, connection_cache.clone()).unwrap();
+            let client = new_rpc_client(contact_info);
             current_slot = client
-                .rpc_client()
                 .get_slot_with_commitment(CommitmentConfig::processed())
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", contact_infos[0].pubkey()));
             if current_slot > end_slot {
@@ -551,10 +590,9 @@ pub fn check_no_new_roots(
     }
 
     for (i, ingress_node) in contact_infos.iter().enumerate() {
-        let client = new_tpu_quic_client(ingress_node, connection_cache.clone()).unwrap();
+        let client = new_rpc_client(ingress_node);
         assert_eq!(
             client
-                .rpc_client()
                 .get_slot()
                 .unwrap_or_else(|_| panic!("get_slot for {} failed", ingress_node.pubkey())),
             roots[i]

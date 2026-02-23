@@ -18,7 +18,7 @@ use {
     solana_keypair::Keypair,
     solana_ledger::{
         mcp_consensus_block::{
-            ConsensusBlock, MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT, FRAGMENT_OVERHEAD,
+            ConsensusBlock, FRAGMENT_OVERHEAD, MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT,
         },
         shred::{
             self,
@@ -445,7 +445,8 @@ fn is_active_mcp_shred_packet(
     }
     // Slot is at OFFSET_SLOT (byte 65) in the new wire format
     let slot_end = OFFSET_SLOT + std::mem::size_of::<Slot>();
-    let Ok(slot_bytes) = <[u8; std::mem::size_of::<Slot>()]>::try_from(&data[OFFSET_SLOT..slot_end])
+    let Ok(slot_bytes) =
+        <[u8; std::mem::size_of::<Slot>()]>::try_from(&data[OFFSET_SLOT..slot_end])
     else {
         return false;
     };

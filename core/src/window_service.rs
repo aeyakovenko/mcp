@@ -39,8 +39,8 @@ use {
             AggregateAttestation, AggregateProposerEntry, AggregateRelayEntry,
         },
         mcp_consensus_block::{
-            ConsensusMeta, ConsensusBlock, ConsensusBlockFragmentCollector,
-            MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT, fragment_consensus_block,
+            fragment_consensus_block, ConsensusBlock, ConsensusBlockFragmentCollector,
+            ConsensusMeta, MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT,
         },
         shred::{self, ReedSolomonCache, Shred},
     },
@@ -951,9 +951,7 @@ fn validate_and_store_consensus_block(
     if let Err(err) = consensus_block.consensus_meta_parsed() {
         debug!(
             "dropping MCP ConsensusBlock for slot {} from {} due to invalid consensus_meta: {}",
-            consensus_block.slot,
-            remote_address,
-            err,
+            consensus_block.slot, remote_address, err,
         );
         return None;
     }
@@ -962,8 +960,7 @@ fn validate_and_store_consensus_block(
         let root_slot = root_bank.slot();
         match consensus_blocks.write() {
             Ok(mut consensus_blocks) => {
-                let min_slot =
-                    root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
+                let min_slot = root_slot.saturating_sub(mcp::CONSENSUS_BLOCK_RETENTION_SLOTS);
                 consensus_blocks.retain(|slot, _| *slot >= min_slot);
                 if let Some(existing) = consensus_blocks.get(&consensus_block.slot) {
                     if existing != payload {
@@ -1462,7 +1459,7 @@ mod test {
             genesis_utils::{create_genesis_config, create_genesis_config_with_leader},
             get_tmp_ledger_path_auto_delete,
             mcp_aggregate_attestation::AggregateAttestation,
-            mcp_consensus_block::{ConsensusMeta, ConsensusBlock},
+            mcp_consensus_block::{ConsensusBlock, ConsensusMeta},
             shred::{ProcessShredsStats, Shredder},
         },
         solana_runtime::bank::Bank,

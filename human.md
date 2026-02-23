@@ -109,3 +109,34 @@ Answer to Q1: Canonical namespace for leader_index
    or remove it if leader_index validation is handled elsewhere.
 
 small nit: dispatch_relay_attestation_to_slot_leader should avoid sending attestations to itself when its the leader
+
+
+
+carl:
+
+another constraint while testing:
+
+⏺ There's a SendDatagramError::TooLarge error being tracked. QUIC datagrams are typically limited to around 1200-65535 bytes (MTU-dependent), but ConsensusBlocks can be up to ~400KB. Let
+  me check the QUIC configuration.
+                                                                                                                                                                                          
+                                                                                                                                                                                           
+⏺ This is a critical finding. QUIC datagrams cannot carry ConsensusBlock.
+
+  The math:                                                                                                                                                                                
+  - MTU = 1280 bytes
+  - QUIC datagram max payload ≈ 1200 bytes (MTU minus headers)                                                                                                                             
+  - ConsensusBlock typical size = 20KB - 400KB               
+
+  The problem: connection.send_datagram() will fail with SendDatagramError::TooLarge for any ConsensusBlock over ~1200 bytes. Since even a minimal ConsensusBlock with threshold
+  attestations is ~20KB, basically all ConsensusBlocks will fail to send.
+
+  The current code at turbine/src/quic_endpoint.rs:459 just returns an error when the datagram is too large, which silently drops the ConsensusBlock.
+
+  Options to fix this:
+
+  1. Use QUIC streams instead of datagrams - Reliable, handles fragmentation automatically, but adds latency overhead
+  2. Shred the ConsensusBlock - Send as MCP shreds through Turbine, leveraging existing FEC/reliability mechanisms. This aligns with the byte-64 discriminator design we're implementing.
+  3. Application-level fragmentation - Manually fragment ConsensusBlock into datagram-sized pieces and reassemble on receive. Complex and unreliable (datagrams can be lost).
+
+  Option 2 seems cleanest - ConsensusBlock would be shredded like proposer payloads, sent through Turbine with FEC protection, and the byte-64 discriminator (0x02) would identify the
+  reconstructed payload as a ConsensusBlock vs regular payload. This matches what the spec already suggests.
