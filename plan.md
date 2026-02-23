@@ -107,6 +107,11 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
   - Nodes MUST NOT proceed (leader finalization or validator voting) until delayed bankhash is locally available for the consensus-defined delayed slot.
   - No fallback hash value is permitted.
   - `delayed_slot` is carried explicitly in ConsensusMeta v1; replay reads it from the parsed consensus_meta rather than hardcoding `slot - 1`.
+- `B5` replay entry self-conflict handling (MCP-only):
+  - In `queue_batches_with_lock_retry`, if the second lock attempt fails for an entry in an MCP-active slot, replay skips only that entry and continues.
+  - This behavior is production-gated by slot-effective `mcp_protocol_v1`; legacy (non-MCP) replay behavior remains fail-slot.
+  - Determinism rule: skip is allowed only for lock-conflict classes (`AccountInUse`, `AlreadyProcessed`); all other errors remain slot-fatal.
+  - Emit explicit log/datapoint with slot + entry start index on each skip.
 
 ---
 
@@ -671,6 +676,11 @@ Staged rollout guard:
   - `ledger/src/blockstore_processor.rs::execute_batch` uses MCP two-pass path only when both are true:
     - block-verification execution path
     - `mcp_protocol_v1` is slot-effective active
+  - `ledger/src/blockstore_processor.rs::queue_batches_with_lock_retry` MCP behavior:
+    - only under `feature_set::mcp_protocol_v1::id()` slot-effective activation, second lock-retry failure on deterministic lock-conflict classes (`AccountInUse`, `AlreadyProcessed`) skips only the current entry and continues replay
+    - outside MCP activation, keep legacy fail-slot behavior
+    - non lock-conflict errors remain slot-fatal even when MCP is active
+  - deterministic fee policy remains unchanged: fees are still applied via MCP two-pass rules; skipping applies only to rejected self-conflicting entries that do not execute
   - Phase A calls `Bank::collect_fees_only_for_transactions`.
   - Phase B calls `Bank::load_execute_and_commit_transactions_skip_fee_collection_with_pre_commit_callback`.
 
@@ -746,6 +756,10 @@ Reconstruction-to-execution bridge:
   - cross-proposer cumulative payer accounting
   - nonce minimum-rent edge case
   - phase-B no re-deduction
+- MCP-gated deterministic entry-skip behavior:
+  - only under `feature_set::mcp_protocol_v1::id()`, second lock-retry failures on (`AccountInUse`, `AlreadyProcessed`) skip the entry and replay continues
+  - legacy path remains slot-fatal for same inputs
+  - multi-node test must assert all nodes land the same bankhash with this behavior enabled
 - issue-20 single-node integration:
   - strict timeout failure by default (no soft-pass env toggle)
   - use live validator blockstore handles during runtime
