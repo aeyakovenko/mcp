@@ -5949,7 +5949,14 @@ impl Bank {
     pub fn set_block_id(&self, block_id: Option<Hash>) {
         let mut block_id_w = self.block_id.write().unwrap();
         if block_id_w.is_some() {
-            debug_assert_eq!(*block_id_w, block_id);
+            // plan.md Pass 7 (authoritative block_id): conflicting assignments are
+            // invalid fork state and must never be silently ignored in release.
+            assert_eq!(
+                *block_id_w,
+                block_id,
+                "conflicting authoritative block_id for slot {}",
+                self.slot()
+            );
         } else {
             *block_id_w = block_id;
         }

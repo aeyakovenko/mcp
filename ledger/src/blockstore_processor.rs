@@ -1871,7 +1871,12 @@ fn maybe_override_replay_entries_with_mcp_execution_output(
     }
 
     let Some(encoded_output) = mcp_execution_output else {
-        return Ok((replay_entries, default_num_txs));
+        // plan.md Pass 7 (strict replay source): MCP-active slots must replay from
+        // persisted McpExecutionOutput and never fall back to legacy entry txs.
+        return Err(BlockstoreProcessorError::InvalidMcpExecutionOutput {
+            slot,
+            reason: "missing MCP execution output for MCP-active replay slot".to_string(),
+        });
     };
 
     let verification_mode = if skip_verification {
@@ -6369,6 +6374,49 @@ pub mod tests {
             EntryType::Transactions(transactions) => assert_eq!(transactions.len(), 2),
             EntryType::Tick(_) => panic!("expected transaction entry"),
         }
+    }
+
+    #[test]
+    fn test_maybe_override_replay_entries_with_mcp_execution_output_rejects_missing_output_when_active(
+    ) {
+        let dummy_leader_pubkey = solana_pubkey::new_rand();
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(60_000, &dummy_leader_pubkey, 100);
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank = Arc::new(bank);
+        let bank = BankWithScheduler::new_without_scheduler(bank);
+        let slot = bank.slot();
+
+        let tx = system_transaction::transfer(
+            &mint_keypair,
+            &Pubkey::new_unique(),
+            1,
+            bank.last_blockhash(),
+        );
+        let replay_entries = vec![ReplayEntry {
+            entry: EntryType::Transactions(vec![RuntimeTransaction::from_transaction_for_tests(
+                tx,
+            )]),
+            starting_index: 0,
+        }];
+
+        let result = maybe_override_replay_entries_with_mcp_execution_output(
+            slot,
+            &bank,
+            false,
+            None,
+            replay_entries,
+            1,
+        );
+        assert!(matches!(
+            result,
+            Err(BlockstoreProcessorError::InvalidMcpExecutionOutput { slot: err_slot, .. })
+                if err_slot == slot
+        ));
     }
 
     #[test]

@@ -3136,18 +3136,19 @@ impl ReplayStage {
                 .map(|slot| (slot, bank_forks.get(slot)))
                 .collect::<Vec<_>>()
         };
-        let start = pending_slot_banks
-            .len()
-            .saturating_sub(MCP_PENDING_PROCESS_PER_LOOP);
-        if start < pending_slot_banks.len() {
+        let total_pending = pending_slot_banks.len();
+        if total_pending > 0 {
             debug!(
-                "processing {} pending MCP consensus slots (heaviest={}, window={})",
-                pending_slot_banks.len(),
+                "processing pending MCP consensus slots oldest-first (total={}, heaviest={}, window={})",
+                total_pending,
                 heaviest_slot,
                 MCP_PENDING_PROCESS_PER_LOOP
             );
         }
-        for (slot, slot_bank) in pending_slot_banks.into_iter().skip(start) {
+        for (slot, slot_bank) in pending_slot_banks
+            .into_iter()
+            .take(MCP_PENDING_PROCESS_PER_LOOP)
+        {
             if blockstore
                 .get_mcp_execution_output(slot)
                 .ok()

@@ -903,7 +903,7 @@ where
 /// Returns the slot on success, or None if validation fails.
 fn validate_and_store_consensus_block(
     payload: &[u8],
-    sender_pubkey: Pubkey,
+    _sender_pubkey: Pubkey,
     remote_address: SocketAddr,
     bank_forks: &RwLock<BankForks>,
     leader_schedule_cache: &LeaderScheduleCache,
@@ -938,13 +938,8 @@ fn validate_and_store_consensus_block(
         );
         return None;
     }
-    if sender_pubkey != leader_pubkey {
-        debug!(
-            "dropping MCP ConsensusBlock for slot {} from {} (claimed {}, expected {})",
-            consensus_block.slot, remote_address, sender_pubkey, leader_pubkey
-        );
-        return None;
-    }
+    // plan.md Pass 4 (control-frame auth): consensus blocks are authenticated by
+    // the leader's in-payload signature, not by transport peer identity.
     if !consensus_block.verify_leader_signature(&leader_pubkey) {
         return None;
     }
@@ -1563,7 +1558,7 @@ mod test {
     }
 
     #[test]
-    fn test_ingest_mcp_consensus_block_rejects_wrong_sender() {
+    fn test_ingest_mcp_consensus_block_accepts_forwarded_sender_with_valid_signature() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Keypair::new();
@@ -1615,7 +1610,10 @@ mod test {
             &mut ConsensusBlockFragmentCollector::default(),
         );
 
-        assert!(consensus_blocks.read().unwrap().is_empty());
+        assert_eq!(
+            consensus_blocks.read().unwrap().get(&slot).cloned(),
+            Some(payload),
+        );
     }
 
     #[test]

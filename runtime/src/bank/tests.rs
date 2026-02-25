@@ -12657,6 +12657,15 @@ fn test_parent_block_id() {
 }
 
 #[test]
+#[should_panic(expected = "conflicting authoritative block_id")]
+fn test_set_block_id_rejects_conflicting_assignment() {
+    let (genesis_config, _mint_keypair) = create_genesis_config(100_000);
+    let bank = Bank::new_for_tests(&genesis_config);
+    bank.set_block_id(Some(Hash::new_unique()));
+    bank.set_block_id(Some(Hash::new_unique()));
+}
+
+#[test]
 fn test_get_top_epoch_stakes() {
     let num_of_nodes: u64 = 3000;
     let stakes = (1..num_of_nodes.checked_add(1).expect("Shouldn't be big")).collect::<Vec<_>>();

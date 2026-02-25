@@ -144,7 +144,7 @@ impl McpProposerDispatchState {
             transaction.base_fee.checked_mul(mcp::NUM_PROPOSERS as u64)
         else {
             inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
-            return true;
+            return false;
         };
         let current_reserved = self
             .payer_fee_reservations
@@ -153,11 +153,11 @@ impl McpProposerDispatchState {
             .unwrap_or_default();
         let Some(next_reserved) = current_reserved.checked_add(per_proposer_reservation) else {
             inc_new_counter_error!("mcp-proposer-dispatch-fee-reservation-overflow", 1, 1);
-            return true;
+            return false;
         };
         if bank.get_balance(&transaction.fee_payer) < next_reserved {
             inc_new_counter_error!("mcp-proposer-dispatch-insufficient-funds", 1, 1);
-            return true;
+            return false;
         }
 
         let Some(tx_wire_len) =
@@ -1352,7 +1352,7 @@ mod test {
 
         let mut state = McpSlotDispatchState::default();
         let rejected = make_payload_tx(16, 3, fee_payer, 1, 0);
-        assert!(state.try_push_transaction(0, bank.as_ref(), rejected));
+        assert!(!state.try_push_transaction(0, bank.as_ref(), rejected));
         assert!(state
             .proposer_states
             .get(&0)
