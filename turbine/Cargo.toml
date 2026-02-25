@@ -77,7 +77,9 @@ bencher = { workspace = true }
 bs58 = { workspace = true }
 conditional-mod = { workspace = true }
 solana-account = { workspace = true }
+solana-feature-gate-interface = { workspace = true }
 solana-genesis-config = { workspace = true }
+solana-rent = { workspace = true }
 solana-ledger = { workspace = true, features = ["agave-unstable-api","dev-context-only-utils"] }
 solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
 solana-signature = { workspace = true, features = ["rand"] }

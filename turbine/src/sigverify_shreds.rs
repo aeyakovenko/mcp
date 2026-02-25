@@ -17,7 +17,7 @@ use {
         shred::{
             self,
             layout::{get_shred, resign_packet},
-            mcp_shred::is_mcp_shred_bytes,
+            mcp_shred::{is_mcp_shred_bytes, OFFSET_SLOT},
             wire::is_retransmitter_signed_variant,
         },
         sigverify_shreds::{verify_shreds_gpu, LruCache, SlotPubkeys},
@@ -307,7 +307,11 @@ fn partition_mcp_packets(
                     continue;
                 }
                 Some((
-                    Slot::from_le_bytes(data[..std::mem::size_of::<Slot>()].try_into().unwrap()),
+                    Slot::from_le_bytes(
+                        data[OFFSET_SLOT..OFFSET_SLOT + std::mem::size_of::<Slot>()]
+                            .try_into()
+                            .unwrap(),
+                    ),
                     data.to_vec(),
                 ))
             }) else {
@@ -645,17 +649,22 @@ mod tests {
         super::*,
         rand::Rng,
         solana_entry::entry::{create_ticks, Entry},
+        solana_feature_gate_interface::{create_account as create_feature_account, Feature},
         solana_gossip::contact_info::ContactInfo,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_ledger::{
             genesis_utils::create_genesis_config_with_leader,
             shred::{
-                mcp_shred::{MCP_SHRED_DATA_BYTES, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN},
+                mcp_shred::{
+                    MCP_SHRED_DISCRIMINATOR, MCP_SHRED_WIRE_SIZE,
+                    MCP_WITNESS_LEN, OFFSET_DISCRIMINATOR, OFFSET_SLOT, OFFSET_WITNESS_LEN,
+                },
                 Nonce, ProcessShredsStats, ReedSolomonCache, Shredder,
             },
         },
         solana_perf::packet::{Packet, PacketBatch, PacketFlags, PinnedPacketBatch},
+        solana_rent::Rent,
         solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_streamer::socket::SocketAddrSpace,
@@ -668,9 +677,10 @@ mod tests {
         let leader_keypair = Arc::new(Keypair::new());
         let wrong_keypair = Keypair::new();
         let leader_pubkey = leader_keypair.pubkey();
-        let bank = Bank::new_for_tests(
+        let mut bank = Bank::new_for_tests(
             &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
         );
+        bank.deactivate_feature(&feature_set::verify_retransmitter_signature::id());
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let bank_forks = BankForks::new_rw_arc(bank);
         let batch_size = 2;
@@ -728,56 +738,83 @@ mod tests {
         assert!(!batches[0].get(0).unwrap().meta().discard());
         assert!(batches[0].get(1).unwrap().meta().discard());
     }
-
     #[test]
-    fn test_partition_mcp_packets_uses_layout_prefilter_and_feature_gate() {
-        let slot = 500_000u64;
-        let witness_len_offset = std::mem::size_of::<Slot>()
-            + std::mem::size_of::<u32>()
-            + std::mem::size_of::<u32>()
-            + 32
-            + MCP_SHRED_DATA_BYTES;
-        let mut mcp_bytes = vec![0u8; MCP_SHRED_WIRE_SIZE];
-        mcp_bytes[..std::mem::size_of::<Slot>()].copy_from_slice(&slot.to_le_bytes());
-        mcp_bytes[witness_len_offset] = MCP_WITNESS_LEN as u8;
-
-        let mut packet = Packet::default();
-        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
-        packet.meta_mut().size = mcp_bytes.len();
-        packet.meta_mut().set_discard(false);
-        assert!(is_mcp_shred_bytes(packet.data(..).unwrap()));
-
-        let mut batch = PinnedPacketBatch::with_capacity(1);
-        batch.push(packet);
-
-        let mut active_bank = Bank::new_for_tests(
-            &create_genesis_config_with_leader(100, &Pubkey::new_unique(), 10).genesis_config,
+    fn test_partition_mcp_packets_uses_mcp_wire_slot_offset_for_feature_gate() {
+        let activation_slot = 500_000u64;
+        let mut genesis = create_genesis_config_with_leader(100, &Pubkey::new_unique(), 10);
+        let feature_lamports = std::cmp::max(
+            Rent::default().minimum_balance(Feature::size_of()),
+            1,
         );
-        active_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
-        assert!(cluster_nodes::check_feature_activation(
-            &feature_set::mcp_protocol_v1::id(),
-            slot,
-            &active_bank,
-        ));
-        let mut disabled_feature_batches = vec![PacketBatch::from(batch.clone())];
+        genesis.genesis_config.accounts.insert(
+            feature_set::mcp_protocol_v1::id(),
+            create_feature_account(
+                &Feature {
+                    activated_at: Some(activation_slot),
+                },
+                feature_lamports,
+            )
+            .into(),
+        );
+        let pre_activation_bank = Bank::new_for_tests(&genesis.genesis_config);
+        let root_bank = Bank::new_from_parent(
+            Arc::new(pre_activation_bank),
+            &Pubkey::new_unique(),
+            activation_slot.saturating_add(1),
+        );
+
+        let build_packet = |slot: Slot, signature_prefix_slot: Slot| {
+            let mut mcp_bytes = vec![0u8; MCP_SHRED_WIRE_SIZE];
+            mcp_bytes[..std::mem::size_of::<Slot>()]
+                .copy_from_slice(&signature_prefix_slot.to_le_bytes());
+            mcp_bytes[OFFSET_DISCRIMINATOR] = MCP_SHRED_DISCRIMINATOR;
+            mcp_bytes[OFFSET_SLOT..OFFSET_SLOT + std::mem::size_of::<Slot>()]
+                .copy_from_slice(&slot.to_le_bytes());
+            mcp_bytes[OFFSET_WITNESS_LEN] = MCP_WITNESS_LEN as u8;
+            assert!(is_mcp_shred_bytes(&mcp_bytes));
+
+            let mut packet = Packet::default();
+            packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+            packet.meta_mut().size = mcp_bytes.len();
+            packet.meta_mut().set_discard(false);
+            packet
+        };
+
+        let packet_should_pass = build_packet(
+            activation_slot.saturating_add(1),
+            activation_slot.saturating_sub(1),
+        );
+        let packet_should_fail = build_packet(
+            activation_slot.saturating_sub(1),
+            activation_slot.saturating_add(1),
+        );
+
+        let mut disabled_batch = PinnedPacketBatch::with_capacity(2);
+        disabled_batch.push(packet_should_pass.clone());
+        disabled_batch.push(packet_should_fail.clone());
+        let mut disabled_feature_batches = vec![PacketBatch::from(disabled_batch)];
         assert!(partition_mcp_packets(
             &mut disabled_feature_batches,
-            &active_bank,
+            &root_bank,
             &Pubkey::new_unique(),
         )
         .is_empty());
         assert!(!disabled_feature_batches[0].get(0).unwrap().meta().discard());
+        assert!(!disabled_feature_batches[0].get(1).unwrap().meta().discard());
 
-        let mut active_batches = vec![PacketBatch::from(batch)];
+        let mut active_batch = PinnedPacketBatch::with_capacity(2);
+        active_batch.push(packet_should_pass);
+        active_batch.push(packet_should_fail);
+        let mut active_batches = vec![PacketBatch::from(active_batch)];
         let mcp_packets = partition_mcp_packets(
             &mut active_batches,
-            &active_bank,
+            &root_bank,
             &feature_set::mcp_protocol_v1::id(),
         );
         assert_eq!(mcp_packets.len(), 1);
         assert!(active_batches[0].get(0).unwrap().meta().discard());
+        assert!(!active_batches[0].get(1).unwrap().meta().discard());
     }
-
     #[test_matrix(
         [true, false],
         [true, false]
@@ -787,9 +824,10 @@ mod tests {
 
         let leader_keypair = Arc::new(Keypair::new());
         let leader_pubkey = leader_keypair.pubkey();
-        let bank = Bank::new_for_tests(
+        let mut bank = Bank::new_for_tests(
             &create_genesis_config_with_leader(100, &leader_pubkey, 10).genesis_config,
         );
+        bank.deactivate_feature(&feature_set::verify_retransmitter_signature::id());
         let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank);
         let bank_forks = BankForks::new_rw_arc(bank);
         let (working_bank, root_bank) = {

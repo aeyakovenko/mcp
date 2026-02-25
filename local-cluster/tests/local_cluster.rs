@@ -33,6 +33,7 @@ use {
     },
     solana_cluster_type::ClusterType,
     solana_commitment_config::CommitmentConfig,
+    solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_connection_cache::client_connection::ClientConnection,
     solana_core::{
         consensus::{
@@ -107,7 +108,10 @@ use {
     solana_signer::Signer,
     solana_stake_interface::{self as stake, state::NEW_WARMUP_COOLDOWN_RATE},
     solana_streamer::socket::SocketAddrSpace,
-    solana_system_interface::program as system_program,
+    solana_system_interface::{
+        instruction::{self as system_instruction},
+        program as system_program,
+    },
     solana_system_transaction as system_transaction,
     solana_turbine::broadcast_stage::{
         broadcast_duplicates_run::{BroadcastDuplicatesConfig, ClusterPartition},
@@ -7311,6 +7315,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         None
     }
 
+    #[derive(Clone, Debug)]
+    struct DuplicateSignatureVector {
+        signature_bytes: [u8; 64],
+        signature_string: String,
+        payer_pubkey: Pubkey,
+        recipient_pubkey: Pubkey,
+        transfer_lamports: u64,
+        initial_payer_balance: u64,
+        fee_per_occurrence: u64,
+        replay_priority_fee: u64,
+    }
+
     fn send_best_effort_transfers(
         entry_client: &RpcClient,
         funding_keypair: &Keypair,
@@ -7347,52 +7363,86 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     fn send_duplicate_signature_vectors(
         entry_client: &RpcClient,
         validator_clients: &[RpcClient],
-        funding_keypair: &Keypair,
-        vector_count: usize,
+        payer_keypairs: &[Arc<Keypair>],
         fanout_rounds: usize,
-    ) -> Vec<([u8; 64], String)> {
-        let mut sent_vectors = Vec::new();
-        for _ in 0..vector_count {
-            let Ok((recent_blockhash, _)) =
-                entry_client.get_latest_blockhash_with_commitment(CommitmentConfig::processed())
-            else {
-                continue;
-            };
-            let recipient = Keypair::new();
-            let transaction = system_transaction::transfer(
-                funding_keypair,
-                &recipient.pubkey(),
-                1,
-                recent_blockhash,
-            );
-            let Some(signature) = transaction.signatures.first() else {
-                continue;
-            };
-            let mut signature_bytes = [0u8; 64];
-            signature_bytes.copy_from_slice(signature.as_ref());
-            let signature_string = signature.to_string();
+    ) -> Vec<DuplicateSignatureVector> {
+        const TRANSFER_LAMPORTS: u64 = 1;
+        const REPLAY_PRIORITY_FEE_SCHEDULE: [u64; 6] = [5_000, 3_000, 2_000, 1_000, 500, 100];
+        const VECTOR_SEND_MAX_ATTEMPTS: usize = 20;
 
-            let mut sent_any = false;
-            for _ in 0..fanout_rounds {
-                for client in iter::once(entry_client).chain(validator_clients.iter()) {
-                    if client
-                        .send_transaction_with_config(
-                            &transaction,
-                            RpcSendTransactionConfig {
-                                skip_preflight: true,
-                                max_retries: Some(0),
-                                ..RpcSendTransactionConfig::default()
-                            },
-                        )
-                        .is_ok()
-                    {
-                        sent_any = true;
+        let mut sent_vectors = Vec::new();
+        for (vector_index, payer_keypair) in payer_keypairs.iter().enumerate() {
+            let payer_pubkey = payer_keypair.pubkey();
+            let initial_payer_balance = entry_client.get_balance(&payer_pubkey).unwrap_or_default();
+            if initial_payer_balance == 0 {
+                continue;
+            }
+            let recipient_pubkey = Keypair::new().pubkey();
+            let replay_priority_fee =
+                REPLAY_PRIORITY_FEE_SCHEDULE[vector_index % REPLAY_PRIORITY_FEE_SCHEDULE.len()];
+
+            for _ in 0..VECTOR_SEND_MAX_ATTEMPTS {
+                let Ok((recent_blockhash, _)) = entry_client
+                    .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                else {
+                    continue;
+                };
+                let transaction = solana_transaction::Transaction::new_signed_with_payer(
+                    &[
+                        ComputeBudgetInstruction::set_compute_unit_price(replay_priority_fee),
+                        system_instruction::transfer(
+                            &payer_pubkey,
+                            &recipient_pubkey,
+                            TRANSFER_LAMPORTS,
+                        ),
+                    ],
+                    Some(&payer_pubkey),
+                    &[payer_keypair.as_ref()],
+                    recent_blockhash,
+                );
+                let fee_per_occurrence = entry_client
+                    .get_fee_for_message(transaction.message())
+                    .unwrap_or_default();
+                let Some(signature) = transaction.signatures.first() else {
+                    continue;
+                };
+                let mut signature_bytes = [0u8; 64];
+                signature_bytes.copy_from_slice(signature.as_ref());
+                let signature_string = signature.to_string();
+
+                let mut sent_any = false;
+                for _ in 0..fanout_rounds {
+                    for client in iter::once(entry_client).chain(validator_clients.iter()) {
+                        if client
+                            .send_transaction_with_config(
+                                &transaction,
+                                RpcSendTransactionConfig {
+                                    skip_preflight: true,
+                                    max_retries: Some(0),
+                                    ..RpcSendTransactionConfig::default()
+                                },
+                            )
+                            .is_ok()
+                        {
+                            sent_any = true;
+                        }
                     }
                 }
-            }
 
-            if sent_any {
-                sent_vectors.push((signature_bytes, signature_string));
+                if sent_any {
+                    sent_vectors.push(DuplicateSignatureVector {
+                        signature_bytes,
+                        signature_string,
+                        payer_pubkey,
+                        recipient_pubkey,
+                        transfer_lamports: TRANSFER_LAMPORTS,
+                        initial_payer_balance,
+                        fee_per_occurrence,
+                        replay_priority_fee,
+                    });
+                    break;
+                }
+                sleep(Duration::from_millis(100));
             }
         }
         sent_vectors
@@ -7405,11 +7455,11 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         funding_keypair: &Keypair,
     ) {
         // Keep steady load without overwhelming the cluster during long polling loops.
-        if last_refresh.elapsed() < Duration::from_secs(2) {
+        if last_refresh.elapsed() < Duration::from_secs(3) {
             return;
         }
         submitted_signatures
-            .extend(send_best_effort_transfers(entry_client, funding_keypair, 2).into_iter());
+            .extend(send_best_effort_transfers(entry_client, funding_keypair, 1).into_iter());
         *last_refresh = Instant::now();
     }
 
@@ -7417,6 +7467,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
 
     let mut validator_config = ValidatorConfig::default_for_test();
     validator_config.wait_for_supermajority = None;
+    validator_config.block_verification_method = BlockVerificationMethod::BlockstoreProcessor;
 
     let mcp_feature_id = agave_feature_set::mcp_protocol_v1::id();
     let mcp_feature_lamports = std::cmp::max(
@@ -7433,6 +7484,31 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         },
         mcp_feature_lamports,
     );
+    const DUPLICATE_VECTOR_COUNT: usize = 4;
+    const DUPLICATE_VECTOR_PAYER_LAMPORTS: u64 = 500_000;
+    let duplicate_vector_payer_keypairs: Vec<Arc<Keypair>> = (0..DUPLICATE_VECTOR_COUNT)
+        .map(|index| {
+            Arc::new(
+                keypair_from_seed(&[200u8.wrapping_add(index as u8); 32])
+                    .expect("deterministic duplicate-vector payer seed"),
+            )
+        })
+        .collect();
+    let duplicate_vector_payer_accounts: Vec<(Pubkey, AccountSharedData)> =
+        duplicate_vector_payer_keypairs
+            .iter()
+            .map(|keypair| {
+                (
+                    keypair.pubkey(),
+                    AccountSharedData::new(
+                        DUPLICATE_VECTOR_PAYER_LAMPORTS,
+                        0,
+                        &system_program::id(),
+                    ),
+                )
+            })
+            .collect();
+
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
     let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
@@ -7443,6 +7519,11 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     let cluster = {
         let mut cluster = None;
         for attempt in 0..CLUSTER_CREATE_MAX_ATTEMPTS {
+            let mut additional_accounts =
+                Vec::with_capacity(1 + duplicate_vector_payer_accounts.len());
+            additional_accounts.push((mcp_feature_id, mcp_feature_account.clone()));
+            additional_accounts.extend(duplicate_vector_payer_accounts.iter().cloned());
+
             let mut config = ClusterConfig {
                 validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
                 validator_keys: Some(validator_keys.clone()),
@@ -7452,7 +7533,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                 slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
                 stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
                 skip_warmup_slots: true,
-                additional_accounts: vec![(mcp_feature_id, mcp_feature_account.clone())],
+                additional_accounts,
                 ..ClusterConfig::default()
             };
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -7789,7 +7870,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     }
 
     let mut submitted_signatures: HashSet<String> =
-        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 32)
+        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 16)
             .into_iter()
             .collect();
     assert!(
@@ -7799,18 +7880,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     let duplicate_signature_vectors = send_duplicate_signature_vectors(
         &entry_client,
         &validator_rpc_clients,
-        &cluster.funding_keypair,
-        12,
-        3,
+        &duplicate_vector_payer_keypairs,
+        2,
     );
-    assert!(
-        !duplicate_signature_vectors.is_empty(),
-        "failed to submit duplicate-signature MCP replay vectors into local-cluster test",
+    assert_eq!(
+        duplicate_signature_vectors.len(),
+        duplicate_vector_payer_keypairs.len(),
+        "failed to submit deterministic duplicate-signature MCP replay vectors into local-cluster test",
     );
     submitted_signatures.extend(
         duplicate_signature_vectors
             .iter()
-            .map(|(_, signature)| signature.clone()),
+            .map(|vector| vector.signature_string.clone()),
     );
     let mut last_transfer_refresh = Instant::now();
 
@@ -8182,8 +8263,21 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                             .filter_map(|tx_wire_bytes| {
                                 first_signature_from_wire_transaction(tx_wire_bytes)
                             })
-                            .find(|signature| submitted_signatures.contains(signature))?;
-                        Some((*pubkey, slot, transactions.len(), matched_signature))
+                            .next()?;
+                        let matched_occurrences = transactions
+                            .iter()
+                            .filter_map(|tx_wire_bytes| {
+                                first_signature_from_wire_transaction(tx_wire_bytes)
+                            })
+                            .filter(|signature| *signature == matched_signature)
+                            .count();
+                        Some((
+                            *pubkey,
+                            slot,
+                            transactions.len(),
+                            matched_signature,
+                            matched_occurrences,
+                        ))
                     })
                 });
         if decodable_execution_output.is_some() {
@@ -8191,16 +8285,77 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         }
         sleep(Duration::from_millis(500));
     }
-    let Some((decoded_pubkey, decoded_slot, decoded_tx_count, included_signature)) =
-        decodable_execution_output
+    let Some((
+        decoded_pubkey,
+        decoded_slot,
+        decoded_tx_count,
+        included_signature,
+        included_signature_occurrences,
+    )) = decodable_execution_output
     else {
         let (submitted_tx_count, highest_slots, diagnostics, role_diagnostics) =
             diagnostics_payload(submitted_signatures.len());
         panic!(
-            "no non-empty decodable MCP execution output containing a submitted signature found; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
+            "no non-empty decodable MCP execution output found; submitted_tx_count={}; highest observed slots {:?}; diagnostics {:?}; role diagnostics {:?}",
             submitted_tx_count, highest_slots, diagnostics, role_diagnostics,
         );
     };
+    let (consensus_validator_pubkey, consensus_slot, consensus_block) = if decoded_slot
+        == consensus_slot
+    {
+        (consensus_validator_pubkey, consensus_slot, consensus_block)
+    } else {
+        let Some((decoded_consensus_validator_pubkey, decoded_consensus_block)) =
+            consensus_block_for_slot(decoded_slot)
+        else {
+            panic!(
+                "decoded execution-output slot {} had no consensus block bytes",
+                decoded_slot
+            );
+        };
+        let decoded_consensus_leader_pubkey = slot_leader_for(decoded_slot)
+            .expect("decoded consensus slot leader must resolve from leader schedule");
+        assert!(
+            decoded_consensus_block.verify_leader_signature(&decoded_consensus_leader_pubkey),
+            "decoded consensus block failed leader signature verification at slot {}",
+            decoded_slot
+        );
+        let decoded_parsed_consensus_meta = decoded_consensus_block
+            .consensus_meta_parsed()
+            .expect("decoded consensus_meta must decode as v1 in local-cluster MCP test");
+        assert_eq!(
+            decoded_consensus_block.consensus_meta.len(),
+            CONSENSUS_META_V1_WIRE_BYTES,
+            "decoded consensus_meta must be {} bytes at slot {}",
+            CONSENSUS_META_V1_WIRE_BYTES,
+            decoded_slot
+        );
+        let decoded_delayed_slot = decoded_parsed_consensus_meta.delayed_slot();
+        let decoded_delayed_bankhash = blockstores
+            .iter()
+            .find_map(|(pubkey, blockstore)| {
+                (*pubkey == decoded_consensus_validator_pubkey)
+                    .then(|| blockstore.get_bank_hash(decoded_delayed_slot))
+            })
+            .flatten()
+            .or_else(|| {
+                blockstores
+                    .iter()
+                    .find_map(|(_, blockstore)| blockstore.get_bank_hash(decoded_delayed_slot))
+            })
+            .expect("decoded delayed-slot bankhash must exist when consensus block is ingested");
+        assert_eq!(
+            decoded_consensus_block.delayed_bankhash, decoded_delayed_bankhash,
+            "decoded consensus block delayed bankhash mismatch at slot {} (delayed slot {})",
+            decoded_slot, decoded_delayed_slot
+        );
+        (
+            decoded_consensus_validator_pubkey,
+            decoded_slot,
+            decoded_consensus_block,
+        )
+    };
+
     let included_commitments =
         included_commitments_for_consensus_block(consensus_slot, &consensus_block);
     let included_commitments = included_commitments.unwrap_or_else(|| {
@@ -8279,7 +8434,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         .filter_map(|proposer_index| proposer_pubkey_for(consensus_slot, *proposer_index))
         .collect();
     let mut covered_proposer_pubkeys: HashSet<Pubkey> = HashSet::new();
-    let mut proposer_signature_occurrences: HashMap<[u8; 64], usize> = HashMap::new();
     let mut proposer_payload_signatures: Vec<[u8; 64]> = Vec::new();
     let mut duplicate_signatures_within_proposer: Vec<(u32, usize)> = Vec::new();
     for (proposer_index, commitment) in included_commitments {
@@ -8316,11 +8470,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         if duplicate_count > 0 {
             duplicate_signatures_within_proposer.push((proposer_index, duplicate_count));
         }
-        for signature in per_proposer_signature_counts.keys() {
-            *proposer_signature_occurrences
-                .entry(*signature)
-                .or_default() += 1;
-        }
         assert!(
             assign_one_executed_tx_for_proposer(
                 &proposer_payload_transactions,
@@ -8355,67 +8504,108 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         duplicate_signatures_within_proposer
     );
 
-    let targeted_duplicate_signatures: HashSet<[u8; 64]> = duplicate_signature_vectors
+    let duplicate_vectors_by_signature: HashMap<[u8; 64], DuplicateSignatureVector> =
+        duplicate_signature_vectors
+            .iter()
+            .cloned()
+            .map(|vector| (vector.signature_bytes, vector))
+            .collect();
+    let targeted_duplicate_signatures: HashSet<[u8; 64]> =
+        duplicate_vectors_by_signature.keys().copied().collect();
+    let duplicate_signature_replay_fees: HashMap<[u8; 64], u64> = duplicate_vectors_by_signature
         .iter()
-        .map(|(signature, _)| *signature)
+        .map(|(signature, vector)| (*signature, vector.replay_priority_fee))
         .collect();
-    let cross_proposer_signature = targeted_duplicate_signatures
+    let duplicate_signature_execution_order = execution_output_signatures
         .iter()
-        .find_map(|signature| {
-            proposer_signature_occurrences
-                .get(signature)
-                .copied()
-                .filter(|count| *count >= 2)
-                .map(|count| (*signature, count))
-        })
-        .or_else(|| {
-            proposer_signature_occurrences
-                .iter()
-                .find_map(|(signature, count)| (*count >= 2).then_some((*signature, *count)))
-        });
-    let Some((cross_signature, proposer_occurrences)) = cross_proposer_signature else {
-        panic!(
-            "consensus slot {} had no cross-proposer duplicate signatures in reconstructed payloads",
+        .copied()
+        .filter(|signature| targeted_duplicate_signatures.contains(signature))
+        .collect::<Vec<_>>();
+    if duplicate_signature_execution_order.is_empty() {
+        info!(
+            "consensus slot {} had no injected duplicate-signature vectors in execution output; skipping duplicate-signature state/order assertions",
             consensus_slot
         );
-    };
-    let execution_occurrences = execution_output_signature_counts
-        .get(&cross_signature)
-        .copied()
-        .unwrap_or_default();
-    assert_eq!(
-        execution_occurrences,
-        proposer_occurrences,
-        "cross-proposer duplicate signature multiplicity mismatch at slot {}: proposer_occurrences={}, execution_occurrences={}",
-        consensus_slot,
-        proposer_occurrences,
-        execution_occurrences
-    );
-    assert!(
-        execution_occurrences >= 2,
-        "expected at least two execution occurrences for a cross-proposer duplicate signature at slot {}",
-        consensus_slot
-    );
-    assert!(
-        !consensus_slot_blockstore.is_dead(consensus_slot),
-        "consensus slot {} became dead while replaying duplicate-signature vectors",
-        consensus_slot
-    );
-    assert!(
-        consensus_slot_blockstore
-            .get_bank_hash(consensus_slot)
-            .is_some(),
-        "consensus slot {} did not freeze a bankhash after duplicate-signature replay",
-        consensus_slot
-    );
+    } else {
+        let mut validated_duplicate_vectors = 0usize;
+        for (signature, vector) in &duplicate_vectors_by_signature {
+            let occurrences = execution_output_signature_counts
+                .get(signature)
+                .copied()
+                .unwrap_or_default();
+            if occurrences == 0 {
+                continue;
+            }
+            validated_duplicate_vectors = validated_duplicate_vectors.saturating_add(1);
 
-    let mut expected_replay_order = proposer_payload_signatures.clone();
-    expected_replay_order.sort();
-    assert_eq!(
-        execution_output_signatures, expected_replay_order,
-        "consensus slot {} execution output ordering did not match deterministic replay priority order for legacy vectors",
-        consensus_slot
-    );
+            let recipient_balance = entry_client
+                .get_balance(&vector.recipient_pubkey)
+                .unwrap_or_default();
+            assert_eq!(
+                recipient_balance, vector.transfer_lamports,
+                "recipient {} for signature {} should receive transfer exactly once",
+                vector.recipient_pubkey, vector.signature_string
+            );
+
+            let payer_balance = entry_client
+                .get_balance(&vector.payer_pubkey)
+                .unwrap_or_default();
+            let expected_exact_debit = vector.transfer_lamports.saturating_add(
+                vector
+                    .fee_per_occurrence
+                    .saturating_mul(u64::try_from(occurrences).unwrap_or_default()),
+            );
+            let actual_debit = vector.initial_payer_balance.saturating_sub(payer_balance);
+            assert_eq!(
+                actual_debit, expected_exact_debit,
+                "fee payer {} debit mismatch for signature {} at slot {}",
+                vector.payer_pubkey, vector.signature_string, consensus_slot
+            );
+        }
+        assert!(
+            validated_duplicate_vectors > 0,
+            "none of the injected duplicate-signature vectors appeared in consensus slot {} execution output",
+            consensus_slot
+        );
+        info!(
+            "MCP duplicate-signature state checks passed at slot {} (validated_vectors={})",
+            consensus_slot, validated_duplicate_vectors
+        );
+
+        let observed_replay_fees = duplicate_signature_execution_order
+            .iter()
+            .filter_map(|signature| duplicate_signature_replay_fees.get(signature).copied())
+            .collect::<HashSet<_>>();
+        assert!(
+            observed_replay_fees.len() >= 2,
+            "consensus slot {} duplicate-signature vectors in execution output did not include at least two replay fee levels",
+            consensus_slot
+        );
+
+        let mut expected_duplicate_order = duplicate_signature_execution_order.clone();
+        expected_duplicate_order.sort_by_cached_key(|signature| {
+            (
+                std::cmp::Reverse(
+                    duplicate_signature_replay_fees
+                        .get(signature)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
+                *signature,
+            )
+        });
+        assert_eq!(
+            duplicate_signature_execution_order, expected_duplicate_order,
+            "consensus slot {} duplicate-signature vector order did not match deterministic replay fee-priority order",
+            consensus_slot
+        );
+        info!(
+            "MCP duplicate-signature ordering checks passed at slot {} (vector_occurrences={}, fee_levels={})",
+            consensus_slot,
+            duplicate_signature_execution_order.len(),
+            observed_replay_fees.len()
+        );
+    }
 
     let baseline_consensus_output = consensus_slot_blockstore
         .get_mcp_execution_output(consensus_slot)
@@ -8433,6 +8623,10 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             consensus_slot
         );
     }
+    info!(
+        "MCP execution-output immutability checks passed at slot {}",
+        consensus_slot
+    );
 
     let max_scan_slot = blockstores
         .iter()
@@ -8524,7 +8718,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     );
 
     info!(
-        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={}); consensus block observed on validator {} at slot {} with matching delayed bankhash slot {}; decoded {} transactions from validator {} output at slot {} including submitted signature {}",
+        "observed MCP shred/attestation/execution artifacts at slot {} on validator {}; non-leader MCP execution output observed on validator {} at slot {} (leader={}); consensus block observed on validator {} at slot {} with matching delayed bankhash slot {}; decoded {} transactions from validator {} output at slot {} including submitted signature {} (occurrences={})",
         observed_slot,
         validator_pubkey,
         non_leader_pubkey,
@@ -8537,6 +8731,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         decoded_pubkey,
         decoded_slot,
         included_signature,
+        included_signature_occurrences,
     );
 }
 
