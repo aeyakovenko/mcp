@@ -5855,6 +5855,105 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_maybe_process_pending_mcp_slots_processes_oldest_window_first() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+
+        let heaviest_slot = 20;
+        let mut parent_bank = root_bank.clone();
+        for slot in 1..=heaviest_slot {
+            parent_bank = new_bank_from_parent_with_bank_forks(
+                &bank_forks,
+                parent_bank,
+                &leader.pubkey(),
+                slot,
+            );
+        }
+        let heaviest_bank = parent_bank;
+        let delayed_slot = root_bank.slot();
+        let delayed_bankhash = root_bank.hash();
+
+        let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut consensus_blocks = mcp_consensus_blocks.write().unwrap();
+            for slot in 1..=heaviest_slot {
+                let slot_bank = bank_forks
+                    .read()
+                    .unwrap()
+                    .get(slot)
+                    .expect("slot bank should exist for pending MCP slot test");
+                let leader_index = {
+                    let (_, slot_index) = slot_bank.get_epoch_and_slot_index(slot);
+                    u32::try_from(slot_index).expect("leader index should fit in u32")
+                };
+                let aggregate_bytes =
+                    AggregateAttestation::new_canonical(slot, leader_index, vec![])
+                        .unwrap()
+                        .to_wire_bytes()
+                        .unwrap();
+                let mut consensus_block = ConsensusBlock::new_unsigned_with_meta(
+                    slot,
+                    leader_index,
+                    aggregate_bytes,
+                    ConsensusMeta::new_v1(Hash::new_unique(), delayed_slot),
+                    delayed_bankhash,
+                )
+                .unwrap();
+                consensus_block.sign_leader(&leader).unwrap();
+                consensus_blocks.insert(slot, consensus_block.to_wire_bytes().unwrap());
+            }
+        }
+
+        let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
+        let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        ReplayStage::maybe_process_pending_mcp_slots(
+            &heaviest_bank,
+            &mcp_consensus_blocks,
+            &mcp_vote_gate_inputs,
+            &mcp_vote_gate_included_proposers,
+            &bank_forks,
+            &blockstore,
+            &leader_schedule_cache,
+        );
+
+        let processed_slots: HashSet<_> = mcp_vote_gate_inputs
+            .read()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            processed_slots.len(),
+            16,
+            "replay loop should process at most 16 pending MCP slots per iteration",
+        );
+        for slot in 1..=16 {
+            assert!(
+                processed_slots.contains(&slot),
+                "oldest slot {} should be processed first",
+                slot
+            );
+        }
+        for slot in 17..=heaviest_slot {
+            assert!(
+                !processed_slots.contains(&slot),
+                "slot {} should be deferred to later replay iterations",
+                slot
+            );
+        }
+    }
+    #[test]
     fn test_mcp_authoritative_block_id_for_slot_reads_hash_sized_consensus_meta() {
         let slot: Slot = 21;
         let leader = Keypair::new();
@@ -11468,6 +11567,7 @@ pub(crate) mod tests {
             0,    // version
         );
         blockstore.insert_shreds(shreds, None, false).unwrap();
+        blockstore.put_mcp_empty_execution_output(1).unwrap();
 
         let bank1_progress = progress
             .entry(bank1.slot())

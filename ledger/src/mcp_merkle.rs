@@ -311,4 +311,27 @@ mod tests {
         )
         .unwrap());
     }
+
+    #[test]
+    fn test_odd_leaf_count_roundtrip_verifies_all_witnesses() {
+        let shreds = vec![[1u8; 4], [2u8; 4], [3u8; 4]];
+        let (root, witnesses) = commitment_and_witnesses::<4, 2>(9, 2, &shreds).unwrap();
+        assert_eq!(witnesses.len(), shreds.len());
+
+        for (leaf_index, shred) in shreds.iter().enumerate() {
+            assert!(
+                verify_witness(
+                    9,
+                    2,
+                    leaf_index as u32,
+                    shred,
+                    &witnesses[leaf_index],
+                    &root,
+                    shreds.len(),
+                )
+                .unwrap(),
+                "odd-leaf witness failed at index {leaf_index}",
+            );
+        }
+    }
 }

@@ -153,6 +153,9 @@ impl LeaderScheduleCache {
     }
 
     /// Returns all relay indices owned by `pubkey` for `slot`.
+    ///
+    /// Test/diagnostic helper: currently used by local-cluster MCP tests;
+    /// there are no production call sites in validator data paths.
     pub fn relay_indices_at_slot(
         &self,
         slot: Slot,

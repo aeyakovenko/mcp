@@ -287,6 +287,25 @@ impl StandardBroadcastRun {
         .collect()
     }
 
+    fn route_payload_transaction_to_proposers(
+        slot_state: &mut McpSlotDispatchState,
+        proposer_indices: &[u32],
+        bank: &Bank,
+        payload_transaction: McpPayloadTransaction,
+    ) {
+        if let Some(target_proposer) = payload_transaction.target_proposer {
+            if proposer_indices.contains(&target_proposer) {
+                let _ = slot_state.try_push_transaction(target_proposer, bank, payload_transaction);
+            }
+            return;
+        }
+
+        for proposer_index in proposer_indices.iter().copied() {
+            let _ =
+                slot_state.try_push_transaction(proposer_index, bank, payload_transaction.clone());
+        }
+    }
+
     pub(super) fn new(
         identity: Pubkey,
         shred_version: u16,
@@ -846,24 +865,12 @@ impl StandardBroadcastRun {
                     );
                     continue;
                 };
-                if let Some(target_proposer) = payload_transaction.target_proposer {
-                    if proposer_indices.contains(&target_proposer) {
-                        let _ = slot_state.try_push_transaction(
-                            target_proposer,
-                            bank,
-                            payload_transaction,
-                        );
-                    }
-                    continue;
-                }
-
-                for proposer_index in proposer_indices.iter().copied() {
-                    let _ = slot_state.try_push_transaction(
-                        proposer_index,
-                        bank,
-                        payload_transaction.clone(),
-                    );
-                }
+                Self::route_payload_transaction_to_proposers(
+                    slot_state,
+                    &proposer_indices,
+                    bank,
+                    payload_transaction,
+                );
             }
         }
     }
@@ -1374,6 +1381,62 @@ mod test {
     }
 
     #[test]
+    fn test_slot_dispatch_state_fee_reservation_capacity_is_dynamic() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let fee_payer = Pubkey::new_unique();
+        let base_fee = 7u64;
+        let per_tx_reservation = base_fee.saturating_mul(mcp::NUM_PROPOSERS as u64);
+        let max_admitted = 3u64;
+        let mut account = AccountSharedData::new(
+            per_tx_reservation.saturating_mul(max_admitted),
+            0,
+            &Pubkey::default(),
+        );
+        bank.store_account(&fee_payer, &account);
+
+        let mut state = McpSlotDispatchState::default();
+        let accepted: Vec<bool> = (0..=max_admitted)
+            .map(|index| {
+                let signature_byte = (index as u8).saturating_add(1);
+                state.try_push_transaction(
+                    0,
+                    bank.as_ref(),
+                    make_payload_tx(16, signature_byte, fee_payer, base_fee, 0),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            accepted.iter().filter(|accepted| **accepted).count(),
+            max_admitted as usize,
+            "admission count should match dynamic fee-reservation capacity",
+        );
+        assert_eq!(accepted.last(), Some(&false));
+        let proposer_state = state.proposer_states.get(&0).unwrap();
+        assert_eq!(
+            proposer_state.payload_transactions.len(),
+            max_admitted as usize
+        );
+        assert_eq!(
+            proposer_state.payer_fee_reservations.get(&fee_payer),
+            Some(&per_tx_reservation.saturating_mul(max_admitted)),
+        );
+
+        account.set_lamports(
+            per_tx_reservation
+                .saturating_mul(max_admitted)
+                .saturating_add(per_tx_reservation),
+        );
+        bank.store_account(&fee_payer, &account);
+        assert!(state.try_push_transaction(
+            0,
+            bank.as_ref(),
+            make_payload_tx(16, 42, fee_payer, base_fee, 0),
+        ));
+    }
+    #[test]
     fn test_slot_dispatch_state_dedups_within_each_proposer_only() {
         let bank = Arc::new(Bank::new_for_tests(
             &create_genesis_config(10_000).genesis_config,
@@ -1404,6 +1467,66 @@ mod test {
                 .payload_transactions
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn test_targeted_proposer_routing() {
+        let bank = Arc::new(Bank::new_for_tests(
+            &create_genesis_config(10_000).genesis_config,
+        ));
+        let mut slot_state = McpSlotDispatchState::default();
+        let proposer_indices = vec![3u32, 7u32];
+        let fee_payer = Pubkey::new_unique();
+
+        let mut targeted = make_payload_tx(16, 1, fee_payer, 0, 0);
+        targeted.target_proposer = Some(7);
+        StandardBroadcastRun::route_payload_transaction_to_proposers(
+            &mut slot_state,
+            &proposer_indices,
+            bank.as_ref(),
+            targeted,
+        );
+
+        assert!(slot_state
+            .proposer_states
+            .get(&3)
+            .is_none_or(|state| state.payload_transactions.is_empty()));
+        assert_eq!(
+            slot_state
+                .proposer_states
+                .get(&7)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+
+        let untargeted = make_payload_tx(16, 2, fee_payer, 0, 0);
+        StandardBroadcastRun::route_payload_transaction_to_proposers(
+            &mut slot_state,
+            &proposer_indices,
+            bank.as_ref(),
+            untargeted,
+        );
+
+        assert_eq!(
+            slot_state
+                .proposer_states
+                .get(&3)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            1
+        );
+        assert_eq!(
+            slot_state
+                .proposer_states
+                .get(&7)
+                .unwrap()
+                .payload_transactions
+                .len(),
+            2
         );
     }
 

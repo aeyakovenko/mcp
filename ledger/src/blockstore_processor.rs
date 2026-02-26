@@ -1613,7 +1613,17 @@ pub fn confirm_slot(
         .activated_slot(&feature_set::mcp_protocol_v1::id())
         .is_some_and(|activated_slot| slot >= activated_slot)
     {
-        blockstore.get_mcp_execution_output(slot)?
+        let mut output = blockstore.get_mcp_execution_output(slot)?;
+
+        // Slot 0 is replayed directly from genesis and never has a consensus block.
+        // Seed an explicit empty MCP execution output so MCP-active startup does not
+        // depend on legacy replay entries for the genesis slot.
+        if output.is_none() && slot == 0 {
+            let _ = blockstore.put_mcp_empty_execution_output_if_absent(slot)?;
+            output = blockstore.get_mcp_execution_output(slot)?;
+        }
+
+        output
     } else {
         None
     };
@@ -2245,7 +2255,10 @@ fn process_bank_0(
         &mut ExecuteTimings::default(),
         migration_status,
     )
-    .map_err(|_| BlockstoreProcessorError::FailedToReplayBank0)?;
+    .map_err(|err| {
+        error!("failed to replay bank 0 during startup: {err:?}");
+        BlockstoreProcessorError::FailedToReplayBank0
+    })?;
     if let Some((result, _timings)) = bank0.wait_for_completed_scheduler() {
         result.unwrap();
     }
@@ -5040,6 +5053,43 @@ pub mod tests {
 
         // Check that bank forks has the correct banks
         verify_fork_infos(&bank_forks);
+    }
+
+    #[test]
+    fn test_process_bank_0_mcp_active_seeds_empty_execution_output() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger_auto_delete!(&genesis_config);
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+
+        let mut bank = Bank::new_for_tests(&genesis_config);
+        bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let bank0 = bank_forks.read().unwrap().get_with_scheduler(0).unwrap();
+
+        let opts = ProcessOptions {
+            run_verification: true,
+            ..ProcessOptions::default()
+        };
+        let recyclers = VerifyRecyclers::default();
+        let replay_tx_thread_pool = create_thread_pool(1);
+
+        process_bank_0(
+            &bank0,
+            &blockstore,
+            &replay_tx_thread_pool,
+            &opts,
+            None,
+            &recyclers,
+            None,
+            &MigrationStatus::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            blockstore.get_mcp_execution_output(0).unwrap(),
+            Some(Vec::new()),
+            "slot 0 MCP replay should materialize an explicit empty execution output"
+        );
     }
 
     #[test]

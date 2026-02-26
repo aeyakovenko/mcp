@@ -1920,6 +1920,113 @@ mod tests {
     }
 
     #[test]
+    fn test_should_use_bankless_recording_conditions() {
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+
+        genesis_config
+            .accounts
+            .remove(&agave_feature_set::mcp_protocol_v1::id());
+        let bank_without_feature = Bank::new_for_tests(&genesis_config);
+        let genesis_cert = Certificate {
+            cert_type: CertificateType::Genesis(0, Hash::default()),
+            signature: BLSSignature::default(),
+            bitmap: Vec::default(),
+        };
+        bank_without_feature.set_alpenglow_genesis_certificate(&genesis_cert);
+        assert!(!Consumer::should_use_bankless_recording(
+            &bank_without_feature
+        ));
+
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        let (parent_bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        parent_bank.set_alpenglow_genesis_certificate(&genesis_cert);
+
+        assert!(
+            !Consumer::should_use_bankless_recording(&parent_bank),
+            "boundary slot equal to genesis cert slot must remain legacy"
+        );
+
+        let child_bank = Arc::new(Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1));
+        assert!(Consumer::should_use_bankless_recording(&child_bank));
+    }
+
+    #[test]
+    fn test_record_transactions_bankless_produces_synthetic_commit() {
+        let GenesisConfigInfo {
+            genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            10_000,
+            &Pubkey::new_unique(),
+            bootstrap_validator_stake_lamports(),
+        );
+        let (parent_bank, _bank_forks) = Bank::new_no_wallclock_throttle_for_tests(&genesis_config);
+        let genesis_cert = Certificate {
+            cert_type: CertificateType::Genesis(0, Hash::default()),
+            signature: BLSSignature::default(),
+            bitmap: Vec::default(),
+        };
+        parent_bank.set_alpenglow_genesis_certificate(&genesis_cert);
+        let bank = Arc::new(Bank::new_from_parent(parent_bank, &Pubkey::new_unique(), 1));
+
+        let recipient = Pubkey::new_unique();
+        let transactions = sanitize_transactions(vec![system_transaction::transfer(
+            &mint_keypair,
+            &recipient,
+            1,
+            bank.last_blockhash(),
+        )]);
+
+        let (record_sender, mut record_receiver) = record_channels(false);
+        let recorder = TransactionRecorder::new(record_sender);
+        record_receiver.restart(bank.slot());
+
+        let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let committer = Committer::new(
+            None,
+            replay_vote_sender,
+            Arc::new(PrioritizationFeeCache::new(0u64)),
+        );
+        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+
+        let output = consumer.process_and_record_transactions(&bank, &transactions);
+        let statuses = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert!(matches!(
+            statuses[0],
+            CommitTransactionDetails::Committed {
+                compute_units: 0,
+                loaded_accounts_data_size: 0,
+                fee_payer_post_balance: 0,
+                result: Ok(()),
+            }
+        ));
+
+        // Bankless path records but does not execute in banking stage.
+        assert_eq!(bank.get_balance(&recipient), 0);
+
+        record_receiver.shutdown();
+        let record = record_receiver.drain().next().unwrap();
+        assert_eq!(record.slot, bank.slot());
+        assert_eq!(record.transaction_batches.len(), 1);
+        assert_eq!(record.transaction_batches[0].len(), 1);
+    }
+
+    #[test]
     fn test_mcp_bankless_records_without_execution() {
         agave_logger::setup();
         let GenesisConfigInfo {

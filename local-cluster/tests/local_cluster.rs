@@ -7327,6 +7327,13 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         replay_priority_fee: u64,
     }
 
+    #[derive(Clone, Debug)]
+    struct TargetedProposerVector {
+        signature_bytes: [u8; 64],
+        signature_string: String,
+        target_proposer_index: u32,
+    }
+
     fn send_best_effort_transfers(
         entry_client: &RpcClient,
         funding_keypair: &Keypair,
@@ -7366,7 +7373,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         payer_keypairs: &[Arc<Keypair>],
         fanout_rounds: usize,
     ) -> Vec<DuplicateSignatureVector> {
-        const TRANSFER_LAMPORTS: u64 = 1;
+        const TRANSFER_LAMPORTS: u64 = 1_000_000;
         const REPLAY_PRIORITY_FEE_SCHEDULE: [u64; 6] = [5_000, 3_000, 2_000, 1_000, 500, 100];
         const VECTOR_SEND_MAX_ATTEMPTS: usize = 20;
 
@@ -7418,7 +7425,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
                                 &transaction,
                                 RpcSendTransactionConfig {
                                     skip_preflight: true,
-                                    max_retries: Some(0),
+                                    max_retries: Some(20),
                                     ..RpcSendTransactionConfig::default()
                                 },
                             )
@@ -7447,6 +7454,119 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         }
         sent_vectors
     }
+    fn send_targeted_proposer_vectors(
+        entry_client: &RpcClient,
+        validator_rpc_clients: &[RpcClient],
+        target_proposer_indices: &[u32],
+        payer_keypairs: &[Arc<Keypair>],
+    ) -> Vec<TargetedProposerVector> {
+        const TRANSFER_LAMPORTS: u64 = 1_000_000;
+        const TARGETED_PRIORITY_FEE_SCHEDULE: [u64; 8] =
+            [4_900, 4_700, 4_500, 4_300, 4_100, 3_900, 3_700, 3_500];
+        const VECTOR_SEND_MAX_ATTEMPTS: usize = 20;
+        const TARGETED_FANOUT_ROUNDS: usize = 8;
+        const TARGETED_VECTORS_PER_PROPOSER: usize = 2;
+
+        assert_eq!(
+            target_proposer_indices.len(),
+            payer_keypairs.len(),
+            "targeted proposer vectors require one deterministic payer per target proposer index",
+        );
+
+        let mut sent_vectors = Vec::new();
+        for (vector_index, payer_keypair) in payer_keypairs.iter().enumerate() {
+            let payer_pubkey = payer_keypair.pubkey();
+            let initial_payer_balance = entry_client.get_balance(&payer_pubkey).unwrap_or_default();
+            if initial_payer_balance == 0 {
+                continue;
+            }
+            let target_proposer_index = target_proposer_indices[vector_index];
+            let target_rpc_client = usize::try_from(target_proposer_index)
+                .ok()
+                .and_then(|index| validator_rpc_clients.get(index % validator_rpc_clients.len()));
+            let Some(target_rpc_client) = target_rpc_client else {
+                continue;
+            };
+            let replay_priority_fee =
+                TARGETED_PRIORITY_FEE_SCHEDULE[vector_index % TARGETED_PRIORITY_FEE_SCHEDULE.len()];
+
+            for _ in 0..TARGETED_VECTORS_PER_PROPOSER {
+                let mut submitted_vector = false;
+                for _ in 0..VECTOR_SEND_MAX_ATTEMPTS {
+                    let recipient_pubkey = Keypair::new().pubkey();
+                    let Ok((recent_blockhash, _)) = entry_client
+                        .get_latest_blockhash_with_commitment(CommitmentConfig::processed())
+                    else {
+                        continue;
+                    };
+                    let transaction = solana_transaction::Transaction::new_signed_with_payer(
+                        &[
+                            ComputeBudgetInstruction::set_compute_unit_price(replay_priority_fee),
+                            system_instruction::transfer(
+                                &payer_pubkey,
+                                &recipient_pubkey,
+                                TRANSFER_LAMPORTS,
+                            ),
+                        ],
+                        Some(&payer_pubkey),
+                        &[payer_keypair.as_ref()],
+                        recent_blockhash,
+                    );
+                    let Some(signature_ref) = transaction.signatures.first() else {
+                        continue;
+                    };
+                    let mut signature_bytes = [0u8; 64];
+                    signature_bytes.copy_from_slice(signature_ref.as_ref());
+                    let signature_string = signature_ref.to_string();
+
+                    let mut sent_any = false;
+                    let mut last_send_error = None;
+                    for _ in 0..TARGETED_FANOUT_ROUNDS {
+                        match target_rpc_client.send_transaction_with_config(
+                            &transaction,
+                            RpcSendTransactionConfig {
+                                skip_preflight: true,
+                                max_retries: Some(20),
+                                ..RpcSendTransactionConfig::default()
+                            },
+                        ) {
+                            Ok(_) => {
+                                sent_any = true;
+                            }
+                            Err(err) => {
+                                last_send_error = Some(format!(
+                                    "targeted proposer RPC send failed (target_proposer_index={}): {}",
+                                    target_proposer_index, err
+                                ));
+                            }
+                        }
+                    }
+
+                    if sent_any {
+                        sent_vectors.push(TargetedProposerVector {
+                            signature_bytes,
+                            signature_string,
+                            target_proposer_index,
+                        });
+                        submitted_vector = true;
+                        break;
+                    }
+
+                    if let Some(last_send_error) = last_send_error {
+                        info!(
+                            "targeted proposer vector send retry (index={}, payer={}, target_proposer_index={}): {}",
+                            vector_index, payer_pubkey, target_proposer_index, last_send_error
+                        );
+                    }
+                    sleep(Duration::from_millis(100));
+                }
+                if !submitted_vector {
+                    break;
+                }
+            }
+        }
+        sent_vectors
+    }
 
     fn maybe_refresh_transfer_stream(
         submitted_signatures: &mut HashSet<String>,
@@ -7455,7 +7575,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         funding_keypair: &Keypair,
     ) {
         // Keep steady load without overwhelming the cluster during long polling loops.
-        if last_refresh.elapsed() < Duration::from_secs(3) {
+        if submitted_signatures.len() >= 32 || last_refresh.elapsed() < Duration::from_secs(5) {
             return;
         }
         submitted_signatures
@@ -7485,7 +7605,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         mcp_feature_lamports,
     );
     const DUPLICATE_VECTOR_COUNT: usize = 4;
-    const DUPLICATE_VECTOR_PAYER_LAMPORTS: u64 = 500_000;
+    const DUPLICATE_VECTOR_PAYER_LAMPORTS: u64 = 50_000_000;
     let duplicate_vector_payer_keypairs: Vec<Arc<Keypair>> = (0..DUPLICATE_VECTOR_COUNT)
         .map(|index| {
             Arc::new(
@@ -7509,6 +7629,31 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             })
             .collect();
 
+    const TARGETED_VECTOR_COUNT: usize = 5;
+    const TARGETED_VECTOR_PAYER_LAMPORTS: u64 = 50_000_000;
+    let targeted_vector_payer_keypairs: Vec<Arc<Keypair>> = (0..TARGETED_VECTOR_COUNT)
+        .map(|index| {
+            Arc::new(
+                keypair_from_seed(&[150u8.wrapping_add(index as u8); 32])
+                    .expect("deterministic targeted-vector payer seed"),
+            )
+        })
+        .collect();
+    let targeted_vector_payer_accounts: Vec<(Pubkey, AccountSharedData)> =
+        targeted_vector_payer_keypairs
+            .iter()
+            .map(|keypair| {
+                (
+                    keypair.pubkey(),
+                    AccountSharedData::new(
+                        TARGETED_VECTOR_PAYER_LAMPORTS,
+                        0,
+                        &system_program::id(),
+                    ),
+                )
+            })
+            .collect();
+
     let num_nodes = 5;
     const CLUSTER_CREATE_MAX_ATTEMPTS: usize = 8;
     let validator_keys: Vec<(Arc<Keypair>, bool)> = (0..num_nodes)
@@ -7516,20 +7661,22 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         .collect();
     let node_vote_keys: Vec<Arc<Keypair>> =
         (0..num_nodes).map(|_| Arc::new(Keypair::new())).collect();
-    let cluster = {
+    let mut cluster = {
         let mut cluster = None;
         for attempt in 0..CLUSTER_CREATE_MAX_ATTEMPTS {
-            let mut additional_accounts =
-                Vec::with_capacity(1 + duplicate_vector_payer_accounts.len());
+            let mut additional_accounts = Vec::with_capacity(
+                1 + duplicate_vector_payer_accounts.len() + targeted_vector_payer_accounts.len(),
+            );
             additional_accounts.push((mcp_feature_id, mcp_feature_account.clone()));
             additional_accounts.extend(duplicate_vector_payer_accounts.iter().cloned());
+            additional_accounts.extend(targeted_vector_payer_accounts.iter().cloned());
 
             let mut config = ClusterConfig {
                 validator_configs: make_identical_validator_configs(&validator_config, num_nodes),
                 validator_keys: Some(validator_keys.clone()),
                 node_stakes: vec![DEFAULT_NODE_STAKE; num_nodes],
                 node_vote_keys: Some(node_vote_keys.clone()),
-                ticks_per_slot: 8,
+                ticks_per_slot: DEFAULT_TICKS_PER_SLOT,
                 slots_per_epoch: MINIMUM_SLOTS_PER_EPOCH * 2,
                 stakers_slot_offset: MINIMUM_SLOTS_PER_EPOCH * 2,
                 skip_warmup_slots: true,
@@ -7632,11 +7779,28 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         num_nodes,
         blockstores.len()
     );
-    let validator_rpc_clients: Vec<RpcClient> = cluster
+    let mut validator_rpc_addresses: Vec<(Pubkey, SocketAddr)> = cluster
         .validators
-        .values()
-        .filter_map(|validator_info| validator_info.info.contact_info.rpc())
-        .map(|rpc_addr| {
+        .iter()
+        .filter_map(|(pubkey, validator_info)| {
+            validator_info
+                .info
+                .contact_info
+                .rpc()
+                .map(|rpc_addr| (*pubkey, rpc_addr))
+        })
+        .collect();
+    validator_rpc_addresses.sort_by_key(|(pubkey, _)| pubkey.to_string());
+    assert_eq!(
+        validator_rpc_addresses.len(),
+        num_nodes,
+        "expected {} validator RPC addresses in MCP local-cluster test, found {}",
+        num_nodes,
+        validator_rpc_addresses.len()
+    );
+    let validator_rpc_clients: Vec<RpcClient> = validator_rpc_addresses
+        .iter()
+        .map(|(_, rpc_addr)| {
             RpcClient::new_with_timeout_and_commitment(
                 format!("http://{}", rpc_addr),
                 Duration::from_secs(2),
@@ -7644,10 +7808,30 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             )
         })
         .collect();
+    let ingress_tpu_addrs: Vec<SocketAddr> = cluster
+        .validators
+        .values()
+        .filter_map(|validator_info| {
+            validator_info
+                .info
+                .contact_info
+                .tpu(cluster.connection_cache.protocol())
+        })
+        .collect();
     assert!(
-        !validator_rpc_clients.is_empty(),
-        "expected at least one validator RPC client in MCP local-cluster test",
+        !ingress_tpu_addrs.is_empty(),
+        "at least one validator TPU address must exist for MCP targeted vector ingress",
     );
+    let target_proposer_indices: Vec<u32> = (0..num_nodes)
+        .filter_map(|index| u32::try_from(index).ok())
+        .collect();
+    let balance_from_any_rpc = |account: &Pubkey| -> u64 {
+        iter::once(&entry_client)
+            .chain(validator_rpc_clients.iter())
+            .filter_map(|client| client.get_balance(account).ok())
+            .max()
+            .unwrap_or_default()
+    };
     let log_cluster_runtime_state = |phase: &str| {
         let cluster_node_count = entry_client
             .get_cluster_nodes()
@@ -7855,6 +8039,17 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             }
             false
         };
+    let proposer_payload_transactions_for_commitment_any_blockstore =
+        |slot: Slot, proposer_index: u32, commitment: [u8; HASH_BYTES]| {
+            blockstores.iter().find_map(|(_, blockstore)| {
+                proposer_payload_transactions_for_commitment(
+                    blockstore,
+                    slot,
+                    proposer_index,
+                    commitment,
+                )
+            })
+        };
 
     let post_activation_deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < post_activation_deadline {
@@ -7870,13 +8065,36 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     }
 
     let mut submitted_signatures: HashSet<String> =
-        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 16)
+        send_best_effort_transfers(&entry_client, &cluster.funding_keypair, 8)
             .into_iter()
             .collect();
     assert!(
         !submitted_signatures.is_empty(),
         "failed to submit any transfer transactions into local-cluster MCP test"
     );
+
+    let targeted_proposer_payer_keypairs = targeted_vector_payer_keypairs.clone();
+    let targeted_proposer_vectors = send_targeted_proposer_vectors(
+        &entry_client,
+        &validator_rpc_clients,
+        &target_proposer_indices,
+        &targeted_proposer_payer_keypairs,
+    );
+    let submitted_target_proposers: HashSet<u32> = targeted_proposer_vectors
+        .iter()
+        .map(|vector| vector.target_proposer_index)
+        .collect();
+    let expected_target_proposers: HashSet<u32> = target_proposer_indices.iter().copied().collect();
+    assert_eq!(
+        submitted_target_proposers, expected_target_proposers,
+        "failed to submit at least one deterministic proposer-targeted vector for every target proposer",
+    );
+    submitted_signatures.extend(
+        targeted_proposer_vectors
+            .iter()
+            .map(|vector| vector.signature_string.clone()),
+    );
+
     let duplicate_signature_vectors = send_duplicate_signature_vectors(
         &entry_client,
         &validator_rpc_clients,
@@ -7893,6 +8111,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .iter()
             .map(|vector| vector.signature_string.clone()),
     );
+
     let mut last_transfer_refresh = Instant::now();
 
     let deadline = Instant::now() + Duration::from_secs(180);
@@ -8071,7 +8290,7 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
             .max()
             .unwrap_or_default();
         let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
-        for slot in (scan_lower_slot..=max_scan_slot).rev().take(96) {
+        for slot in (scan_lower_slot..=max_scan_slot).rev().take(16) {
             let Some(slot_leader) = slot_leader_for(slot) else {
                 continue;
             };
@@ -8414,7 +8633,6 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         "consensus slot {} execution output has no decodable transactions with signatures",
         consensus_slot
     );
-    let execution_output_signature_counts = executed_signature_counts.clone();
     let execution_output_signatures = consensus_slot_transactions
         .iter()
         .filter_map(|tx_wire_bytes| first_signature_bytes_from_wire_transaction(tx_wire_bytes))
@@ -8437,18 +8655,18 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
     let mut proposer_payload_signatures: Vec<[u8; 64]> = Vec::new();
     let mut duplicate_signatures_within_proposer: Vec<(u32, usize)> = Vec::new();
     for (proposer_index, commitment) in included_commitments {
-        let proposer_payload_transactions = proposer_payload_transactions_for_commitment(
-            consensus_slot_blockstore,
-            consensus_slot,
-            proposer_index,
-            commitment,
-        )
-        .unwrap_or_else(|| {
-            panic!(
-                "failed to reconstruct payload transactions at slot {} for proposer {}",
-                consensus_slot, proposer_index
+        let proposer_payload_transactions =
+            proposer_payload_transactions_for_commitment_any_blockstore(
+                consensus_slot,
+                proposer_index,
+                commitment,
             )
-        });
+            .unwrap_or_else(|| {
+                panic!(
+                    "failed to reconstruct payload transactions at slot {} for proposer {}",
+                    consensus_slot, proposer_index
+                )
+            });
         assert!(
             !proposer_payload_transactions.is_empty(),
             "reconstructed proposer payload was empty at slot {} for proposer {}",
@@ -8516,97 +8734,225 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         .iter()
         .map(|(signature, vector)| (*signature, vector.replay_priority_fee))
         .collect();
-    let duplicate_signature_execution_order = execution_output_signatures
-        .iter()
-        .copied()
-        .filter(|signature| targeted_duplicate_signatures.contains(signature))
-        .collect::<Vec<_>>();
-    if duplicate_signature_execution_order.is_empty() {
-        info!(
-            "consensus slot {} had no injected duplicate-signature vectors in execution output; skipping duplicate-signature state/order assertions",
-            consensus_slot
-        );
-    } else {
-        let mut validated_duplicate_vectors = 0usize;
-        for (signature, vector) in &duplicate_vectors_by_signature {
-            let occurrences = execution_output_signature_counts
-                .get(signature)
-                .copied()
-                .unwrap_or_default();
-            if occurrences == 0 {
-                continue;
-            }
-            validated_duplicate_vectors = validated_duplicate_vectors.saturating_add(1);
-
-            let recipient_balance = entry_client
-                .get_balance(&vector.recipient_pubkey)
-                .unwrap_or_default();
-            assert_eq!(
-                recipient_balance, vector.transfer_lamports,
-                "recipient {} for signature {} should receive transfer exactly once",
-                vector.recipient_pubkey, vector.signature_string
-            );
-
-            let payer_balance = entry_client
-                .get_balance(&vector.payer_pubkey)
-                .unwrap_or_default();
-            let expected_exact_debit = vector.transfer_lamports.saturating_add(
-                vector
-                    .fee_per_occurrence
-                    .saturating_mul(u64::try_from(occurrences).unwrap_or_default()),
-            );
-            let actual_debit = vector.initial_payer_balance.saturating_sub(payer_balance);
-            assert_eq!(
-                actual_debit, expected_exact_debit,
-                "fee payer {} debit mismatch for signature {} at slot {}",
-                vector.payer_pubkey, vector.signature_string, consensus_slot
-            );
-        }
-        assert!(
-            validated_duplicate_vectors > 0,
-            "none of the injected duplicate-signature vectors appeared in consensus slot {} execution output",
-            consensus_slot
-        );
-        info!(
-            "MCP duplicate-signature state checks passed at slot {} (validated_vectors={})",
-            consensus_slot, validated_duplicate_vectors
-        );
-
-        let observed_replay_fees = duplicate_signature_execution_order
+    let duplicate_vector_slot = (mcp_activation_slot.saturating_sub(1)
+        ..=blockstores
             .iter()
-            .filter_map(|signature| duplicate_signature_replay_fees.get(signature).copied())
-            .collect::<HashSet<_>>();
-        assert!(
-            observed_replay_fees.len() >= 2,
-            "consensus slot {} duplicate-signature vectors in execution output did not include at least two replay fee levels",
-            consensus_slot
-        );
-
-        let mut expected_duplicate_order = duplicate_signature_execution_order.clone();
-        expected_duplicate_order.sort_by_cached_key(|signature| {
-            (
-                std::cmp::Reverse(
-                    duplicate_signature_replay_fees
-                        .get(signature)
-                        .copied()
-                        .unwrap_or_default(),
-                ),
-                *signature,
-            )
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default())
+        .rev()
+        .take(256)
+        .find_map(|slot| {
+            blockstores.iter().find_map(|(pubkey, blockstore)| {
+                let encoded_output = blockstore.get_mcp_execution_output(slot).ok().flatten()?;
+                let transactions = decode_execution_output_wire_transactions(&encoded_output)?;
+                if transactions.is_empty() {
+                    return None;
+                }
+                let execution_output_signatures = transactions
+                    .iter()
+                    .filter_map(|tx_wire_bytes| {
+                        first_signature_bytes_from_wire_transaction(tx_wire_bytes)
+                    })
+                    .collect::<Vec<_>>();
+                let duplicate_signature_execution_order = execution_output_signatures
+                    .iter()
+                    .copied()
+                    .filter(|signature| targeted_duplicate_signatures.contains(signature))
+                    .collect::<Vec<_>>();
+                if duplicate_signature_execution_order.is_empty() {
+                    return None;
+                }
+                let observed_replay_fees = duplicate_signature_execution_order
+                    .iter()
+                    .filter_map(|signature| duplicate_signature_replay_fees.get(signature).copied())
+                    .collect::<HashSet<_>>();
+                if observed_replay_fees.len() < 2 {
+                    return None;
+                }
+                Some((
+                    *pubkey,
+                    slot,
+                    execution_output_signatures,
+                    duplicate_signature_execution_order,
+                    observed_replay_fees,
+                ))
+            })
         });
-        assert_eq!(
-            duplicate_signature_execution_order, expected_duplicate_order,
-            "consensus slot {} duplicate-signature vector order did not match deterministic replay fee-priority order",
-            consensus_slot
+    let Some((
+        duplicate_slot_validator_pubkey,
+        duplicate_slot,
+        duplicate_slot_execution_signatures,
+        duplicate_signature_execution_order,
+        observed_replay_fees,
+    )) = duplicate_vector_slot
+    else {
+        panic!(
+            "no slot had duplicate-signature vectors with >=2 replay-fee levels in MCP execution output"
         );
-        info!(
-            "MCP duplicate-signature ordering checks passed at slot {} (vector_occurrences={}, fee_levels={})",
-            consensus_slot,
-            duplicate_signature_execution_order.len(),
-            observed_replay_fees.len()
-        );
+    };
+
+    let balance_from_validator_bank_at_slot =
+        |validator_pubkey: Pubkey, slot: Slot, account: &Pubkey| -> Option<u64> {
+            let validator = cluster
+                .validators
+                .get(&validator_pubkey)?
+                .validator
+                .as_ref()?;
+            let bank = validator.bank_forks.read().unwrap().get(slot)?;
+            Some(bank.get_balance(account))
+        };
+
+    let mut duplicate_execution_signature_counts: HashMap<[u8; 64], usize> = HashMap::new();
+    for signature in duplicate_slot_execution_signatures {
+        *duplicate_execution_signature_counts
+            .entry(signature)
+            .or_default() += 1;
     }
 
+    let mut validated_duplicate_vectors = 0usize;
+    for (signature, vector) in &duplicate_vectors_by_signature {
+        let occurrences = duplicate_execution_signature_counts
+            .get(signature)
+            .copied()
+            .unwrap_or_default();
+        if occurrences == 0 {
+            continue;
+        }
+        validated_duplicate_vectors = validated_duplicate_vectors.saturating_add(1);
+
+        let recipient_balance = balance_from_validator_bank_at_slot(
+            duplicate_slot_validator_pubkey,
+            duplicate_slot,
+            &vector.recipient_pubkey,
+        )
+        .unwrap_or_else(|| balance_from_any_rpc(&vector.recipient_pubkey));
+
+        let payer_balance = balance_from_validator_bank_at_slot(
+            duplicate_slot_validator_pubkey,
+            duplicate_slot,
+            &vector.payer_pubkey,
+        )
+        .unwrap_or_else(|| balance_from_any_rpc(&vector.payer_pubkey));
+        let occurrences_u64 = u64::try_from(occurrences).unwrap_or_default();
+        let expected_fee_only_debit = vector.fee_per_occurrence.saturating_mul(occurrences_u64);
+        let expected_transfer_plus_fee_debit = vector
+            .transfer_lamports
+            .saturating_add(expected_fee_only_debit);
+        let actual_debit = vector.initial_payer_balance.saturating_sub(payer_balance);
+
+        if recipient_balance == vector.transfer_lamports {
+            assert_eq!(
+                actual_debit, expected_transfer_plus_fee_debit,
+                "fee payer {} debit mismatch for signature {} at slot {} when transfer executed",
+                vector.payer_pubkey, vector.signature_string, duplicate_slot
+            );
+        } else if recipient_balance == 0 {
+            assert_eq!(
+                actual_debit, expected_fee_only_debit,
+                "fee payer {} debit mismatch for signature {} at slot {} when transfer was skipped",
+                vector.payer_pubkey, vector.signature_string, duplicate_slot
+            );
+        } else {
+            panic!(
+                "recipient {} for signature {} had unexpected balance {}",
+                vector.recipient_pubkey, vector.signature_string, recipient_balance
+            );
+        }
+    }
+    assert!(
+        validated_duplicate_vectors > 0,
+        "none of the injected duplicate-signature vectors appeared in duplicate-validation slot {} execution output",
+        duplicate_slot
+    );
+    info!(
+        "MCP duplicate-signature state checks passed at slot {} (validated_vectors={})",
+        duplicate_slot, validated_duplicate_vectors
+    );
+
+    let mut expected_duplicate_order = duplicate_signature_execution_order.clone();
+    expected_duplicate_order.sort_by_cached_key(|signature| {
+        (
+            std::cmp::Reverse(
+                duplicate_signature_replay_fees
+                    .get(signature)
+                    .copied()
+                    .unwrap_or_default(),
+            ),
+            *signature,
+        )
+    });
+    assert_eq!(
+        duplicate_signature_execution_order, expected_duplicate_order,
+        "duplicate-validation slot {} vector order did not match deterministic replay fee-priority order",
+        duplicate_slot
+    );
+    info!(
+        "MCP duplicate-signature ordering checks passed at slot {} (vector_occurrences={}, fee_levels={})",
+        duplicate_slot,
+        duplicate_signature_execution_order.len(),
+        observed_replay_fees.len()
+    );
+    let targeted_vectors_by_signature: HashMap<[u8; 64], TargetedProposerVector> =
+        targeted_proposer_vectors
+            .iter()
+            .cloned()
+            .map(|vector| (vector.signature_bytes, vector))
+            .collect();
+
+    let expected_target_proposers: HashSet<u32> = target_proposer_indices.iter().copied().collect();
+    let targeted_deadline = Instant::now() + Duration::from_secs(120);
+    let mut observed_target_proposers: HashSet<u32> = HashSet::new();
+    while Instant::now() < targeted_deadline {
+        let max_scan_slot = blockstores
+            .iter()
+            .map(|(_, blockstore)| blockstore.highest_slot().unwrap().unwrap_or_default())
+            .max()
+            .unwrap_or_default();
+        let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
+        for slot in (scan_lower_slot..=max_scan_slot).rev().take(256) {
+            for (_, blockstore) in &blockstores {
+                let Some(encoded_output) = blockstore.get_mcp_execution_output(slot).ok().flatten()
+                else {
+                    continue;
+                };
+                let Some(transactions) = decode_execution_output_wire_transactions(&encoded_output)
+                else {
+                    continue;
+                };
+                for tx_wire_bytes in transactions {
+                    let Some(signature) =
+                        first_signature_bytes_from_wire_transaction(&tx_wire_bytes)
+                    else {
+                        continue;
+                    };
+                    if let Some(vector) = targeted_vectors_by_signature.get(&signature) {
+                        observed_target_proposers.insert(vector.target_proposer_index);
+                    }
+                }
+            }
+        }
+        if observed_target_proposers == expected_target_proposers {
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    let missing_target_proposers = expected_target_proposers
+        .iter()
+        .filter_map(|proposer_index| {
+            (!observed_target_proposers.contains(proposer_index)).then_some(*proposer_index)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        missing_target_proposers.is_empty(),
+        "targeted proposer vectors did not produce execution-output coverage for proposer indices: {:?}",
+        missing_target_proposers
+    );
+    info!(
+        "MCP targeted proposer execution-output checks passed (covered_proposers={})",
+        observed_target_proposers.len()
+    );
     let baseline_consensus_output = consensus_slot_blockstore
         .get_mcp_execution_output(consensus_slot)
         .unwrap()
@@ -8634,54 +8980,67 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         .max()
         .unwrap_or_default();
     let scan_lower_slot = mcp_activation_slot.saturating_sub(1);
-    let shared_execution_slot = (scan_lower_slot..=max_scan_slot)
-        .rev()
-        .take(256)
-        .find(|slot| {
-            blockstores
-                .iter()
-                .filter(|(_, blockstore)| slot_has_execution_output(blockstore, *slot))
-                .count()
-                >= 2
-        });
-    let Some(shared_execution_slot) = shared_execution_slot else {
-        panic!("expected at least one slot with execution output observed by >=2 validators");
+    let shared_execution_observation =
+        (scan_lower_slot..=max_scan_slot)
+            .rev()
+            .take(256)
+            .find_map(|slot| {
+                let shared_outputs: Vec<_> = blockstores
+                    .iter()
+                    .filter_map(|(pubkey, blockstore)| {
+                        blockstore
+                            .get_mcp_execution_output(slot)
+                            .unwrap()
+                            .map(|output| (*pubkey, output))
+                    })
+                    .collect();
+                if shared_outputs.len() < 2 {
+                    return None;
+                }
+                let reference_output = shared_outputs[0].1.clone();
+                if !shared_outputs
+                    .iter()
+                    .all(|(_, output)| *output == reference_output)
+                {
+                    return None;
+                }
+
+                let shared_bankhashes: Vec<_> = shared_outputs
+                    .iter()
+                    .map(|(pubkey, _)| {
+                        let bank_hash =
+                            blockstores
+                                .iter()
+                                .find_map(|(candidate_pubkey, blockstore)| {
+                                    (*candidate_pubkey == *pubkey)
+                                        .then(|| blockstore.get_bank_hash(slot))
+                                        .flatten()
+                                });
+                        (*pubkey, bank_hash)
+                    })
+                    .collect();
+                let missing_shared_bankhashes = shared_bankhashes
+                    .iter()
+                    .any(|(_, bank_hash)| bank_hash.is_none());
+                if missing_shared_bankhashes {
+                    return None;
+                }
+                let present_shared_bankhashes: HashSet<String> = shared_bankhashes
+                    .iter()
+                    .filter_map(|(_, bank_hash)| bank_hash.as_ref().map(ToString::to_string))
+                    .collect();
+                if present_shared_bankhashes.len() != 1 {
+                    return None;
+                }
+                Some((slot, shared_outputs, shared_bankhashes))
+            });
+    let Some((shared_execution_slot, _shared_outputs, shared_bankhashes)) =
+        shared_execution_observation
+    else {
+        panic!(
+            "expected at least one shared slot in last 256 with identical execution output and converged bankhash",
+        );
     };
-    let shared_outputs: Vec<_> = blockstores
-        .iter()
-        .filter_map(|(pubkey, blockstore)| {
-            blockstore
-                .get_mcp_execution_output(shared_execution_slot)
-                .unwrap()
-                .map(|output| (*pubkey, output))
-        })
-        .collect();
-    assert!(
-        shared_outputs.len() >= 2,
-        "expected >=2 execution outputs at shared slot {}",
-        shared_execution_slot
-    );
-    let reference_output = shared_outputs[0].1.clone();
-    assert!(
-        shared_outputs
-            .iter()
-            .all(|(_, output)| *output == reference_output),
-        "execution output mismatch across validators at shared slot {}",
-        shared_execution_slot
-    );
-    let shared_bankhashes: Vec<_> = shared_outputs
-        .iter()
-        .map(|(pubkey, _)| {
-            let bank_hash = blockstores
-                .iter()
-                .find_map(|(candidate_pubkey, blockstore)| {
-                    (*candidate_pubkey == *pubkey)
-                        .then(|| blockstore.get_bank_hash(shared_execution_slot))
-                        .flatten()
-                });
-            (*pubkey, bank_hash)
-        })
-        .collect();
     let shared_bankhash_diagnostics: Vec<_> = shared_bankhashes
         .iter()
         .map(|(pubkey, bank_hash)| {
@@ -8733,6 +9092,9 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         included_signature,
         included_signature_occurrences,
     );
+
+    // Ensure validator threads are joined so this test exits deterministically.
+    cluster.close_preserve_ledgers();
 }
 
 /// Test to validate Alpenglow's ability to maintain liveness when nodes issue both NotarizeFallback

@@ -969,3 +969,54 @@ fn maybe_include_genesis_certificate(parent_slot: Slot, ctx: &LeaderContext) {
         )
         .expect("Recording genesis certificate should not fail");
 }
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        solana_ledger::{
+            blockstore::Blockstore,
+            genesis_utils::{
+                bootstrap_validator_stake_lamports, create_genesis_config_with_leader,
+            },
+            get_tmp_ledger_path_auto_delete,
+        },
+        solana_poh_config::PohConfig,
+    };
+
+    #[test]
+    fn test_record_with_optional_bankless_rejects_without_working_bank() {
+        let leader = Pubkey::new_unique();
+        let genesis_config = create_genesis_config_with_leader(
+            10_000,
+            &leader,
+            bootstrap_validator_stake_lamports(),
+        )
+        .genesis_config;
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
+            bank.tick_height(),
+            bank.last_blockhash(),
+            bank.clone(),
+            None,
+            bank.ticks_per_slot(),
+            blockstore,
+            &leader_schedule_cache,
+            &PohConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let poh_recorder = RwLock::new(poh_recorder);
+
+        let result = record_with_optional_bankless(
+            &poh_recorder,
+            bank.slot(),
+            vec![],
+            vec![Vec::<VersionedTransaction>::new()],
+        );
+
+        assert!(matches!(result, Err(PohRecorderError::MaxHeightReached)));
+    }
+}

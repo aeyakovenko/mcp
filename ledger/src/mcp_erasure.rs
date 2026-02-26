@@ -196,6 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_payload_rejects_oversized_payload_len() {
+        let payload = vec![7u8; 1000];
+        let encoded = encode_fec_set(&payload).unwrap();
+        let mut shards: Vec<Option<[u8; MCP_SHRED_DATA_BYTES]>> =
+            encoded.into_iter().map(Some).collect();
+
+        assert_eq!(
+            decode_payload(&mut shards, MCP_MAX_PAYLOAD_BYTES + 1).unwrap_err(),
+            McpErasureError::InvalidPayloadLength(MCP_MAX_PAYLOAD_BYTES + 1),
+        );
+    }
+
+    #[test]
     fn test_recover_fails_with_insufficient_shards() {
         let payload = vec![7u8; 1000];
         let encoded = encode_fec_set(&payload).unwrap();

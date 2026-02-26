@@ -162,6 +162,7 @@ mod tests {
             bootstrap_validator_stake_lamports, create_genesis_config_with_leader,
             deactivate_features,
         },
+        solana_signer::Signer,
         test_case::test_case,
     };
 
@@ -269,6 +270,68 @@ mod tests {
         assert_eq!(
             relays.get_slot_leaders().len(),
             usize::try_from(slots_in_epoch * crate::mcp::NUM_RELAYS as u64).unwrap()
+        );
+    }
+
+    #[test_case(true; "vote keyed mcp schedule")]
+    #[test_case(false; "identity keyed mcp schedule")]
+    fn test_mcp_schedule_vote_keyed_vs_identity_keyed(use_vote_keyed_leader_schedule: bool) {
+        let pubkey = solana_pubkey::new_rand();
+        let mut genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+
+        if !use_vote_keyed_leader_schedule {
+            deactivate_features(
+                &mut genesis_config,
+                &vec![agave_feature_set::enable_vote_address_leader_schedule::id()],
+            );
+        }
+
+        let bank = Bank::new_for_tests(&genesis_config);
+        let schedule = mcp_proposer_schedule(0, &bank).expect("MCP proposer schedule");
+
+        assert_eq!(
+            schedule.get_vote_key_at_slot_index(0).is_some(),
+            use_vote_keyed_leader_schedule
+        );
+        assert_eq!(
+            schedule.get_slot_leaders().len(),
+            usize::try_from(bank.get_slots_in_epoch(0) * crate::mcp::NUM_PROPOSERS as u64).unwrap(),
+        );
+    }
+    #[test]
+    fn test_mcp_schedule_multi_validator_stake_proportionality() {
+        use solana_runtime::genesis_utils::{
+            create_genesis_config_with_vote_accounts, ValidatorVoteKeypairs,
+        };
+
+        let validators: Vec<_> = (0..3).map(|_| ValidatorVoteKeypairs::new_rand()).collect();
+        let stakes = vec![1_000_u64, 300_u64, 100_u64];
+        let bank = Bank::new_for_tests(
+            &create_genesis_config_with_vote_accounts(1_000_000, &validators, stakes)
+                .genesis_config,
+        );
+
+        let schedule = mcp_proposer_schedule(0, &bank).expect("MCP proposer schedule");
+        let mut counts: HashMap<Pubkey, usize> = HashMap::new();
+        for leader in schedule.get_slot_leaders() {
+            *counts.entry(*leader).or_default() += 1;
+        }
+
+        let c0 = *counts
+            .get(&validators[0].node_keypair.pubkey())
+            .expect("validator 0 present");
+        let c1 = *counts
+            .get(&validators[1].node_keypair.pubkey())
+            .expect("validator 1 present");
+        let c2 = *counts
+            .get(&validators[2].node_keypair.pubkey())
+            .expect("validator 2 present");
+
+        assert!(
+            c0 > c1 && c1 > c2,
+            "expected schedule frequency ordering to follow stake weights: c0={c0}, c1={c1}, c2={c2}",
         );
     }
 }

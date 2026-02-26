@@ -1617,6 +1617,87 @@ mod test {
     }
 
     #[test]
+    fn test_ingest_mcp_consensus_block_conflict_keeps_first_valid_payload() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_slot = slot.saturating_sub(1);
+
+        let mut block_a = ConsensusBlock::new_unsigned_with_meta(
+            slot,
+            leader_index,
+            aggregate_bytes.clone(),
+            ConsensusMeta::new_v1(Hash::new_unique(), delayed_slot),
+            Hash::new_unique(),
+        )
+        .unwrap();
+        block_a.sign_leader(&leader).unwrap();
+        let payload_a = block_a.to_wire_bytes().unwrap();
+
+        let mut block_b = ConsensusBlock::new_unsigned_with_meta(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            ConsensusMeta::new_v1(Hash::new_unique(), delayed_slot),
+            Hash::new_unique(),
+        )
+        .unwrap();
+        block_b.sign_leader(&leader).unwrap();
+        let payload_b = block_b.to_wire_bytes().unwrap();
+        assert_ne!(payload_a, payload_b);
+
+        let mut frame_a = Vec::with_capacity(1 + payload_a.len());
+        frame_a.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame_a.extend_from_slice(&payload_a);
+        let mut frame_b = Vec::with_capacity(1 + payload_b.len());
+        frame_b.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame_b.extend_from_slice(&payload_b);
+
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+
+        ingest_mcp_control_message(
+            leader.pubkey(),
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            &frame_a,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
+        );
+        ingest_mcp_control_message(
+            leader.pubkey(),
+            SocketAddr::from(([127, 0, 0, 1], 1235)),
+            &frame_b,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
+        );
+
+        let consensus_blocks = consensus_blocks.read().unwrap();
+        assert_eq!(consensus_blocks.len(), 1);
+        assert_eq!(consensus_blocks.get(&slot), Some(&payload_a));
+    }
+    #[test]
     fn test_ingest_mcp_consensus_block_rejects_invalid_consensus_meta() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
@@ -2041,6 +2122,188 @@ mod test {
         );
         assert!(should_retry);
 
+        assert!(consensus_blocks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_maybe_finalize_consensus_block_requires_block_id() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Arc::new(Keypair::new());
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+
+        let delayed_bank = Bank::new_from_parent(
+            root_bank.clone(),
+            &Pubkey::new_unique(),
+            slot.saturating_sub(1),
+        );
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            bank_forks.insert(delayed_bank);
+            bank_forks.insert(slot_bank);
+        }
+
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
+        let relay_schedule = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .expect("MCP relay schedule missing");
+
+        let commitment = [31u8; 32];
+        let proposer_signature = leader.sign_message(&commitment);
+        let relay_indices: Vec<u32> = relay_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(relay_index, pubkey)| {
+                if *pubkey == leader.pubkey() {
+                    u32::try_from(relay_index).ok()
+                } else {
+                    None
+                }
+            })
+            .take(mcp::REQUIRED_ATTESTATIONS)
+            .collect();
+        assert_eq!(relay_indices.len(), mcp::REQUIRED_ATTESTATIONS);
+
+        for relay_index in relay_indices {
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries: vec![RelayAttestationEntry {
+                    proposer_index,
+                    commitment,
+                    proposer_signature,
+                }],
+                relay_signature: Signature::default(),
+            };
+            let signing_bytes = attestation.signing_bytes().unwrap();
+            attestation.relay_signature = leader.sign_message(&signing_bytes);
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation.to_bytes().unwrap())
+                .unwrap();
+        }
+
+        let contact_info = ContactInfo::new_localhost(&leader.pubkey(), timestamp());
+        let cluster_info =
+            ClusterInfo::new(contact_info, leader.clone(), SocketAddrSpace::Unspecified);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
+            slot,
+            &leader.pubkey(),
+            &cluster_info,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            None,
+        );
+
+        assert!(should_retry, "missing block_id must request retry");
+        assert!(consensus_blocks.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_maybe_finalize_skips_non_leader_slot() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Arc::new(Keypair::new());
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+
+        let delayed_bank = Bank::new_from_parent(
+            root_bank.clone(),
+            &Pubkey::new_unique(),
+            slot.saturating_sub(1),
+        );
+        let slot_bank = Bank::new_from_parent(root_bank.clone(), &Pubkey::new_unique(), slot);
+        slot_bank.set_block_id(Some(Hash::new_unique()));
+        {
+            let mut bank_forks = bank_forks.write().unwrap();
+            bank_forks.insert(delayed_bank);
+            bank_forks.insert(slot_bank);
+        }
+
+        let proposer_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
+        let relay_schedule = leader_schedule_cache
+            .relays_at_slot(slot, Some(&root_bank))
+            .expect("MCP relay schedule missing");
+
+        let commitment = [17u8; 32];
+        let proposer_signature = leader.sign_message(&commitment);
+        let relay_indices: Vec<u32> = relay_schedule
+            .iter()
+            .enumerate()
+            .filter_map(|(relay_index, pubkey)| {
+                if *pubkey == leader.pubkey() {
+                    u32::try_from(relay_index).ok()
+                } else {
+                    None
+                }
+            })
+            .take(mcp::REQUIRED_ATTESTATIONS)
+            .collect();
+        assert_eq!(relay_indices.len(), mcp::REQUIRED_ATTESTATIONS);
+
+        for relay_index in relay_indices {
+            let mut attestation = RelayAttestationV1 {
+                slot,
+                relay_index,
+                entries: vec![RelayAttestationEntry {
+                    proposer_index,
+                    commitment,
+                    proposer_signature,
+                }],
+                relay_signature: Signature::default(),
+            };
+            let signing_bytes = attestation.signing_bytes().unwrap();
+            attestation.relay_signature = leader.sign_message(&signing_bytes);
+            blockstore
+                .put_mcp_relay_attestation(slot, relay_index, &attestation.to_bytes().unwrap())
+                .unwrap();
+        }
+
+        let local_non_leader = Arc::new(Keypair::new());
+        let local_non_leader_pubkey = local_non_leader.pubkey();
+        let local_contact_info = ContactInfo::new_localhost(&local_non_leader_pubkey, timestamp());
+        let cluster_info = ClusterInfo::new(
+            local_contact_info,
+            local_non_leader,
+            SocketAddrSpace::Unspecified,
+        );
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+        let should_retry = maybe_finalize_and_broadcast_mcp_consensus_block(
+            slot,
+            &local_non_leader_pubkey,
+            &cluster_info,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            None,
+        );
+
+        assert!(!should_retry, "non-leader should skip without retry");
         assert!(consensus_blocks.read().unwrap().is_empty());
     }
 

@@ -1125,4 +1125,174 @@ mod tests {
         assert_eq!(addresses, vec![expected_address]);
         assert!(getter.mcp_leader_schedule_cache.lock().unwrap().is_some());
     }
+
+    #[test]
+    fn test_connection_cache_client_returns_leader_contact_missing_when_mcp_proposer_contacts_absent(
+    ) {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+
+        let local_keypair = Arc::new(Keypair::new());
+        let local_contact_info = ContactInfo::new_localhost(&local_keypair.pubkey(), 0);
+        let cluster_info = Arc::new(ClusterInfo::new(
+            local_contact_info,
+            local_keypair,
+            SocketAddrSpace::Unspecified,
+        ));
+
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+        let target_slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let tick_height = target_slot
+            .saturating_mul(root_bank.ticks_per_slot())
+            .saturating_add(1);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
+            tick_height,
+            Hash::default(),
+            root_bank.clone(),
+            None,
+            root_bank.ticks_per_slot(),
+            blockstore,
+            &leader_schedule_cache,
+            &PohConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let getter = ForwardAddressGetter::new(
+            cluster_info,
+            Arc::new(RwLock::new(poh_recorder)),
+            sharable_banks,
+        );
+
+        assert!(getter
+            .get_non_vote_forwarding_addresses(1, Protocol::UDP)
+            .is_empty());
+
+        let connection_cache = Arc::new(ConnectionCache::with_udp("forwarding-mcp-test", 1));
+        let client = ConnectionCacheClient::new(connection_cache, getter);
+        let err = client
+            .send_transactions_in_batch(vec![vec![1u8, 2, 3]])
+            .unwrap_err();
+        assert!(matches!(err, ForwardingClientError::LeaderContactMissing));
+    }
+
+    #[test]
+    fn test_forward_address_getter_leader_updater_path_uses_mcp_schedule() {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+
+        let local_keypair = Arc::new(Keypair::new());
+        let local_contact_info = ContactInfo::new_localhost(&local_keypair.pubkey(), 0);
+        let cluster_info = Arc::new(ClusterInfo::new(
+            local_contact_info,
+            local_keypair,
+            SocketAddrSpace::Unspecified,
+        ));
+        let leader_contact_info = ContactInfo::new_localhost(&leader.pubkey(), 0);
+        let expected_address = leader_contact_info.tpu_forwards(Protocol::QUIC).unwrap();
+        cluster_info.insert_info(leader_contact_info);
+
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+        let target_slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let tick_height = target_slot
+            .saturating_mul(root_bank.ticks_per_slot())
+            .saturating_add(1);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
+            tick_height,
+            Hash::default(),
+            root_bank.clone(),
+            None,
+            root_bank.ticks_per_slot(),
+            blockstore,
+            &leader_schedule_cache,
+            &PohConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut updater = ForwardAddressGetter::new(
+            cluster_info,
+            Arc::new(RwLock::new(poh_recorder)),
+            sharable_banks,
+        );
+
+        let addresses = updater.next_leaders(1);
+        assert_eq!(addresses, vec![expected_address]);
+        assert!(updater.mcp_leader_schedule_cache.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn test_vote_forwarding_uses_leader_schedule_not_proposer_schedule() {
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+
+        let local_keypair = Arc::new(Keypair::new());
+        let local_contact_info = ContactInfo::new_localhost(&local_keypair.pubkey(), 0);
+        let cluster_info = Arc::new(ClusterInfo::new(
+            local_contact_info,
+            local_keypair,
+            SocketAddrSpace::Unspecified,
+        ));
+        let leader_contact_info = ContactInfo::new_localhost(&leader.pubkey(), 0);
+        let expected_vote_address = leader_contact_info.tpu_vote(Protocol::UDP).unwrap();
+        cluster_info.insert_info(leader_contact_info);
+
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&root_bank));
+        let target_slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let tick_height = target_slot
+            .saturating_mul(root_bank.ticks_per_slot())
+            .saturating_add(1);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let (poh_recorder, _entry_receiver) = PohRecorder::new(
+            tick_height,
+            Hash::default(),
+            root_bank.clone(),
+            None,
+            root_bank.ticks_per_slot(),
+            blockstore,
+            &leader_schedule_cache,
+            &PohConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let getter = ForwardAddressGetter::new(
+            cluster_info,
+            Arc::new(RwLock::new(poh_recorder)),
+            sharable_banks,
+        );
+
+        let vote_addresses = getter.get_vote_forwarding_addresses(1);
+        assert_eq!(vote_addresses, vec![expected_vote_address]);
+        assert!(
+            getter.mcp_leader_schedule_cache.lock().unwrap().is_none(),
+            "vote forwarding must not resolve MCP proposer schedule"
+        );
+    }
 }

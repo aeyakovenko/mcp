@@ -1115,24 +1115,32 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_shred_id_includes_proposer_index() {
-        let make_mcp_shred = |proposer_index: u32| McpShred {
+    fn test_get_mcp_slot_and_shred_id() {
+        let make_mcp_shred = |proposer_index: u32, shred_index: u32| McpShred {
             slot: 42,
             proposer_index,
-            shred_index: 7,
+            shred_index,
             commitment: [3u8; 32],
             shred_data: [9u8; MCP_SHRED_DATA_BYTES],
             witness: [[0u8; 32]; MCP_WITNESS_LEN],
             proposer_signature: Signature::default(),
         };
 
-        let shred_a = make_mcp_shred(0).to_bytes();
-        let shred_b = make_mcp_shred(1).to_bytes();
+        let shred_a = make_mcp_shred(0, 7).to_bytes();
+        let shred_b = make_mcp_shred(1, 7).to_bytes();
         let id_a = get_mcp_shred_id(&shred_a).unwrap();
         let id_b = get_mcp_shred_id(&shred_b).unwrap();
 
+        assert_eq!(get_mcp_slot(&shred_a), Some(42));
+        assert_eq!(get_mcp_slot(&shred_b), Some(42));
         assert_eq!(id_a.slot(), 42);
         assert_eq!(id_b.slot(), 42);
         assert_ne!(id_a.index(), id_b.index());
+        assert_eq!(id_a.index(), 7);
+        assert_eq!(id_b.index(), (MCP_NUM_RELAYS as u32) + 7);
+
+        let non_mcp = vec![0u8; 8];
+        assert_eq!(get_mcp_slot(&non_mcp), None);
+        assert_eq!(get_mcp_shred_id(&non_mcp), None);
     }
 }

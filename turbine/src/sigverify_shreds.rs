@@ -318,6 +318,7 @@ fn partition_mcp_packets(
                 continue;
             };
             if !cluster_nodes::check_feature_activation(feature_id, slot, root_bank) {
+                packet.meta_mut().set_discard(true);
                 continue;
             }
             packet.meta_mut().set_discard(true);
@@ -657,8 +658,8 @@ mod tests {
             genesis_utils::create_genesis_config_with_leader,
             shred::{
                 mcp_shred::{
-                    MCP_SHRED_DISCRIMINATOR, MCP_SHRED_WIRE_SIZE,
-                    MCP_WITNESS_LEN, OFFSET_DISCRIMINATOR, OFFSET_SLOT, OFFSET_WITNESS_LEN,
+                    MCP_SHRED_DISCRIMINATOR, MCP_SHRED_WIRE_SIZE, MCP_WITNESS_LEN,
+                    OFFSET_DISCRIMINATOR, OFFSET_SLOT, OFFSET_WITNESS_LEN,
                 },
                 Nonce, ProcessShredsStats, ReedSolomonCache, Shredder,
             },
@@ -742,10 +743,8 @@ mod tests {
     fn test_partition_mcp_packets_uses_mcp_wire_slot_offset_for_feature_gate() {
         let activation_slot = 500_000u64;
         let mut genesis = create_genesis_config_with_leader(100, &Pubkey::new_unique(), 10);
-        let feature_lamports = std::cmp::max(
-            Rent::default().minimum_balance(Feature::size_of()),
-            1,
-        );
+        let feature_lamports =
+            std::cmp::max(Rent::default().minimum_balance(Feature::size_of()), 1);
         genesis.genesis_config.accounts.insert(
             feature_set::mcp_protocol_v1::id(),
             create_feature_account(
@@ -799,8 +798,8 @@ mod tests {
             &Pubkey::new_unique(),
         )
         .is_empty());
-        assert!(!disabled_feature_batches[0].get(0).unwrap().meta().discard());
-        assert!(!disabled_feature_batches[0].get(1).unwrap().meta().discard());
+        assert!(disabled_feature_batches[0].get(0).unwrap().meta().discard());
+        assert!(disabled_feature_batches[0].get(1).unwrap().meta().discard());
 
         let mut active_batch = PinnedPacketBatch::with_capacity(2);
         active_batch.push(packet_should_pass);
@@ -813,8 +812,97 @@ mod tests {
         );
         assert_eq!(mcp_packets.len(), 1);
         assert!(active_batches[0].get(0).unwrap().meta().discard());
-        assert!(!active_batches[0].get(1).unwrap().meta().discard());
+        assert!(active_batches[0].get(1).unwrap().meta().discard());
     }
+    #[test]
+    fn test_run_shred_sigverify_routes_mcp_packets_to_verified_sender() {
+        let leader_keypair = Arc::new(Keypair::new());
+        let leader_pubkey = leader_keypair.pubkey();
+        let mut genesis = create_genesis_config_with_leader(100, &leader_pubkey, 10);
+        let feature_lamports =
+            std::cmp::max(Rent::default().minimum_balance(Feature::size_of()), 1);
+        genesis.genesis_config.accounts.insert(
+            feature_set::mcp_protocol_v1::id(),
+            create_feature_account(
+                &Feature {
+                    activated_at: Some(0),
+                },
+                feature_lamports,
+            )
+            .into(),
+        );
+        let bank = Bank::new_for_tests(&genesis.genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let leader_schedule_cache =
+            LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().working_bank());
+        let cluster_info = ClusterInfo::new(
+            ContactInfo::new_localhost(&leader_pubkey, timestamp()),
+            leader_keypair.clone(),
+            SocketAddrSpace::Unspecified,
+        );
+        let cluster_nodes_cache = ClusterNodesCache::<RetransmitStage>::new(
+            CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+            CLUSTER_NODES_CACHE_TTL,
+        );
+        let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let recycler_cache = RecyclerCache::warmed();
+        let mut rng = rand::thread_rng();
+        let deduper = Deduper::<2, [u8]>::new(&mut rng, /*num_bits:*/ 1024);
+        let (shred_fetch_sender, shred_fetch_receiver) = crossbeam_channel::unbounded();
+        let (retransmit_sender, retransmit_receiver) = EvictingSender::new_bounded(1);
+        let (verified_sender, verified_receiver) = crossbeam_channel::unbounded();
+        let block_location_lookup = BlockLocationLookup::new_arc();
+        let cache = RwLock::new(LruCache::new(/*capacity:*/ 128));
+        let mut stats = ShredSigVerifyStats::new(Instant::now());
+        let mut shred_buffer = Vec::new();
+
+        let mut mcp_bytes = vec![0u8; MCP_SHRED_WIRE_SIZE];
+        mcp_bytes[OFFSET_DISCRIMINATOR] = MCP_SHRED_DISCRIMINATOR;
+        mcp_bytes[OFFSET_SLOT..OFFSET_SLOT + std::mem::size_of::<Slot>()]
+            .copy_from_slice(&1u64.to_le_bytes());
+        mcp_bytes[OFFSET_WITNESS_LEN] = MCP_WITNESS_LEN as u8;
+        let mut packet = Packet::default();
+        packet.buffer_mut()[..mcp_bytes.len()].copy_from_slice(&mcp_bytes);
+        packet.meta_mut().size = mcp_bytes.len();
+
+        let mut batch = PinnedPacketBatch::with_capacity(1);
+        batch.push(packet);
+        shred_fetch_sender.send(PacketBatch::from(batch)).unwrap();
+
+        let result = run_shred_sigverify::<2>(
+            &thread_pool,
+            leader_keypair.as_ref(),
+            &cluster_info,
+            bank_forks.as_ref(),
+            &leader_schedule_cache,
+            &recycler_cache,
+            &deduper,
+            &shred_fetch_receiver,
+            &retransmit_sender,
+            &verified_sender,
+            &cluster_nodes_cache,
+            block_location_lookup.as_ref(),
+            &cache,
+            &mut stats,
+            &mut shred_buffer,
+        );
+        assert!(result.is_ok());
+
+        let retransmit = retransmit_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(retransmit.is_empty());
+
+        let verified = verified_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(verified.len(), 1);
+        let (payload, is_repaired, location) = &verified[0];
+        assert_eq!(payload.as_ref(), mcp_bytes.as_slice());
+        assert!(!is_repaired);
+        assert_eq!(*location, BlockLocation::Original);
+    }
+
     #[test_matrix(
         [true, false],
         [true, false]
