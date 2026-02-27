@@ -118,7 +118,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     #[should_panic(expected = "threshold denominator must be non-zero")]
     fn test_threshold_count_guard_zero_denominator() {
         let _ = ceil_threshold_count(3, 0, 200);

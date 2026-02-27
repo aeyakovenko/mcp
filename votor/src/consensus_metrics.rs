@@ -329,11 +329,10 @@ impl ConsensusMetrics {
                 epoch_metrics.metrics_recording_failed,
                 i64
             ),
-            ("stale_epoch_events", self.stale_epoch_events, i64),
+            ("stale_epoch_events", epoch_metrics.stale_epoch_events, i64),
         );
     }
 
-<<<<<<< HEAD
     /// Cleans up old epoch data to prevent unbounded memory growth.
     fn cleanup_old_epochs(&mut self, finalized_epoch: Epoch) {
         let cutoff_epoch = finalized_epoch.saturating_sub(EPOCHS_TO_RETAIN);

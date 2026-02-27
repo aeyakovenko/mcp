@@ -29,7 +29,6 @@ pub mod forwarding_stage;
 pub mod gen_keys;
 #[cfg(test)]
 mod mcp_constant_consistency;
-pub mod mcp_proposer;
 pub mod mcp_relay;
 pub mod mcp_relay_submit;
 mod mcp_replay;

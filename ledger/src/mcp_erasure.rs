@@ -8,7 +8,7 @@ pub const MCP_DATA_SHREDS_PER_FEC_BLOCK: usize = mcp::DATA_SHREDS_PER_FEC_BLOCK;
 pub const MCP_CODING_SHREDS_PER_FEC_BLOCK: usize = mcp::CODING_SHREDS_PER_FEC_BLOCK;
 pub const MCP_NUM_RELAYS: usize = mcp::NUM_RELAYS;
 pub const MCP_SHRED_DATA_BYTES: usize = mcp::SHRED_DATA_BYTES;
-pub const MCP_MAX_PAYLOAD_BYTES: usize = mcp::MAX_PAYLOAD_BYTES;
+pub const MCP_MAX_PAYLOAD_BYTES: usize = mcp::MAX_PROPOSER_PAYLOAD;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum McpErasureError {

@@ -2658,6 +2658,9 @@ impl Bank {
     /// Set the expected bank hash (from an external footer).  This is stored for later verification
     /// when the bank is frozen.
     pub fn set_expected_bank_hash(&self, hash: Hash) {
+        if hash == Hash::default() {
+            return;
+        }
         *self.expected_bank_hash.write().unwrap() = Some(hash);
     }
 

@@ -294,18 +294,11 @@ pub struct ReplayStageConfig {
     pub banking_tracer: Arc<BankingTracer>,
     pub snapshot_controller: Option<Arc<SnapshotController>>,
     pub replay_highest_frozen: Arc<ReplayHighestFrozen>,
-    pub leader_window_info_sender: Sender<LeaderWindowInfo>,
-    pub highest_parent_ready: Arc<RwLock<(Slot, (Slot, Hash))>>,
-    pub consensus_metrics_sender: ConsensusMetricsEventSender,
-    pub consensus_metrics_receiver: ConsensusMetricsEventReceiver,
     pub migration_status: Arc<MigrationStatus>,
     pub mcp_consensus_blocks: mcp_replay::McpConsensusBlockStore,
     pub mcp_vote_gate_inputs: Arc<RwLock<HashMap<Slot, VoteGateInput>>>,
     pub mcp_vote_gate_included_proposers:
         Arc<RwLock<HashMap<Slot, BTreeMap<u32, mcp_vote_gate::Commitment>>>>,
-    pub reward_votes_receiver: Receiver<AddVoteMessage>,
-    pub reward_certs_sender: Sender<BuildRewardCertsResponse>,
-    pub build_reward_certs_receiver: Receiver<BuildRewardCertsRequest>,
 }
 
 pub struct ReplaySenders {
@@ -619,17 +612,10 @@ impl ReplayStage {
             banking_tracer,
             snapshot_controller,
             replay_highest_frozen,
-            leader_window_info_sender,
-            highest_parent_ready,
-            consensus_metrics_sender,
-            consensus_metrics_receiver,
-            migration_status,
+            migration_status: _,
             mcp_consensus_blocks,
             mcp_vote_gate_inputs,
             mcp_vote_gate_included_proposers,
-            reward_votes_receiver,
-            build_reward_certs_receiver,
-            reward_certs_sender,
         } = config;
 
         let ReplaySenders {
@@ -4584,7 +4570,6 @@ impl ReplayStage {
         entry_notification_sender: Option<&EntryNotifierSender>,
         verify_recyclers: &VerifyRecyclers,
         replay_vote_sender: &ReplayVoteSender,
-<<<<<<< HEAD
         finalization_cert_sender: &Sender<Vec<ConsensusMessage>>,
         leader_schedule_cache: &LeaderScheduleCache,
         mcp_consensus_blocks: &mcp_replay::McpConsensusBlockStore,

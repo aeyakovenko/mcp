@@ -14,7 +14,10 @@ use {
     solana_ledger::{
         blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{Nonce, ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        shred::{
+            Nonce, ProcessShredsStats, ReedSolomonCache, Shred, Shredder,
+            SIZE_OF_DATA_SHRED_HEADERS,
+        },
     },
     solana_perf::packet::Packet,
     solana_signer::Signer,
@@ -40,6 +43,8 @@ pub struct MaliciousRepairHandler {
 }
 
 impl MaliciousRepairHandler {
+    const BAD_DATA_INDEX: usize = SIZE_OF_DATA_SHRED_HEADERS + 5;
+
     pub fn new(
         blockstore: Arc<Blockstore>,
         keypair: Arc<Keypair>,

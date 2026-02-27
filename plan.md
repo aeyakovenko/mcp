@@ -13,6 +13,14 @@ Spec: `docs/src/proposals/mcp-protocol-spec.md`
 
 ## Release Blockers (status)
 
+- Non-leader proposer activation path: `OPEN`
+  - In MCP each slot has 1 consensus leader (via `slot_leader_at()`) and 16 proposers (via `proposers_at_slot()`, stake-weighted, independently sampled).
+  - Currently `block_creation_loop` only activates when a node receives `LeaderWindowInfo`, which is sent only when `slot_leader_at()` matches the node's pubkey.
+  - Result: non-leader proposers never receive an activation event, never call `set_bank_bankless()`, never record transactions to PoH, and never produce MCP shreds for their proposer indices.
+  - Only the consensus leader produces MCP shreds (for whatever proposer indices it happens to own).
+  - Fix requires a separate activation path for proposer-only nodes that triggers on `proposers_at_slot()` match independently of `slot_leader_at()`.
+  - Wiring points: `core/src/block_creation_loop.rs`, `core/src/replay_stage.rs`, `core/src/tvu.rs`.
+
 - Vote-gate input producer wiring: `RESOLVED`
   - Per-slot `VoteGateInput` is populated from ingested `ConsensusBlock` state and refreshed in replay before MCP vote-gate evaluation.
   - Wiring points: `core/src/window_service.rs`, `core/src/mcp_replay.rs`, `core/src/replay_stage.rs`.

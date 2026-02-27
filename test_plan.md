@@ -51,6 +51,7 @@ This test boots a real 5-node cluster, activates MCP, submits transactions, and 
 | G-7 | No fee-payer reservation overflow | `test_slot_dispatch_state_requires_num_proposers_fee_reservation` |
 | G-8 | No pending-slot restart ordering | Structural: `BTreeMap` is inherently ordered |
 | G-9 | No out-of-order consensus fragment reassembly | 11 fragment tests in `mcp_consensus_block.rs` |
+| G-10 | **Non-leader proposers never produce shreds** | **NONE — OPEN BUG** (see §8) |
 
 ---
 
@@ -128,14 +129,38 @@ MCP is production-ready when:
 
 ### Blocking Issues
 
-1. **`test_alpenglow_migration_4` FAILS consistently** — `new_pre_migration_alpenglow` cluster returns "Node is unhealthy" when sending feature activation tx via RPC. Needs investigation: is the pre-migration cluster bootstrapping correctly?
+1. **Non-leader proposers never produce shreds (G-10)** — `block_creation_loop` only activates on `LeaderWindowInfo` from `slot_leader_at()`. Non-leader proposers (nodes that appear in `proposers_at_slot()` but not `slot_leader_at()`) never create a bank, never record to PoH, and never produce MCP shreds. Only the consensus leader's proposer indices produce shreds. See §8 for required tests.
 
-2. **`test_restart_node_alpenglow` FAILS** — Single-node cluster can't confirm transactions after restart (718s timeout). May be a single-node-specific issue since the primary 5-node test passes restart-like scenarios.
+2. **`test_alpenglow_migration_4` FAILS consistently** — `new_pre_migration_alpenglow` cluster returns "Node is unhealthy" when sending feature activation tx via RPC. Needs investigation: is the pre-migration cluster bootstrapping correctly?
 
-3. **Basic liveness tests take >60 min each in debug builds** — These tests run for many epochs. Need release builds or adjusted timeouts.
+3. **`test_restart_node_alpenglow` FAILS** — Single-node cluster can't confirm transactions after restart (718s timeout). May be a single-node-specific issue since the primary 5-node test passes restart-like scenarios.
+
+4. **Basic liveness tests take >60 min each in debug builds** — These tests run for many epochs. Need release builds or adjusted timeouts.
 
 ### Known Non-Fatal Issues
 
 1. **`consumed: 128 > meta.last_index + 1: Some(96)` blockstore error** — **CONFIRMED BENIGN.** Source: `blockstore_meta.rs:640-660` (`is_full()` method). Occurs when shreds beyond `last_index` are inserted out of order. The `is_full()` method correctly returns `false` (line 659: equality check). No data corruption: replay reads from `completed_data_indexes`. No consensus impact: vote gate checks execution output, not slot fullness.
 
 2. **`thread Some("solWinInsert") error TrySend`** — Window service channel full during shutdown. Non-fatal.
+
+---
+
+## 8. Missing Proposer Activation Path (OPEN BUG)
+
+**Summary:** In MCP, each slot has two independent schedules:
+- 1 consensus leader via `slot_leader_at()`
+- 16 proposers via `proposers_at_slot()` (stake-weighted, independently sampled)
+
+`block_creation_loop` only activates when a node receives `LeaderWindowInfo`, which is sent only when `slot_leader_at()` matches the node's pubkey. Non-leader proposers never: (1) receive an activation event, (2) create a bank via `set_bank_bankless()`, (3) record transactions to PoH, (4) produce MCP shreds for their proposer indices.
+
+**Impact:** Only the consensus leader produces MCP shreds. All other proposer slots are silent.
+
+**Fix location:** `core/src/block_creation_loop.rs`, `core/src/replay_stage.rs`, `core/src/tvu.rs`
+
+### Required Tests
+
+| # | Test | Type | Description |
+|---|------|------|-------------|
+| P-1 | `test_proposer_activation_fires_for_non_leaders` | Unit | Mock a slot where node is a proposer but NOT the consensus leader. Assert the proposer activation event fires and `set_bank_bankless()` is called. |
+| P-2 | `test_all_16_proposers_produce_shreds` | Integration (local-cluster) | Boot a 5-node cluster with MCP active. For a post-activation slot, assert that all 16 proposer indices have shreds in blockstore (not just the leader's indices). |
+| P-3 | `test_non_leader_proposer_produces_shreds` | Integration (local-cluster) | Identify a slot where a non-leader node owns proposer indices. Assert that node's blockstore contains MCP shreds for those indices. |
