@@ -1558,6 +1558,71 @@ mod test {
     }
 
     #[test]
+    fn test_ingest_whole_consensus_block_returns_none_requiring_pending_retry() {
+        // HS-008: The 0x02 (whole-block) ingestion path stores the consensus
+        // block but returns None, so finalization is NOT triggered on that
+        // iteration. The pending_mcp_consensus_slots retry must compensate.
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let leader = Keypair::new();
+        let mut genesis = create_genesis_config_with_leader(10_000, &leader.pubkey(), 1_000);
+        genesis
+            .genesis_config
+            .accounts
+            .remove(&feature_set::mcp_protocol_v1::id());
+        let mut root_bank = Bank::new_for_tests(&genesis.genesis_config);
+        root_bank.activate_feature(&feature_set::mcp_protocol_v1::id());
+        let bank_forks = BankForks::new_rw_arc(root_bank);
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+        let slot = root_bank.epoch_schedule().get_first_slot_in_epoch(1);
+        let leader_index = consensus_leader_index_for_slot(slot, &root_bank)
+            .expect("leader index should resolve for slot");
+
+        let aggregate_bytes = AggregateAttestation::new_canonical(slot, leader_index, vec![])
+            .unwrap()
+            .to_wire_bytes()
+            .unwrap();
+        let delayed_slot = slot.saturating_sub(1);
+        let delayed_bankhash = Hash::new_unique();
+        let block_id = Hash::new_unique();
+        let consensus_meta = ConsensusMeta::new_v1(block_id, delayed_slot);
+        let mut block = ConsensusBlock::new_unsigned_with_meta(
+            slot,
+            leader_index,
+            aggregate_bytes,
+            consensus_meta,
+            delayed_bankhash,
+        )
+        .unwrap();
+        block.sign_leader(&leader).unwrap();
+        let payload = block.to_wire_bytes().unwrap();
+        let mut frame = Vec::with_capacity(1 + payload.len());
+        frame.push(MCP_CONTROL_MSG_CONSENSUS_BLOCK);
+        frame.extend_from_slice(&payload);
+        let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
+
+        // 0x02 whole-block path must return None (no immediate finalization).
+        let result = ingest_mcp_control_message(
+            leader.pubkey(),
+            SocketAddr::from(([127, 0, 0, 1], 1234)),
+            &frame,
+            &blockstore,
+            &bank_forks,
+            &leader_schedule_cache,
+            Some(&consensus_blocks),
+            &mut ConsensusBlockFragmentCollector::default(),
+        );
+        assert_eq!(result, None, "0x02 path must return None; finalization relies on pending-slot retry");
+
+        // Block IS stored despite returning None.
+        assert_eq!(
+            consensus_blocks.read().unwrap().get(&slot).cloned(),
+            Some(payload),
+        );
+    }
+
+    #[test]
     fn test_ingest_mcp_consensus_block_accepts_forwarded_sender_with_valid_signature() {
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();

@@ -902,6 +902,21 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_proposers_at_slot_none_bank_returns_none_for_unpopulated_epoch() {
+        let pubkey = solana_pubkey::new_rand();
+        let genesis_config =
+            create_genesis_config_with_leader(100, &pubkey, bootstrap_validator_stake_lamports())
+                .genesis_config;
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let cache = LeaderScheduleCache::new_from_bank(&bank);
+
+        // Epoch 5 has never been populated in the cache.
+        let far_future_slot = genesis_config.epoch_schedule.slots_per_epoch * 5;
+        assert!(cache.proposers_at_slot(far_future_slot, None).is_none());
+        assert!(cache.relays_at_slot(far_future_slot, None).is_none());
+    }
+
+    #[test]
     fn test_set_max_schedules() {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
