@@ -3023,6 +3023,7 @@ fn wait_for_supermajority(
                 }
             }
 
+            let original_health_override = rpc_override_health_check.load(Ordering::Relaxed);
             for i in 1.. {
                 let logging = i % 10 == 1;
                 if logging {
@@ -3055,7 +3056,7 @@ fn wait_for_supermajority(
                 rpc_override_health_check.store(true, Ordering::Relaxed);
                 sleep(Duration::new(1, 0));
             }
-            rpc_override_health_check.store(false, Ordering::Relaxed);
+            rpc_override_health_check.store(original_health_override, Ordering::Relaxed);
             Ok(true)
         }
     }

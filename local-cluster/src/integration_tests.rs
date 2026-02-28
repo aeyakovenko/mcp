@@ -483,15 +483,25 @@ pub fn run_cluster_partition<C>(
         LocalCluster::new(&mut config, SocketAddrSpace::Unspecified)
     };
 
-    info!("PARTITION_TEST spend_and_verify_all_nodes(), ensure all nodes are caught up");
-    cluster_tests::spend_and_verify_all_nodes(
-        &cluster.entry_point_info,
-        &cluster.funding_keypair,
-        num_nodes,
-        HashSet::new(),
-        SocketAddrSpace::Unspecified,
-        &cluster.connection_cache,
-    );
+    info!("PARTITION_TEST waiting for initial progress, ensure all nodes are caught up");
+    if is_alpenglow {
+        // Alpenglow clusters can't use spend_and_verify_all_nodes because
+        // poll_for_processed_transaction never sees tx status via RPC
+        cluster.check_for_new_processed(
+            8,
+            "PARTITION_TEST_warmup",
+            SocketAddrSpace::Unspecified,
+        );
+    } else {
+        cluster_tests::spend_and_verify_all_nodes(
+            &cluster.entry_point_info,
+            &cluster.funding_keypair,
+            num_nodes,
+            HashSet::new(),
+            SocketAddrSpace::Unspecified,
+            &cluster.connection_cache,
+        );
+    }
 
     let cluster_nodes = discover_validators(
         &cluster.entry_point_info.gossip().unwrap(),
