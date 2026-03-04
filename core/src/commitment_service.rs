@@ -192,8 +192,10 @@ impl AggregateCommitmentService {
                 w_block_commitment_cache.set_slot(slot);
             }
             AlpenglowCommitmentType::Finalized => {
-                // There is no distinction of OC, root, or finalized in Alpengow commitment.
-                // When receiving a finalilzation certificate we set all of these values.
+                // There is no distinction of OC, root, or finalized in Alpenglow commitment.
+                // When receiving a finalization certificate we set all of these values.
+                // A finalized slot is also processed, so update the processed slot too.
+                w_block_commitment_cache.set_slot(slot);
                 w_block_commitment_cache.set_highest_confirmed_slot(slot);
                 w_block_commitment_cache.set_root(slot);
                 w_block_commitment_cache.set_highest_super_majority_root(slot);

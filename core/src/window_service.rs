@@ -1056,6 +1056,8 @@ fn ingest_mcp_control_message(
         }
         MCP_CONTROL_MSG_CONSENSUS_BLOCK => {
             let payload = &frame[1..];
+            // Return the validated slot so the caller can include it in the
+            // candidate retry set for the next finalize pass.
             validate_and_store_consensus_block(
                 payload,
                 sender_pubkey,
@@ -1063,8 +1065,7 @@ fn ingest_mcp_control_message(
                 bank_forks,
                 leader_schedule_cache,
                 mcp_consensus_blocks,
-            );
-            None
+            )
         }
         MCP_CONTROL_MSG_CONSENSUS_BLOCK_FRAGMENT => {
             fragment_collector.evict_stale(Duration::from_secs(30));
@@ -1558,10 +1559,10 @@ mod test {
     }
 
     #[test]
-    fn test_ingest_whole_consensus_block_returns_none_requiring_pending_retry() {
+    fn test_ingest_whole_consensus_block_returns_slot_for_retry() {
         // HS-008: The 0x02 (whole-block) ingestion path stores the consensus
-        // block but returns None, so finalization is NOT triggered on that
-        // iteration. The pending_mcp_consensus_slots retry must compensate.
+        // block and returns the slot so caller-side retry/finalization loops
+        // can include it in candidate processing.
         let ledger_path = get_tmp_ledger_path_auto_delete!();
         let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let leader = Keypair::new();
@@ -1602,7 +1603,7 @@ mod test {
         frame.extend_from_slice(&payload);
         let consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
 
-        // 0x02 whole-block path must return None (no immediate finalization).
+        // 0x02 whole-block path returns the slot so callers can enqueue retry.
         let result = ingest_mcp_control_message(
             leader.pubkey(),
             SocketAddr::from(([127, 0, 0, 1], 1234)),
@@ -1613,9 +1614,13 @@ mod test {
             Some(&consensus_blocks),
             &mut ConsensusBlockFragmentCollector::default(),
         );
-        assert_eq!(result, None, "0x02 path must return None; finalization relies on pending-slot retry");
+        assert_eq!(
+            result,
+            Some(slot),
+            "0x02 path must return slot for retry/finalization scheduling"
+        );
 
-        // Block IS stored despite returning None.
+        // Block is stored after 0x02 ingestion.
         assert_eq!(
             consensus_blocks.read().unwrap().get(&slot).cloned(),
             Some(payload),

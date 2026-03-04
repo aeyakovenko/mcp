@@ -761,6 +761,10 @@ mod tests {
         super::*,
         crate::banking_stage::tests::{create_slow_genesis_config, sanitize_transactions},
         agave_reserved_account_keys::ReservedAccountKeys,
+        agave_votor_messages::{
+            consensus_message::{Certificate, CertificateType},
+            migration::GENESIS_CERTIFICATE_ACCOUNT,
+        },
         crossbeam_channel::unbounded,
         solana_account::{state_traits::StateMut, AccountSharedData},
         solana_address_lookup_table_interface::{
@@ -801,10 +805,6 @@ mod tests {
             sanitized::MessageHash, versioned::VersionedTransaction, Transaction,
         },
         solana_transaction_status::{TransactionStatusMeta, VersionedTransactionWithStatusMeta},
-        solana_votor_messages::{
-            consensus_message::{Certificate, CertificateType},
-            migration::GENESIS_CERTIFICATE_ACCOUNT,
-        },
         std::{
             borrow::Cow,
             sync::{

@@ -11564,6 +11564,8 @@ pub(crate) mod tests {
             .build()
             .expect("new rayon threadpool");
 
+        let (finalization_cert_sender, _finalization_cert_receiver) = unbounded();
+
         let res = ReplayStage::replay_blockstore_into_bank(
             &bank1,
             &blockstore,
@@ -11573,6 +11575,7 @@ pub(crate) mod tests {
             None,
             None,
             &replay_vote_sender,
+            &finalization_cert_sender,
             &VerifyRecyclers::default(),
             None,
             &PrioritizationFeeCache::new(0u64),
@@ -11638,6 +11641,7 @@ pub(crate) mod tests {
         let mcp_consensus_blocks = Arc::new(RwLock::new(HashMap::new()));
         let mcp_vote_gate_inputs = RwLock::new(HashMap::new());
         let mcp_vote_gate_included_proposers = RwLock::new(HashMap::new());
+        let (finalization_cert_sender, _finalization_cert_receiver) = unbounded();
 
         let mut pre_migration_timing = ReplayLoopTiming::default();
         let pre_migration = ReplayStage::replay_active_bank(
@@ -11655,6 +11659,7 @@ pub(crate) mod tests {
             None,
             &verify_recyclers,
             &replay_vote_sender,
+            &finalization_cert_sender,
             &mut pre_migration_timing,
             None,
             1,
@@ -11682,6 +11687,7 @@ pub(crate) mod tests {
             None,
             &verify_recyclers,
             &replay_vote_sender,
+            &finalization_cert_sender,
             &mut post_migration_timing,
             None,
             1,

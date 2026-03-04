@@ -984,6 +984,18 @@ mod tests {
         solana_poh_config::PohConfig,
     };
 
+    fn record_with_optional_bankless(
+        poh_recorder: &RwLock<PohRecorder>,
+        slot: Slot,
+        mixins: Vec<Hash>,
+        transaction_batches: Vec<Vec<VersionedTransaction>>,
+    ) -> Result<(), PohRecorderError> {
+        poh_recorder
+            .write()
+            .unwrap()
+            .record(slot, mixins, transaction_batches)
+            .map(|_| ())
+    }
     #[test]
     fn test_record_with_optional_bankless_rejects_without_working_bank() {
         let leader = Pubkey::new_unique();

@@ -4556,11 +4556,7 @@ fn run_test_cluster_partition(num_partitions: usize, is_alpenglow: bool) {
     let empty = |_: &mut LocalCluster, _: &mut ()| {};
     let on_partition_resolved = move |cluster: &mut LocalCluster, _: &mut ()| {
         if is_alpenglow {
-            cluster.check_for_new_processed(
-                16,
-                "PARTITION_TEST",
-                SocketAddrSpace::Unspecified,
-            );
+            cluster.check_for_new_processed(16, "PARTITION_TEST", SocketAddrSpace::Unspecified);
         } else {
             cluster.check_for_new_roots(16, "PARTITION_TEST", SocketAddrSpace::Unspecified);
         }
@@ -6173,6 +6169,9 @@ fn test_alpenglow_imbalanced_stakes_catchup() {
 
     let mut validator_config = ValidatorConfig::default_for_test();
     validator_config.fixed_leader_schedule = Some(leader_schedule);
+    // Ensure all nodes start at the same time to prevent minority nodes
+    // from falling behind during rolling start
+    validator_config.wait_for_supermajority = Some(0);
     validator_config.voting_service_test_override = Some(VotingServiceOverride {
         additional_listeners: vec![vote_listener_addr.local_addr().unwrap()],
         alpenglow_port_override: AlpenglowPortOverride::default(),
@@ -8410,6 +8409,105 @@ fn test_local_cluster_mcp_produces_blockstore_artifacts() {
         consensus_block.delayed_bankhash, delayed_bankhash,
         "consensus block delayed bankhash mismatch at slot {} (delayed slot {})",
         consensus_slot, delayed_slot
+    );
+    #[derive(Default, Debug)]
+    struct McpArtifactTimeline {
+        first_shred_poll: Option<u64>,
+        first_attestation_poll: Option<u64>,
+        first_consensus_block_poll: Option<u64>,
+        first_execution_output_poll: Option<u64>,
+    }
+
+    // Deterministic timeline probe: observe a single slot on a single
+    // validator and require MCP artifacts to appear in pipeline order.
+    let consensus_validator = cluster
+        .validators
+        .get(&consensus_validator_pubkey)
+        .and_then(|validator_info| validator_info.validator.as_ref())
+        .expect("consensus validator handle should exist for timeline probe");
+    let consensus_blockstore = blockstores
+        .iter()
+        .find_map(|(pubkey, blockstore)| {
+            (*pubkey == consensus_validator_pubkey).then_some(blockstore.as_ref())
+        })
+        .expect("consensus validator should have blockstore for timeline probe");
+
+    let mut timeline = McpArtifactTimeline::default();
+    let timeline_deadline = Instant::now() + Duration::from_secs(120);
+    let mut poll_index = 0u64;
+    while Instant::now() < timeline_deadline {
+        if timeline.first_shred_poll.is_none()
+            && slot_has_shred_data(consensus_blockstore, consensus_slot)
+        {
+            timeline.first_shred_poll = Some(poll_index);
+        }
+        if timeline.first_attestation_poll.is_none()
+            && slot_has_relay_attestation(consensus_blockstore, consensus_slot)
+        {
+            timeline.first_attestation_poll = Some(poll_index);
+        }
+        if timeline.first_consensus_block_poll.is_none()
+            && consensus_validator
+                .mcp_consensus_block_bytes(consensus_slot)
+                .is_some()
+        {
+            timeline.first_consensus_block_poll = Some(poll_index);
+        }
+        if timeline.first_execution_output_poll.is_none() {
+            let has_non_empty_output = consensus_blockstore
+                .get_mcp_execution_output(consensus_slot)
+                .ok()
+                .flatten()
+                .and_then(|encoded| decode_execution_output_wire_transactions(&encoded))
+                .is_some_and(|transactions| !transactions.is_empty());
+            if has_non_empty_output {
+                timeline.first_execution_output_poll = Some(poll_index);
+            }
+        }
+
+        if timeline.first_shred_poll.is_some()
+            && timeline.first_attestation_poll.is_some()
+            && timeline.first_consensus_block_poll.is_some()
+            && timeline.first_execution_output_poll.is_some()
+        {
+            break;
+        }
+
+        maybe_refresh_transfer_stream(
+            &mut submitted_signatures,
+            &mut last_transfer_refresh,
+            &entry_client,
+            &cluster.funding_keypair,
+        );
+        poll_index = poll_index.saturating_add(1);
+        sleep(Duration::from_millis(100));
+    }
+
+    let (
+        Some(first_shred_poll),
+        Some(first_attestation_poll),
+        Some(first_consensus_block_poll),
+        Some(first_execution_output_poll),
+    ) = (
+        timeline.first_shred_poll,
+        timeline.first_attestation_poll,
+        timeline.first_consensus_block_poll,
+        timeline.first_execution_output_poll,
+    )
+    else {
+        panic!(
+            "timed out waiting for MCP artifact timeline on slot {} at validator {}: {:?}",
+            consensus_slot, consensus_validator_pubkey, timeline
+        );
+    };
+    assert!(
+        first_shred_poll <= first_attestation_poll
+            && first_attestation_poll <= first_consensus_block_poll
+            && first_consensus_block_poll <= first_execution_output_poll,
+        "MCP artifact timeline order violation at slot {} on validator {}: {:?}",
+        consensus_slot,
+        consensus_validator_pubkey,
+        timeline
     );
     let artifact_blockstore = blockstores
         .iter()
