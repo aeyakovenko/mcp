@@ -503,7 +503,7 @@ impl Tvu {
             commitment_sender: votor_commitment_sender,
             drop_bank_sender: drop_bank_sender.clone(),
             bank_notification_sender: bank_notification_sender.clone(),
-            leader_window_info_sender,
+            leader_window_info_sender: leader_window_info_sender.clone(),
             highest_parent_ready,
             event_sender: votor_event_sender.clone(),
             own_vote_sender: consensus_message_sender.clone(),
@@ -536,6 +536,7 @@ impl Tvu {
             dumped_slots_sender,
             votor_event_sender,
             own_vote_sender: consensus_message_sender,
+            leader_window_info_sender,
             optimistic_parent_sender,
             lockouts_sender,
         };

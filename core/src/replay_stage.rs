@@ -319,6 +319,7 @@ pub struct ReplaySenders {
     pub dumped_slots_sender: Sender<Vec<(u64, Hash)>>,
     pub votor_event_sender: VotorEventSender,
     pub own_vote_sender: Sender<Vec<ConsensusMessage>>,
+    pub leader_window_info_sender: Sender<LeaderWindowInfo>,
     pub optimistic_parent_sender: Sender<LeaderWindowInfo>,
     pub lockouts_sender: Sender<TowerCommitmentAggregationData>,
 }
@@ -636,6 +637,7 @@ impl ReplayStage {
             dumped_slots_sender,
             votor_event_sender,
             own_vote_sender,
+            leader_window_info_sender,
             optimistic_parent_sender,
             lockouts_sender,
         } = senders;
@@ -881,6 +883,12 @@ impl ReplayStage {
                             &my_pubkey,
                             &leader_schedule_cache,
                             &optimistic_parent_sender,
+                        );
+                        Self::maybe_notify_of_non_leader_proposer_slot(
+                            &bank,
+                            &my_pubkey,
+                            &leader_schedule_cache,
+                            &leader_window_info_sender,
                         );
                     }
 
@@ -4054,6 +4062,58 @@ impl ReplayStage {
             });
     }
 
+    /// Activates block production for slots where this node owns proposer indices
+    /// but is not the consensus leader. These slots still need a bankless bank
+    /// so banking stage can execute payloads and broadcast MCP shreds.
+    fn maybe_notify_of_non_leader_proposer_slot(
+        bank: &Arc<Bank>,
+        my_pubkey: &Pubkey,
+        leader_schedule_cache: &LeaderScheduleCache,
+        leader_window_info_sender: &Sender<LeaderWindowInfo>,
+    ) {
+        let next_slot = bank.slot().saturating_add(1);
+        let Some(activated_slot) = bank
+            .feature_set
+            .activated_slot(&agave_feature_set::mcp_protocol_v1::id())
+        else {
+            return;
+        };
+        if next_slot < activated_slot {
+            return;
+        }
+
+        let next_leader = leader_schedule_cache
+            .slot_leader_at(next_slot, Some(bank))
+            .or_else(|| leader_schedule_cache.slot_leader_at(next_slot, None));
+        if next_leader.is_some_and(|leader| leader == *my_pubkey) {
+            return;
+        }
+
+        let owns_proposer_index = leader_schedule_cache
+            .proposers_at_slot(next_slot, Some(bank))
+            .or_else(|| leader_schedule_cache.proposers_at_slot(next_slot, None))
+            .is_some_and(|proposers| proposers.iter().any(|proposer| proposer == my_pubkey));
+        if !owns_proposer_index {
+            return;
+        }
+
+        let Some(block_id) = bank.block_id() else {
+            return;
+        };
+
+        let leader_window_info = LeaderWindowInfo {
+            start_slot: next_slot,
+            end_slot: next_slot,
+            parent_block: (bank.slot(), block_id),
+            block_timer: Instant::now(),
+        };
+        leader_window_info_sender
+            .send_timeout(leader_window_info, Duration::from_secs(1))
+            .unwrap_or_else(|err| {
+                error!("leader_window_info_sender failed to send proposer slot info: {err:?}");
+            });
+    }
+
     /// Computes and sets the block ID for a bank based on migration status and block validity.
     /// Returns Ok(()) if the block ID was successfully computed and set, or Err(error) if the slot should be marked dead.
     fn mcp_authoritative_block_id_for_slot(
@@ -6181,6 +6241,63 @@ pub(crate) mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn test_non_leader_proposer_activation_fires_for_non_leaders() {
+        let ReplayBlockstoreComponents {
+            vote_simulator,
+            my_pubkey,
+            ..
+        } = replay_blockstore_components(None, 5, None::<GenerateVotes>);
+        let root_bank = vote_simulator.bank_forks.read().unwrap().root_bank();
+        let root_schedule_cache = LeaderScheduleCache::new_from_bank(&root_bank);
+
+        let (parent_slot, parent_leader) = (1..=512)
+            .find_map(|parent_slot| {
+                let parent_leader =
+                    root_schedule_cache.slot_leader_at(parent_slot, Some(&root_bank))?;
+                let mut candidate_bank =
+                    Bank::new_from_parent(root_bank.clone(), &parent_leader, parent_slot);
+                candidate_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+                let candidate_cache = LeaderScheduleCache::new_from_bank(&candidate_bank);
+                let next_slot = parent_slot.saturating_add(1);
+                let is_non_leader_proposer = candidate_cache
+                    .slot_leader_at(next_slot, Some(&candidate_bank))
+                    .is_some_and(|leader| leader != my_pubkey)
+                    && candidate_cache
+                        .proposers_at_slot(next_slot, Some(&candidate_bank))
+                        .is_some_and(|proposers| {
+                            proposers.iter().any(|proposer| proposer == &my_pubkey)
+                        });
+                is_non_leader_proposer.then_some((parent_slot, parent_leader))
+            })
+            .expect(
+                "expected to find a slot where the local validator is a proposer but not leader",
+            );
+
+        let mut parent_bank = Bank::new_from_parent(root_bank, &parent_leader, parent_slot);
+        parent_bank.activate_feature(&agave_feature_set::mcp_protocol_v1::id());
+        let expected_parent_block_id = Hash::new_unique();
+        parent_bank.set_block_id(Some(expected_parent_block_id));
+        parent_bank.freeze();
+        let parent_bank = Arc::new(parent_bank);
+        let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&parent_bank);
+
+        let (leader_window_info_sender, leader_window_info_receiver) = unbounded();
+        ReplayStage::maybe_notify_of_non_leader_proposer_slot(
+            &parent_bank,
+            &my_pubkey,
+            &leader_schedule_cache,
+            &leader_window_info_sender,
+        );
+
+        let info = leader_window_info_receiver
+            .try_recv()
+            .expect("expected proposer-only activation for the next slot");
+        assert_eq!(info.start_slot, parent_slot + 1);
+        assert_eq!(info.end_slot, parent_slot + 1);
+        assert_eq!(info.parent_block, (parent_slot, expected_parent_block_id));
     }
 
     #[test]
